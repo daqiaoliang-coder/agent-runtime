@@ -17,6 +17,8 @@ func NewExecutor(store *MemoryStore, llm LLM, tools *ToolRegistry) *Executor {
 	return &Executor{store: store, llm: llm, tools: tools}
 }
 
+// Execute 是步骤执行入口：先抢锁（ClaimStep），再按类型分发，最后用 CAS 落盘成功状态。
+// 抢锁失败说明被别的 worker 抢先了，直接退出，不算错误。
 func (e *Executor) Execute(ctx context.Context, stepID string) error {
 	step, err := e.store.GetStep(stepID)
 	if err != nil {
@@ -82,6 +84,7 @@ func (e *Executor) executeLLM(ctx context.Context, step *AgentStep) (string, err
 }
 
 func (e *Executor) executeTool(ctx context.Context, step *AgentStep) (string, error) {
+	// 用 runID:stepID 作为缓存键，同一个步骤重复执行时直接复用结果。
 	key := fmt.Sprintf("%s:%s", step.RunID, step.ID)
 
 	if result, ok := e.store.GetToolResult(key); ok {
@@ -108,6 +111,8 @@ func (e *Executor) executeTool(ctx context.Context, step *AgentStep) (string, er
 	return output, nil
 }
 
+// handleFailure 处理步骤执行失败：超过 maxAttempts 直接判失败，否则退避后重置为 Pending 等待重试。
+// 退避是指数 + 随机抖动，避免多个失败步骤同时重试造成惊群。
 func (e *Executor) handleFailure(step *AgentStep, cause error) error {
 	const maxAttempts = 3
 
@@ -123,6 +128,7 @@ func (e *Executor) handleFailure(step *AgentStep, cause error) error {
 		})
 	}
 
+	// 指数退避 100ms → 200ms → 400ms，叠加最多 100ms 的随机抖动。
 	delay := time.Duration(1<<current.Attempt) * 100 * time.Millisecond
 	delay += time.Duration(rand.Intn(100)) * time.Millisecond
 

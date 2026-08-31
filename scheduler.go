@@ -9,12 +9,14 @@ type Task struct {
 	StepID string
 }
 
+// Scheduler 是一个固定大小的 worker pool，任务通过带缓冲的 channel 派发。
 type Scheduler struct {
 	queue    chan Task
 	workers  int
 	executor *Executor
 }
 
+// NewScheduler workers 决定并发度，队列容量 1000 起到削峰作用。
 func NewScheduler(workers int, executor *Executor) *Scheduler {
 	return &Scheduler{
 		queue:    make(chan Task, 1000),

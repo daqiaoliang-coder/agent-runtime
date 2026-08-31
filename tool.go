@@ -6,6 +6,7 @@ import (
 	"time"
 )
 
+// Tool 是 Agent 可调用的外部能力，Name 作为注册键，Execute 接收原始输入字符串。
 type Tool interface {
 	Name() string
 	Execute(context.Context, string) (string, error)

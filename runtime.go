@@ -17,6 +17,7 @@ type Runtime struct {
 	stepCounter atomic.Int64
 }
 
+// NewRuntime 装配一个最小可用的运行时：内存存储 + Mock 规划器 + 4 个 worker。
 func NewRuntime() *Runtime {
 	store := NewMemoryStore()
 	llm := &MockLLM{}
@@ -35,6 +36,7 @@ func NewRuntime() *Runtime {
 	return runtime
 }
 
+// CreateRun 创建一次运行并写入存储，状态为 Pending，等待 Run 驱动。
 func (r *Runtime) CreateRun(input string) (*AgentRun, error) {
 	now := time.Now()
 
@@ -54,6 +56,9 @@ func (r *Runtime) CreateRun(input string) (*AgentRun, error) {
 	return run, nil
 }
 
+// Run 是运行主循环：先把状态翻成 Running，然后反复「规划 → 建步骤 → 提交给调度器 → 等步骤完成」。
+// 退出条件有三类：达到 MaxSteps、收到取消请求、规划器返回 StepFinish。
+// 注意每一步的状态变更都走 CAS，避免和并发的取消请求互相覆盖。
 func (r *Runtime) Run(ctx context.Context, runID string) error {
 	run, err := r.store.GetRun(runID)
 	if err != nil {
@@ -119,6 +124,8 @@ func (r *Runtime) Run(ctx context.Context, runID string) error {
 
 		r.scheduler.Submit(Task{StepID: step.ID})
 
+		// 这里没有用 channel 回调，而是轮询存储里的步骤状态。
+		// 简单粗暴，但和基于 CAS 的存储模型保持一致，也方便后续换持久化实现。
 		for {
 			current, err := r.store.GetStep(step.ID)
 			if err != nil {
@@ -141,6 +148,7 @@ func (r *Runtime) Run(ctx context.Context, runID string) error {
 	}
 }
 
+// Cancel 只是打个取消标记，真正的状态翻转交给主循环在下一轮检查时处理。
 func (r *Runtime) Cancel(runID string) error {
 	run, err := r.store.GetRun(runID)
 	if err != nil {
@@ -153,6 +161,7 @@ func (r *Runtime) Cancel(runID string) error {
 	})
 }
 
+// finishRun 收尾：用最新版本做一次 CAS 把状态写定，再补一条 RUN_FINISHED 事件。
 func (r *Runtime) finishRun(run *AgentRun, status RunStatus, output string) error {
 	current, err := r.store.GetRun(run.ID)
 	if err != nil {

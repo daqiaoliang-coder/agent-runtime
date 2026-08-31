@@ -6,6 +6,8 @@ import (
 	"sync"
 )
 
+// StateStore 是运行时状态的持久化抽象。
+// 所有更新都走 CAS（带版本号），保证并发更新不会互相覆盖。
 type StateStore interface {
 	CreateRun(*AgentRun) error
 	GetRun(string) (*AgentRun, error)
@@ -67,6 +69,7 @@ func (s *MemoryStore) GetRun(id string) (*AgentRun, error) {
 	return &cp, nil
 }
 
+// UpdateRunCAS 用乐观锁更新 Run：版本号不匹配说明期间被别人改过，直接报错让调用方重试。
 func (s *MemoryStore) UpdateRunCAS(id string, expectedVersion int64, update func(*AgentRun)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,6 +108,8 @@ func (s *MemoryStore) GetStep(id string) (*AgentStep, error) {
 	return &cp, nil
 }
 
+// ClaimStep 把步骤从 Pending 抢到 Running，是 worker 之间互斥执行同一步骤的关键。
+// 抢不到（版本冲突或状态已变）就返回 error，调用方应静默退出。
 func (s *MemoryStore) ClaimStep(id string, expectedVersion int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -142,6 +147,7 @@ func (s *MemoryStore) UpdateStepCAS(id string, expectedVersion int64, update fun
 	return nil
 }
 
+// SaveCheckpoint 只接受比当前版本更新的快照，旧版本直接丢弃，避免回退。
 func (s *MemoryStore) SaveCheckpoint(cp *Checkpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
