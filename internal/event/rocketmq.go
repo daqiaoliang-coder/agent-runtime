@@ -45,7 +45,7 @@ func NewConsumer(nameserver, topic, group string, handler func(context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	_, err = c.Subscribe(topic, consumer.MessageSelector{}, func(ctx context.Context, msgs ...*primitive.MessageExt) (consumer.ConsumeResult, error) {
+	err = c.Subscribe(topic, consumer.MessageSelector{}, func(ctx context.Context, msgs ...*primitive.MessageExt) (consumer.ConsumeResult, error) {
 		for _, m := range msgs {
 			var e model.Event
 			if err := json.Unmarshal(m.Body, &e); err != nil {
