@@ -2,11 +2,12 @@ package runtime
 
 import (
 	"agent-runtime/internal/model"
+	"context"
 	"testing"
 )
 
 func TestDemoPlannerBuildsParallelDAG(t *testing.T) {
-	p, err := DemoPlanner{}.Plan(&model.Run{ID: "r1", Input: "x"})
+	p, err := DemoPlanner{}.Plan(context.Background(), &model.Run{ID: "r1", Input: "x"})
 	if err != nil {
 		t.Fatal(err)
 	}

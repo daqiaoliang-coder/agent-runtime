@@ -30,7 +30,7 @@ func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input string) (*
 	if err := r.Store.CreateRun(ctx, run); err != nil {
 		return nil, err
 	}
-	plan, err := r.Planner.Plan(run)
+	plan, err := r.Planner.Plan(ctx, run)
 	if err != nil {
 		return nil, err
 	}

@@ -2,6 +2,7 @@
 package main
 
 import (
+	"agent-runtime/internal/llm"
 	"agent-runtime/internal/queue"
 	"agent-runtime/internal/runtime"
 	"agent-runtime/internal/store"
@@ -24,7 +25,15 @@ func main() {
 	if err := q.Init(ctx); err != nil {
 		log.Fatal(err)
 	}
-	rt := &runtime.Runtime{Store: s, Queue: q, Planner: runtime.DemoPlanner{}}
+	// 默认使用静态 DemoPlanner（确定性 DAG，无需 LLM）；
+	// 配置 OPENAI_API_KEY 时切换为 LLMPlanner，由模型动态生成 DAG。
+	planner := runtime.Planner(runtime.DemoPlanner{})
+	if base := os.Getenv("OPENAI_BASE_URL"); base != "" {
+		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
+			planner = &runtime.LLMPlanner{LLM: llm.NewOpenAIClient(base, key)}
+		}
+	}
+	rt := &runtime.Runtime{Store: s, Queue: q, Planner: planner}
 	run, err := rt.CreateRun(ctx, "default", "demo", "why is project delayed?")
 	if err != nil {
 		log.Fatal(err)
