@@ -118,3 +118,12 @@ type RunContext struct {
 	NodeOutputs  map[string]string
 	GraphVersion int64
 }
+
+// LLMUsage 记录单次 LLM 调用的 token 消耗与成本，对应 llm_usage 表。
+// 用于按 run/tenant/model 维度聚合统计 token 用量与花费，支撑成本分析与配额管控。
+type LLMUsage struct {
+	ID, RunID, NodeID, TenantID, Model string
+	PromptTokens, CompletionTokens      int
+	TotalTokens                         int
+	Cost                                float64
+}

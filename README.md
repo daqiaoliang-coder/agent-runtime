@@ -8,6 +8,7 @@
 - MySQL 8
 - Redis Streams
 - RocketMQ 5
+- OpenTelemetry（轨迹追踪）
 
 ## 核心能力
 
@@ -22,6 +23,11 @@
 - Redis Streams 工作队列
 - 工具 / LLM 执行抽象
 - 工具调用幂等（`tool_call` 表 + 幂等键）
+- 节点执行重试策略（指数退避 + 抖动 + 死信队列）
+- RocketMQ 消费端幂等（Inbox 模式）
+- Checkpoint / Context 恢复（对话历史 + 节点输出）
+- LLM token / cost 追踪（用量落库 + 成本估算）
+- OpenTelemetry 全链路轨迹追踪
 
 ## 组件
 

@@ -11,6 +11,7 @@ import (
 	"agent-runtime/internal/retry"
 	"agent-runtime/internal/store"
 	"agent-runtime/internal/tool"
+	"agent-runtime/internal/trace"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -18,6 +19,9 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // Worker 是单个任务执行器实例。
@@ -41,6 +45,15 @@ type Worker struct {
 // 租户隔离：所有节点操作都带 t.TenantID，跨租户的 node_id 会被 WHERE tenant_id=? 拦截。
 // 事件携带 TenantID，Resume Controller 据此继续做租户隔离。
 func (w *Worker) Handle(ctx context.Context, t model.Task) error {
+	// 轨迹根 span：串联从认领节点到执行完成的全流程，携带 run/node/tenant 维度。
+	ctx, span := trace.StartSpan(ctx, "worker.handle")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("run.id", t.RunID),
+		attribute.String("node.id", t.NodeID),
+		attribute.String("tenant.id", t.TenantID),
+		attribute.Int("attempt", t.Attempt),
+	)
 	n, err := w.Store.GetNode(ctx, t.TenantID, t.NodeID)
 	if err != nil {
 		return err
@@ -73,6 +86,9 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	// 执行节点：替换原先的占位字符串拼接，真正发起 LLM 推理或工具调用。
 	output, execErr := w.Exec.Execute(ctx, n)
 	if execErr != nil {
+		// 在 span 上记录执行错误，便于在追踪系统中按错误维度检索失败轨迹。
+		span.RecordError(execErr)
+		span.SetStatus(codes.Error, execErr.Error())
 		next := n.Attempt + 1
 		if w.Retry.ShouldRetry(next) {
 			// 仍可重试：指数退避，置回 READY 并安排 ready_at，ack 任务。
@@ -147,7 +163,8 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	}
 	// ToolStore=s 使 TOOL 节点经 tool_call 表保证幂等（SUCCESS 复用、崩溃在途拒绝重执行）。
 	// Retry=指数退避策略，失败可重试节点置回 READY 并按 ready_at 补投递，耗尽入 DLQ。
-	disp := &executor.Dispatcher{LLM: client, Tools: tools, ToolStore: s}
+	// UsageRecorder=s 使 LLM 节点的 token 用量与成本落 llm_usage 表，支撑成本分析。
+	disp := &executor.Dispatcher{LLM: client, Tools: tools, ToolStore: s, UsageRecorder: s, Pricer: DefaultPricer}
 	// ContextLoader 从 checkpoint 重建对话历史，使崩溃恢复后的 LLM 节点保持上下文连续。
 	disp.ContextLoader = func(ctx context.Context, runID string) ([]llm.Message, error) {
 		_, _, stateJSON, err := s.LoadCheckpoint(ctx, runID)
@@ -168,4 +185,23 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 		return msgs, nil
 	}
 	return &Worker{Store: s, Queue: q, Events: r, ID: id, Retry: retry.Default(), Exec: disp}
+}
+
+// modelPrices 按模型名记录每百万 token 的单价（美元），prompt 在前、completion 在后。
+// 仅含常见模型作为演示；生产中应从配置中心动态加载。未命中的模型 cost 记 0。
+var modelPrices = map[string][2]float64{
+	"gpt-4o":        {2.5, 10},
+	"gpt-4o-mini":   {0.15, 0.6},
+	"gpt-4-turbo":   {10, 30},
+	"gpt-3.5-turbo": {0.5, 1.5},
+}
+
+// DefaultPricer 根据 model 与 token 数估算单次调用成本（美元）。
+// 价格按每百万 token 计；未在 modelPrices 中登记的模型返回 0（仅追踪 token）。
+func DefaultPricer(model string, prompt, completion int) float64 {
+	prices, ok := modelPrices[model]
+	if !ok {
+		return 0
+	}
+	return float64(prompt)/1e6*prices[0] + float64(completion)/1e6*prices[1]
 }

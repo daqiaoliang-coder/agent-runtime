@@ -5,6 +5,7 @@ import (
 	"agent-runtime/internal/event"
 	"agent-runtime/internal/queue"
 	"agent-runtime/internal/store"
+	"agent-runtime/internal/trace"
 	"agent-runtime/internal/worker"
 	"context"
 	_ "github.com/go-sql-driver/mysql"
@@ -14,6 +15,12 @@ import (
 
 func main() {
 	ctx := context.Background()
+	// 初始化 OpenTelemetry 轨迹追踪；失败时降级为 no-op，不阻断启动。
+	if shutdown, err := trace.Init("agent-worker"); err != nil {
+		log.Printf("trace init skipped: %v", err)
+	} else {
+		defer shutdown(ctx)
+	}
 	dsn := env("DATABASE_DSN", "agent:agent@tcp(localhost:3306)/agent_runtime?parseTime=true")
 	s, err := store.New(ctx, dsn)
 	if err != nil {

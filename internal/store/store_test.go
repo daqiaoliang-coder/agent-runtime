@@ -379,3 +379,23 @@ func TestSaveCheckpoint_UpsertsState(t *testing.T) {
 		t.Errorf("expectations not met: %v", err)
 	}
 }
+
+// TestRecordLLMUsage_InsertsWithDimensions LLM 用量落库必须携带 run/node/tenant/model 维度。
+func TestRecordLLMUsage_InsertsWithDimensions(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	mock.ExpectExec("INSERT INTO llm_usage").
+		WithArgs("usage-1", "run-1", "node-1", "tenant-A", "gpt-4o", 100, 50, 150, 0.000625).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	err := s.RecordLLMUsage(context.Background(), model.LLMUsage{
+		ID: "usage-1", RunID: "run-1", NodeID: "node-1", TenantID: "tenant-A",
+		Model: "gpt-4o", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150,
+		Cost: 0.000625,
+	})
+	if err != nil {
+		t.Fatalf("RecordLLMUsage: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expectations not met: %v", err)
+	}
+}

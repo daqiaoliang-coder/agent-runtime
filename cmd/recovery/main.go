@@ -5,6 +5,7 @@ package main
 import (
 	"agent-runtime/internal/queue"
 	"agent-runtime/internal/store"
+	"agent-runtime/internal/trace"
 	"context"
 	_ "github.com/go-sql-driver/mysql"
 	"log"
@@ -14,6 +15,11 @@ import (
 
 func main() {
 	ctx := context.Background()
+	if shutdown, err := trace.Init("agent-recovery"); err != nil {
+		log.Printf("trace init skipped: %v", err)
+	} else {
+		defer shutdown(ctx)
+	}
 	dsn := env("DATABASE_DSN", "agent:agent@tcp(localhost:3306)/agent_runtime?parseTime=true")
 	s, err := store.New(ctx, dsn)
 	if err != nil {

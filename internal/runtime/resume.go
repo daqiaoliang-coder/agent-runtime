@@ -3,8 +3,11 @@ package runtime
 import (
 	"agent-runtime/internal/event"
 	"agent-runtime/internal/model"
+	"agent-runtime/internal/trace"
 	"context"
 	"fmt"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Resumer 是事件驱动的 DAG 推进器。
@@ -23,6 +26,16 @@ type Resumer struct {
 // 关键点：依赖就绪检查保证 DAG 拓扑顺序；CAS 保证收敛不会被并发重复；
 // 所有查询携带事件中的 e.TenantID 做租户隔离，错误不再被静默吞掉。
 func (r *Resumer) Handle(ctx context.Context, e model.Event) error {
+	// 轨迹 span：标记 DAG 推进事件处理，携带事件类型与 run/tenant 维度。
+	ctx, span := trace.StartSpan(ctx, "resumer.handle")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("event.type", e.Type),
+		attribute.String("event.id", e.ID),
+		attribute.String("run.id", e.RunID),
+		attribute.String("node.id", e.NodeID),
+		attribute.String("tenant.id", e.TenantID),
+	)
 	if e.Type != "AgentStepCompleted" && e.Type != "AgentStepFailed" {
 		return nil
 	}

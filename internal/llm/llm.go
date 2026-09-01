@@ -25,9 +25,19 @@ type Request struct {
 	Messages []Message
 }
 
-// Response 是补全结果，当前仅暴露生成的文本内容。
+// Usage 描述单次 LLM 调用的 token 消耗，用于成本追踪与配额核算。
+type Usage struct {
+	PromptTokens     int // 输入 token 数
+	CompletionTokens int // 输出 token 数
+	TotalTokens      int // 合计（部分 provider 会直接返回）
+}
+
+// Response 是补全结果。除文本内容外，还携带实际使用的模型名与 token 用量，
+// 供执行器落库做 token/cost tracking。
 type Response struct {
 	Content string
+	Model   string // 实际生成使用的模型（可能与请求不同，如 provider 降级）
+	Usage   Usage
 }
 
 // Client 抽象 LLM 调用。实现需尊重 ctx 的超时与取消。

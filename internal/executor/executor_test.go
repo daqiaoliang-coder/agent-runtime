@@ -129,3 +129,73 @@ func TestNewDefault_Smoke(t *testing.T) {
 		t.Errorf("default tool exec: out=%q err=%v", out, err)
 	}
 }
+
+// fakeUsageClient 是返回固定 Usage 的 LLM 客户端，用于测试 token/cost tracking。
+type fakeUsageClient struct {
+	resp llm.Response
+}
+
+func (f *fakeUsageClient) Complete(_ context.Context, _ llm.Request) (llm.Response, error) {
+	return f.resp, nil
+}
+
+// fakeUsageRecorder 记录收到的 LLMUsage，用于断言 executor 正确落库 token 用量。
+type fakeUsageRecorder struct {
+	recorded []model.LLMUsage
+}
+
+func (f *fakeUsageRecorder) RecordLLMUsage(_ context.Context, u model.LLMUsage) error {
+	f.recorded = append(f.recorded, u)
+	return nil
+}
+
+// TestDispatcher_LLM_RecordsUsage 配置 UsageRecorder 时，LLM 调用的 token 用量应被落库。
+func TestDispatcher_LLM_RecordsUsage(t *testing.T) {
+	rec := &fakeUsageRecorder{}
+	d := &Dispatcher{
+		LLM: &fakeUsageClient{resp: llm.Response{
+			Content: "answer",
+			Model:   "gpt-4o",
+			Usage:   llm.Usage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150},
+		}},
+		UsageRecorder: rec,
+		Pricer: func(model string, prompt, completion int) float64 {
+			if model == "gpt-4o" {
+				return float64(prompt)/1e6*2.5 + float64(completion)/1e6*10
+			}
+			return 0
+		},
+	}
+	out, err := d.Execute(context.Background(), &model.Node{
+		Type: model.NodeLLM, ID: "node-1", RunID: "run-1", TenantID: "tenant-A", Name: "gpt-4o", Input: "hi",
+	})
+	if err != nil || out != "answer" {
+		t.Fatalf("execute: out=%q err=%v", out, err)
+	}
+	if len(rec.recorded) != 1 {
+		t.Fatalf("expected 1 usage record, got %d", len(rec.recorded))
+	}
+	u := rec.recorded[0]
+	if u.Model != "gpt-4o" || u.PromptTokens != 100 || u.CompletionTokens != 50 || u.TotalTokens != 150 {
+		t.Errorf("unexpected usage: %+v", u)
+	}
+	// gpt-4o: 100/1e6*2.5 + 50/1e6*10 = 0.00025 + 0.0005 = 0.00075
+	if u.Cost < 0.00074 || u.Cost > 0.00076 {
+		t.Errorf("unexpected cost: %v", u.Cost)
+	}
+}
+
+// TestDispatcher_LLM_NoUsage_SkipsRecording Usage.TotalTokens 为 0 时不落库（如 Stub）。
+func TestDispatcher_LLM_NoUsage_SkipsRecording(t *testing.T) {
+	rec := &fakeUsageRecorder{}
+	d := &Dispatcher{
+		LLM:           llm.Echo(),
+		UsageRecorder: rec,
+	}
+	if _, err := d.Execute(context.Background(), &model.Node{Type: model.NodeLLM, Input: "hi"}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(rec.recorded) != 0 {
+		t.Errorf("expected no usage record for zero-token stub, got %d", len(rec.recorded))
+	}
+}

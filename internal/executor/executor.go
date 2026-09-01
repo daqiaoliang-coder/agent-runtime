@@ -6,10 +6,15 @@ import (
 	"agent-runtime/internal/llm"
 	"agent-runtime/internal/model"
 	"agent-runtime/internal/tool"
+	"agent-runtime/internal/trace"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // Executor 抽象节点执行：输入节点，输出结果字符串与错误。
@@ -28,6 +33,16 @@ type ToolCallStore interface {
 	FailToolCall(ctx context.Context, tenant, callID string) error
 }
 
+// UsageRecorder 持久化 LLM token 消耗与成本（*store.MySQL 天然实现）。
+// 为 nil 时不落库（测试/无 DB 场景），token 用量仅存在于内存中。
+type UsageRecorder interface {
+	RecordLLMUsage(ctx context.Context, u model.LLMUsage) error
+}
+
+// Pricer 根据模型名与 token 数估算单次调用成本（美元）。
+// worker 注入默认实现；为 nil 时 cost 记 0（仅追踪 token，不估算花费）。
+type Pricer func(model string, promptTokens, completionTokens int) float64
+
 // Dispatcher 按 node.Type 路由到具体执行器。未识别类型返回错误，避免静默失败。
 type Dispatcher struct {
 	LLM           llm.Client
@@ -35,6 +50,8 @@ type Dispatcher struct {
 	ToolStore     ToolCallStore      // 工具调用幂等存储；为 nil 时工具退化为直接执行（测试/无 DB 场景）
 	SubAgent      Executor          // 子 Agent 执行器（递归运行子 Run），当前为占位实现
 	ContextLoader func(ctx context.Context, runID string) ([]llm.Message, error) // 从 checkpoint 重建对话历史
+	UsageRecorder UsageRecorder     // LLM token/cost 持久化；为 nil 时不落库
+	Pricer        Pricer            // 成本估算函数；为 nil 时 cost 记 0
 }
 
 // Execute 根据 node.Type 分发：
@@ -42,11 +59,31 @@ type Dispatcher struct {
 //   - TOOL 节点：以 node.Name 查 Registry 执行，经 tool_call 表保证幂等；
 //   - SUB_AGENT 节点：委托 SubAgent 执行器。
 func (d *Dispatcher) Execute(ctx context.Context, n *model.Node) (string, error) {
+	// 轨迹 span：标记节点执行入口，携带类型/ID/租户维度，串联到 worker.handle 的子 span。
+	ctx, span := trace.StartSpan(ctx, "executor.execute")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("node.type", string(n.Type)),
+		attribute.String("node.id", n.ID),
+		attribute.String("node.name", n.Name),
+		attribute.String("run.id", n.RunID),
+		attribute.String("tenant.id", n.TenantID),
+	)
 	switch n.Type {
 	case model.NodeLLM:
-		return d.executeLLM(ctx, n)
+		out, err := d.executeLLM(ctx, n)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		return out, err
 	case model.NodeTool:
-		return d.executeTool(ctx, n)
+		out, err := d.executeTool(ctx, n)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		return out, err
 	case model.NodeSubAgent:
 		if d.SubAgent != nil {
 			return d.SubAgent.Execute(ctx, n)
@@ -58,6 +95,8 @@ func (d *Dispatcher) Execute(ctx context.Context, n *model.Node) (string, error)
 }
 
 func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, error) {
+	ctx, span := trace.StartSpan(ctx, "executor.llm")
+	defer span.End()
 	if d.LLM == nil {
 		return "", fmt.Errorf("llm client not configured")
 	}
@@ -72,15 +111,47 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 			msgs = append(hist, msgs...)
 		}
 	}
-	resp, err := d.LLM.Complete(ctx, llm.Request{Messages: msgs})
+	resp, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs})
 	if err != nil {
 		return "", fmt.Errorf("llm: %w", err)
+	}
+	// 将 token 用量与模型记入 span，便于在追踪系统中按 token 维度聚合分析。
+	span.SetAttributes(
+		attribute.String("llm.model", resp.Model),
+		attribute.Int("llm.prompt_tokens", resp.Usage.PromptTokens),
+		attribute.Int("llm.completion_tokens", resp.Usage.CompletionTokens),
+		attribute.Int("llm.total_tokens", resp.Usage.TotalTokens),
+	)
+	// 记录 token 用量与估算成本（最佳努力，不影响主流程）。
+	if d.UsageRecorder != nil && resp.Usage.TotalTokens > 0 {
+		modelName := resp.Model
+		if modelName == "" {
+			modelName = modelForNode(n)
+		}
+		var cost float64
+		if d.Pricer != nil {
+			cost = d.Pricer(modelName, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+		}
+		_ = d.UsageRecorder.RecordLLMUsage(ctx, model.LLMUsage{
+			ID:               fmt.Sprintf("usage-%s-%d", n.ID, time.Now().UnixNano()),
+			RunID:            n.RunID,
+			NodeID:           n.ID,
+			TenantID:         n.TenantID,
+			Model:            modelName,
+			PromptTokens:     resp.Usage.PromptTokens,
+			CompletionTokens: resp.Usage.CompletionTokens,
+			TotalTokens:      resp.Usage.TotalTokens,
+			Cost:             cost,
+		})
 	}
 	return resp.Content, nil
 }
 
 // executeTool 执行工具节点。配置了 ToolStore 时走幂等路径，否则退化为直接执行。
 func (d *Dispatcher) executeTool(ctx context.Context, n *model.Node) (string, error) {
+	ctx, span := trace.StartSpan(ctx, "executor.tool")
+	defer span.End()
+	span.SetAttributes(attribute.String("tool.name", n.Name))
 	if d.Tools == nil {
 		return "", fmt.Errorf("tool registry not configured")
 	}
@@ -157,6 +228,10 @@ func idempotencyKey(runID, nodeID, toolName, input string) string {
 	h := sha256.Sum256([]byte(runID + "|" + nodeID + "|" + toolName + "|" + input))
 	return hex.EncodeToString(h[:])
 }
+
+// modelForNode 返回 LLM 节点应使用的模型名。当前从 node.Name 取（LLM 节点的 Name 字段
+// 可复用为模型标识），为空时由 LLM 客户端决定默认模型。
+func modelForNode(n *model.Node) string { return n.Name }
 
 // NewDefault 构造一个开箱即用的 Dispatcher：使用 Echo（Stub）LLM + Search/Calculator 工具。
 // 不带 ToolStore（工具直接执行），便于本地无 DB 演示与单元测试。

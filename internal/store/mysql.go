@@ -447,4 +447,13 @@ func (s *MySQL) MarkInbox(ctx context.Context, tenant, eventID string) error {
 	return err
 }
 
+// RecordLLMUsage 记录单次 LLM 调用的 token 消耗与成本到 llm_usage 表。
+// 用于按 run/tenant/model 维度聚合统计，支撑成本分析与配额管控。
+func (s *MySQL) RecordLLMUsage(ctx context.Context, u model.LLMUsage) error {
+	_, err := s.DB.ExecContext(ctx,
+		`INSERT INTO llm_usage(usage_id,run_id,node_id,tenant_id,model,prompt_tokens,completion_tokens,total_tokens,cost) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		u.ID, u.RunID, u.NodeID, u.TenantID, u.Model, u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.Cost)
+	return err
+}
+
 var ErrNotFound = errors.New("not found")
