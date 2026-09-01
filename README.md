@@ -42,14 +42,16 @@ cmd/outbox     将 MySQL Outbox 事件发布到 RocketMQ
 内部包：
 
 ```text
-internal/llm       LLM 客户端抽象（Stub / OpenAI 兼容 HTTP）
+internal/llm       LLM 客户端抽象（Stub / OpenAI 兼容 HTTP，含 token usage 解析）
 internal/tool      工具抽象 + Registry + 演示工具（Search / Calculator）
 internal/executor  节点执行器：按 node.Type 分发 LLM/Tool/SubAgent
 internal/runtime   Run 生命周期、DAG 规划、Resume
-internal/store      MySQL 持久化（CAS / 租约 / Outbox / tool_call 幂等）
+internal/store      MySQL 持久化（CAS / 租约 / Outbox / tool_call 幂等 / LLM usage / Inbox）
 internal/queue      Redis Streams 工作队列
 internal/event      RocketMQ 事件层
 internal/worker     任务执行单元
+internal/retry      重试策略（指数退避 + 抖动 + 最大次数）
+internal/trace      OpenTelemetry 轨迹追踪（span 初始化 + 辅助函数）
 ```
 
 ## 启动基础设施
@@ -64,6 +66,9 @@ docker compose -f deploy/docker-compose.yml up -d
 mysql -h127.0.0.1 -uagent -pagent < migrations/001_init.sql
 mysql -h127.0.0.1 -uagent -pagent < migrations/002_node_tenant.sql
 mysql -h127.0.0.1 -uagent -pagent < migrations/003_tool_call_tenant.sql
+mysql -h127.0.0.1 -uagent -pagent < migrations/004_retry_dlq.sql
+mysql -h127.0.0.1 -uagent -pagent < migrations/005_inbox.sql
+mysql -h127.0.0.1 -uagent -pagent < migrations/006_llm_usage.sql
 ```
 
 安装依赖：
@@ -120,6 +125,58 @@ Worker 认领节点后调用 `Executor.Execute`，真正发起 LLM 推理或工�
 
 > 诚实说明：这是"SUCCESS 缓存 + 崩溃在途拒绝"的幂等策略，不是严格的 exactly-once。工具副作用发生到 `SUCCESS` 落库之间仍存在窗口；该窗口内的崩溃会留下停滞 `RUNNING` 记录，需人工或租约机制清理后才能重试。对真正非幂等的副作用（发邮件 / 扣款），这正是期望的保守行为——宁可卡住也不重复。
 
+### 重试策略与死信队列
+
+节点执行失败时，Worker 按指数退避 + 抖动策略重试（`internal/retry`）：
+
+- **退避公式**：`Initial * Factor^(attempt-1)`，封顶 `Max`，叠加 ±Jitter/2 抖动，避免惊群；
+- **重试流程**：失败可重试 → `RetryNode` 将节点置回 `READY` 并写入 `ready_at`（退避到期时间），`attempt+1`；
+- **投递闸门**：`ReadyTasks` 扫描仅选取 `ready_at` 已到期的 `READY` 节点，未到期的重试节点不会被提前投递；
+- **死信队列**：重试耗尽（达到 `MaxAttempts`）后写入 `agent_dlq` 表，供人工排查或补偿，同时发 `AgentStepFailed` 事件由 Resume 收敛 Run 为 `FAILED`。
+
+### RocketMQ 消费端幂等（Inbox）
+
+Resume Controller 消费 RocketMQ 事件时采用 Inbox 模式去重至少一次投递的重复消息：
+
+- **处理前查表**：`InboxSeen(tenant, event_id)` 检查事件是否已处理过；
+- **处理后写表**：事件成功推进后 `MarkInbox` 写入 `agent_inbox`（`INSERT IGNORE` 保证幂等）；
+- **标记后模式**：先处理事件、成功后再标记 Inbox，崩溃在处理中途不会误标完成，重投递可幂等重放（底层 CAS / 状态机本身幂等）。
+
+### Checkpoint / Context 恢复
+
+Worker 在节点完成后将对话历史与节点输出累积写入 `checkpoint` 表，供崩溃恢复后重建 Agent 上下文：
+
+- **累积写入**：`saveCheckpoint` 追加当前节点的输入/输出到 `RunContext.Messages` 与 `RunContext.NodeOutputs`；
+- **上下文重建**：`ContextLoader` 从 checkpoint 读取历史消息，`executeLLM` 将历史消息前置到当前 prompt，保证 Agent 对话连续性；
+- **崩溃安全**：检查点为"最佳努力"落盘（忽略错误），节点状态由 `CompleteNodeWithOutbox` 事务保证；检查点仅为上下文缓存，丢失不影响状态正确性。
+
+### LLM token / cost 追踪
+
+LLM 调用的 token 消耗与成本被持久化到 `llm_usage` 表，支撑成本分析与配额管控：
+
+- **用量采集**：`llm.Response` 携带 `Usage`（prompt/completion/total tokens）与 `Model`，OpenAI 客户端解析 API 响应中的 `usage` 字段；
+- **成本估算**：`Pricer` 函数根据模型名与 token 数估算成本（`DefaultPricer` 内置 gpt-4o/gpt-4o-mini 等常见模型价格表，未登记模型 cost 记 0，仅追踪 token）；
+- **落库**：`executor.executeLLM` 在 LLM 调用成功后，通过 `UsageRecorder` 接口将用量写入 `llm_usage` 表，按 run/tenant/model 维度聚合统计；
+- **最佳努力**：落库失败不影响主流程（忽略错误），token 用量同时写入 OTel span 属性，可在追踪系统中观测。
+
+### OpenTelemetry 轨迹追踪
+
+全链路 span 串联 Agent 执行轨迹，便于在追踪系统中按租户与 Run 维度检索失败用例：
+
+| Span | 位置 | 属性 |
+| --- | --- | --- |
+| `worker.handle` | Worker 任务处理入口 | run.id, node.id, tenant.id, attempt |
+| `executor.execute` | 节点分发 | node.type, node.id, run.id, tenant.id |
+| `executor.llm` | LLM 节点执行 | llm.model, prompt/completion/total tokens |
+| `executor.tool` | 工具节点执行 | tool.name |
+| `llm.complete` | OpenAI HTTP 调用 | llm.base_url, request_model, message_count |
+| `resumer.handle` | DAG 推进事件处理 | event.type, event.id, run.id, tenant.id |
+
+- **初始化**：`trace.Init(serviceName)` 创建 TracerProvider，默认 stdout exporter（演示），生产中替换为 OTLP / Jaeger exporter；
+- **降级**：`OTEL_DISABLED=1` 跳过 exporter 初始化，返回 no-op tracer，不阻断启动（单元测试默认走此路径）；
+- **零开销**：Tracer 未初始化时 `StartSpan` 返回 no-op span，非追踪场景零性能损耗；
+- **错误标记**：执行失败的 span 自动 `RecordError` + `SetStatus(Error)`，在追踪系统中以红色高亮失败轨迹。
+
 ## 环境变量
 
 ```text
@@ -134,6 +191,8 @@ WORKER_ID=worker-1
 # 可选：配置后 worker 与 runtime 切换为真实 OpenAI 兼容 LLM，缺省时使用 Stub（本地无副作用）
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_API_KEY=sk-...
+# 设为 1 时禁用 OpenTelemetry exporter，返回 no-op tracer（单元测试 / 无 Collector 场景）
+OTEL_DISABLED=1
 ```
 
 ## 可靠性模型
@@ -167,8 +226,11 @@ recovery 进程还会扫描 READY 节点。这用于关闭一个投递缺口：�
 go test ./...
 ```
 
-覆盖 40 个用例：
+覆盖 50+ 个用例：
 
-- `internal/store`：多租户过滤、tool_call 幂等存储（sqlmock）
-- `internal/runtime`：Resumer 事件推进与错误传播（fake store）、LLMPlanner JSON 解析
-- `internal/executor`：节点分发、工具调用幂等（SUCCESS 缓存 / FAILED 重试 / RUNNING 拒绝）
+- `internal/store`：多租户过滤、tool_call 幂等存储、RetryNode/DLQ、Inbox、Checkpoint、LLM usage 落库（sqlmock）
+- `internal/runtime`：Resumer 事件推进与错误传播（fake store）、Inbox 幂等、LLMPlanner JSON 解析
+- `internal/executor`：节点分发、工具调用幂等、LLM token/cost 记录
+- `internal/retry`：退避策略与抖动
+- `internal/worker`：成本估算（DefaultPricer）
+- `internal/trace`：OTel 初始化与 no-op 降级
