@@ -19,6 +19,9 @@ type Store interface {
 	DependenciesReady(ctx context.Context, tenant, nodeID string) (bool, error)
 	RunComplete(ctx context.Context, tenant, runID string) (bool, error)
 	RunHasFailure(ctx context.Context, tenant, runID string) (bool, error)
+	// 消费端幂等 Inbox：InboxSeen 处理前查表，MarkInbox 处理后写表，去重 RocketMQ 至少一次投递。
+	InboxSeen(ctx context.Context, tenant, eventID string) (bool, error)
+	MarkInbox(ctx context.Context, tenant, eventID string) error
 }
 
 // Queue 抽象任务投递所需的最小操作。*queue.RedisQueue 满足该接口。

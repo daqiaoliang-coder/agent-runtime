@@ -26,6 +26,27 @@ func (r *Resumer) Handle(ctx context.Context, e model.Event) error {
 	if e.Type != "AgentStepCompleted" && e.Type != "AgentStepFailed" {
 		return nil
 	}
+	// 消费端幂等 Inbox：处理前查表，已处理过的事件直接跳过，去重 RocketMQ 至少一次投递的重复消息。
+	seen, err := r.Store.InboxSeen(ctx, e.TenantID, e.ID)
+	if err != nil {
+		return fmt.Errorf("inbox seen: %w", err)
+	}
+	if seen {
+		return nil
+	}
+	// 标记后模式：先推进事件，成功后再写 Inbox；处理中途崩溃不会误标完成，
+	// 重投递可幂等重放（底层 CAS/状态机本身幂等）。
+	if err := r.process(ctx, e); err != nil {
+		return err
+	}
+	if err := r.Store.MarkInbox(ctx, e.TenantID, e.ID); err != nil {
+		return fmt.Errorf("mark inbox: %w", err)
+	}
+	return nil
+}
+
+// process 执行事件推进逻辑（原 Handle 主体）。返回 error 时不写 Inbox，触发重投递。
+func (r *Resumer) process(ctx context.Context, e model.Event) error {
 	if e.Type == "AgentStepFailed" {
 		// 修复 Bug2：必须先拿到 Run 当前 version，再用 CAS 标记失败，否则 WHERE version=0 永不匹配。
 		run, err := r.Store.GetRun(ctx, e.TenantID, e.RunID)

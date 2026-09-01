@@ -8,10 +8,13 @@ import (
 	"agent-runtime/internal/llm"
 	"agent-runtime/internal/model"
 	"agent-runtime/internal/queue"
+	"agent-runtime/internal/retry"
 	"agent-runtime/internal/store"
 	"agent-runtime/internal/tool"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -25,6 +28,7 @@ type Worker struct {
 	Queue  *queue.RedisQueue
 	Events *event.RocketMQ
 	Exec   executor.Executor
+	Retry  retry.Policy
 	ID     string
 }
 
@@ -69,25 +73,59 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	// 执行节点：替换原先的占位字符串拼接，真正发起 LLM 推理或工具调用。
 	output, execErr := w.Exec.Execute(ctx, n)
 	if execErr != nil {
-		// 执行失败：经 Outbox 写 AgentStepFailed 事件，触发 Resume 将 Run 标记为 FAILED。
+		next := n.Attempt + 1
+		if w.Retry.ShouldRetry(next) {
+			// 仍可重试：指数退避，置回 READY 并安排 ready_at，ack 任务。
+			// recovery 的 ReadyTasks 扫描会在 ready_at 到期后补投递，实现真正的退避重试。
+			readyAt := time.Now().Add(w.Retry.Backoff(next))
+			ok, rerr := w.Store.RetryNode(ctx, n.TenantID, n.ID, n.Version, readyAt)
+			if rerr != nil {
+				return fmt.Errorf("retry node: %w (exec err: %v)", rerr, execErr)
+			}
+			if !ok {
+				// 版本/状态已变（可能被恢复抢占），不 ack，任务重投递由恢复机制收敛。
+				return fmt.Errorf("retry cas conflict for %s (exec err: %v)", n.ID, execErr)
+			}
+			return nil
+		}
+		// 重试耗尽：入死信队列 + 失败事件，由 Resume 收敛 Run 为 FAILED。
+		_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, execErr.Error(), next, output)
 		fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: execErr.Error(), Timestamp: time.Now()}
 		payload, _ := json.Marshal(fe)
 		if _, ferr := w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{ID: fe.ID, EventType: fe.Type, AggregateID: n.RunID, Payload: string(payload)}); ferr != nil {
-			// DB 写失败：不 ack，任务重投递，节点靠租约过期恢复后重试。
 			return fmt.Errorf("persist failure: %w (exec err: %v)", ferr, execErr)
 		}
-		// 执行失败已持久化为事件，ack 任务，由 Resume 收敛 Run。
 		return nil
 	}
 
 	e := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepCompleted", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Output: output, Timestamp: time.Now()}
 	payload, _ := json.Marshal(e)
+	// 累积检查点上下文（对话历史 + 节点输出），在节点完成前落盘，供崩溃恢复重建 Agent 上下文。
+	w.saveCheckpoint(ctx, n, output)
 	// 节点完成 + Outbox 事件在同一事务内提交，保证状态与事件一致。
 	_, err = w.Store.CompleteNodeWithOutbox(ctx, n, output, model.OutboxMessage{ID: e.ID, EventType: e.Type, AggregateID: n.RunID, Payload: string(payload)})
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+// saveCheckpoint 累积更新 Run 检查点：追加本节点的输入/输出到对话历史与 NodeOutputs。
+// 最佳努力落盘（忽略错误）：节点状态由 CompleteNodeWithOutbox 事务保证，检查点为上下文缓存。
+func (w *Worker) saveCheckpoint(ctx context.Context, n *model.Node, output string) {
+	_, _, stateJSON, err := w.Store.LoadCheckpoint(ctx, n.RunID)
+	var rc model.RunContext
+	if err == nil && len(stateJSON) > 0 {
+		_ = json.Unmarshal(stateJSON, &rc)
+	}
+	if rc.NodeOutputs == nil {
+		rc.NodeOutputs = map[string]string{}
+	}
+	rc.NodeOutputs[n.Name] = output
+	rc.Messages = append(rc.Messages,
+		model.ChatTurn{Role: string(llm.RoleUser), Content: n.Input},
+		model.ChatTurn{Role: string(llm.RoleAssistant), Content: output})
+	_ = w.Store.SaveCheckpoint(ctx, n.RunID, n.Version, n.ID, rc)
 }
 
 // NewFromEnv 从环境变量 WORKER_ID 读取标识，缺省时按时间戳生成。
@@ -108,6 +146,26 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 		}
 	}
 	// ToolStore=s 使 TOOL 节点经 tool_call 表保证幂等（SUCCESS 复用、崩溃在途拒绝重执行）。
-	return &Worker{Store: s, Queue: q, Events: r, ID: id,
-		Exec: &executor.Dispatcher{LLM: client, Tools: tools, ToolStore: s}}
+	// Retry=指数退避策略，失败可重试节点置回 READY 并按 ready_at 补投递，耗尽入 DLQ。
+	disp := &executor.Dispatcher{LLM: client, Tools: tools, ToolStore: s}
+	// ContextLoader 从 checkpoint 重建对话历史，使崩溃恢复后的 LLM 节点保持上下文连续。
+	disp.ContextLoader = func(ctx context.Context, runID string) ([]llm.Message, error) {
+		_, _, stateJSON, err := s.LoadCheckpoint(ctx, runID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, nil // 无历史检查点（根节点首次执行），非错误
+			}
+			return nil, err
+		}
+		var rc model.RunContext
+		if err := json.Unmarshal(stateJSON, &rc); err != nil {
+			return nil, err
+		}
+		msgs := make([]llm.Message, 0, len(rc.Messages))
+		for _, m := range rc.Messages {
+			msgs = append(msgs, llm.Message{Role: llm.Role(m.Role), Content: m.Content})
+		}
+		return msgs, nil
+	}
+	return &Worker{Store: s, Queue: q, Events: r, ID: id, Retry: retry.Default(), Exec: disp}
 }

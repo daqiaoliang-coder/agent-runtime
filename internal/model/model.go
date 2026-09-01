@@ -104,3 +104,17 @@ type ToolCall struct {
 	Output                                                     string
 	Attempt                                                    int
 }
+
+// ChatTurn 是对话历史中的一轮，用于 Checkpoint 上下文恢复。
+type ChatTurn struct{ Role, Content string }
+
+// RunContext 是持久化到 checkpoint 表的运行上下文：
+//   - Messages：累积的对话历史（user 输入 + assistant/工具输出）；
+//   - NodeOutputs：各节点输出，按节点名索引。
+//
+// 崩溃恢复后，后续 LLM 节点可从 checkpoint 重建对话历史，保证 Agent 上下文连续。
+type RunContext struct {
+	Messages     []ChatTurn
+	NodeOutputs  map[string]string
+	GraphVersion int64
+}

@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -241,6 +242,13 @@ func (s *MySQL) SaveCheckpoint(ctx context.Context, runID string, version int64,
 	return err
 }
 
+// LoadCheckpoint 读取 Run 最近一次检查点（graph 版本、当前节点、状态 JSON），供崩溃恢复上下文。
+// 用于 Agent 上下文连续性：崩溃恢复后的 LLM 节点据此重建对话历史。
+func (s *MySQL) LoadCheckpoint(ctx context.Context, runID string) (version int64, nodeID string, stateJSON []byte, err error) {
+	err = s.DB.QueryRowContext(ctx, `SELECT graph_version,COALESCE(current_node_id,''),state_json FROM checkpoint WHERE run_id=?`, runID).Scan(&version, &nodeID, &stateJSON)
+	return
+}
+
 func (s *MySQL) PutOutbox(ctx context.Context, tx *sql.Tx, e model.OutboxMessage) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO event_outbox(event_id,event_type,aggregate_id,payload) VALUES(?,?,?,?)`, e.ID, e.EventType, e.AggregateID, e.Payload)
 	return err
@@ -255,7 +263,7 @@ func (s *MySQL) CompleteNodeWithOutbox(ctx context.Context, node *model.Node, ou
 		return false, err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,output=?,version=version+1,lease_owner=NULL,lease_until=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=? AND status=?`, model.NodeSuccess, output, node.ID, node.TenantID, node.Version, model.NodeRunning)
+	res, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,output=?,version=version+1,lease_owner=NULL,lease_until=NULL,ready_at=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=? AND status=?`, model.NodeSuccess, output, node.ID, node.TenantID, node.Version, model.NodeRunning)
 	if err != nil {
 		return false, err
 	}
@@ -276,7 +284,7 @@ func (s *MySQL) FailNodeWithOutbox(ctx context.Context, node *model.Node, e mode
 		return false, err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=?`, model.NodeFailed, node.ID, node.TenantID, node.Version)
+	res, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,ready_at=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=?`, model.NodeFailed, node.ID, node.TenantID, node.Version)
 	if err != nil {
 		return false, err
 	}
@@ -336,10 +344,11 @@ func (s *MySQL) RetryOutbox(ctx context.Context, id string, after time.Duration)
 	return err
 }
 
-// ReadyTasks 扫描全部 READY 节点（系统级，不限定租户），
+// ReadyTasks 扫描全部就绪且 ready_at 已到期的 READY 节点（系统级，不限定租户），
 // 返回的任务携带 tenant_id 以便补投递时保持租户上下文。
+// ready_at 闸门实现退避重试：未到期的重试节点不会被提前投递。
 func (s *MySQL) ReadyTasks(ctx context.Context, limit int) ([]model.Task, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT node_id, run_id, tenant_id, attempt FROM agent_node WHERE status=? ORDER BY created_at LIMIT ?`, model.NodeReady, limit)
+	rows, err := s.DB.QueryContext(ctx, `SELECT node_id, run_id, tenant_id, attempt FROM agent_node WHERE status=? AND (ready_at IS NULL OR ready_at<=NOW(6)) ORDER BY created_at LIMIT ?`, model.NodeReady, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -353,6 +362,24 @@ func (s *MySQL) ReadyTasks(ctx context.Context, limit int) ([]model.Task, error)
 		tasks = append(tasks, t)
 	}
 	return tasks, rows.Err()
+}
+
+// RetryNode 将 RUNNING 节点重置为 READY 并安排 ready_at（退避到期时间），attempt+1。
+// 用于可重试失败的指数退避重试；recovery 的 ReadyTasks 扫描会在 ready_at 到期后补投递。
+func (s *MySQL) RetryNode(ctx context.Context, tenant, id string, version int64, readyAt time.Time) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET status=?,ready_at=?,attempt=attempt+1,lease_owner=NULL,lease_until=NULL,version=version+1 WHERE node_id=? AND tenant_id=? AND version=? AND status=?`, model.NodeReady, readyAt, id, tenant, version, model.NodeRunning)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// EnqueueDLQ 将重试耗尽的节点写入死信队列，供人工排查或补偿。
+func (s *MySQL) EnqueueDLQ(ctx context.Context, tenant, runID, nodeID, reason string, attempt int, payload string) error {
+	dlqID := fmt.Sprintf("dlq-%s-%d", nodeID, time.Now().UnixNano())
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO agent_dlq(dlq_id,run_id,node_id,tenant_id,reason,attempt,payload) VALUES(?,?,?,?,?,?,?)`, dlqID, runID, nodeID, tenant, reason, attempt, payload)
+	return err
 }
 
 // ClaimToolCall 以 INSERT IGNORE 抢占工具调用记录（status=RUNNING）。
@@ -397,6 +424,26 @@ func (s *MySQL) CompleteToolCall(ctx context.Context, tenant, callID, output str
 // FailToolCall 标记调用失败，仅当当前为 RUNNING 时生效。
 func (s *MySQL) FailToolCall(ctx context.Context, tenant, callID string) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE tool_call SET status='FAILED' WHERE call_id=? AND tenant_id=? AND status='RUNNING'`, callID, tenant)
+	return err
+}
+
+// InboxSeen 查询事件是否已被该租户消费过（消费端幂等 Inbox 的查表步骤）。
+// 采用"处理前查表、处理后写表"的标记后模式：崩溃在处理中途不会误标完成，重投递可幂等重放。
+func (s *MySQL) InboxSeen(ctx context.Context, tenant, eventID string) (bool, error) {
+	var one int
+	err := s.DB.QueryRowContext(ctx, `SELECT 1 FROM agent_inbox WHERE event_id=? AND tenant_id=?`, eventID, tenant).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// MarkInbox 在事件成功处理后写入 Inbox，INSERT IGNORE 保证幂等（重复写不影响）。
+func (s *MySQL) MarkInbox(ctx context.Context, tenant, eventID string) error {
+	_, err := s.DB.ExecContext(ctx, `INSERT IGNORE INTO agent_inbox(event_id,tenant_id) VALUES(?,?)`, eventID, tenant)
 	return err
 }
 

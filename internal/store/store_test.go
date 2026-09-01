@@ -258,3 +258,124 @@ func TestCompleteToolCall_SetsSuccess(t *testing.T) {
 		t.Errorf("expectations not met: %v", err)
 	}
 }
+
+// TestRetryNode_SetsReadyWithReadyAt 重试回退：RUNNING→READY 并写 ready_at、attempt+1。
+func TestRetryNode_SetsReadyWithReadyAt(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	readyAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	mock.ExpectExec("ready_at=\\?,attempt=attempt\\+1").
+		WithArgs(model.NodeReady, readyAt, "node-1", "tenant-A", int64(0), model.NodeRunning).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	ok, err := s.RetryNode(context.Background(), "tenant-A", "node-1", 0, readyAt)
+	if err != nil {
+		t.Fatalf("RetryNode: %v", err)
+	}
+	if !ok {
+		t.Errorf("expected retry success")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expectations not met: %v", err)
+	}
+}
+
+// TestEnqueueDLQ_InsertsWithTenant 死信写入必须携带 tenant_id。
+func TestEnqueueDLQ_InsertsWithTenant(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	mock.ExpectExec("INSERT INTO agent_dlq").
+		WithArgs(sqlmock.AnyArg(), "run-1", "node-1", "tenant-A", "boom", 4, "").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	if err := s.EnqueueDLQ(context.Background(), "tenant-A", "run-1", "node-1", "boom", 4, ""); err != nil {
+		t.Fatalf("EnqueueDLQ: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expectations not met: %v", err)
+	}
+}
+
+// TestReadyTasks_GatesOnReadyAt ReadyTasks 扫描 SQL 必须含 ready_at 到期闸门。
+func TestReadyTasks_GatesOnReadyAt(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	rows := sqlmock.NewRows([]string{"node_id", "run_id", "tenant_id", "attempt"}).
+		AddRow("node-1", "run-1", "tenant-A", 2)
+	mock.ExpectQuery("ready_at").WillReturnRows(rows)
+	tasks, err := s.ReadyTasks(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("ReadyTasks: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].NodeID != "node-1" {
+		t.Errorf("unexpected tasks: %+v", tasks)
+	}
+}
+
+// TestInboxSeen_FalseWhenNoRow 无记录返回 false（未处理）。
+func TestInboxSeen_FalseWhenNoRow(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	mock.ExpectQuery("FROM agent_inbox").
+		WithArgs("evt-1", "tenant-A").
+		WillReturnError(sql.ErrNoRows)
+	seen, err := s.InboxSeen(context.Background(), "tenant-A", "evt-1")
+	if err != nil || seen {
+		t.Fatalf("expected (false,nil), got (%v,%v)", seen, err)
+	}
+}
+
+// TestInboxSeen_TrueWhenRecorded 有记录返回 true（已处理）。
+func TestInboxSeen_TrueWhenRecorded(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	mock.ExpectQuery("FROM agent_inbox").
+		WithArgs("evt-1", "tenant-A").
+		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+	seen, err := s.InboxSeen(context.Background(), "tenant-A", "evt-1")
+	if err != nil || !seen {
+		t.Fatalf("expected (true,nil), got (%v,%v)", seen, err)
+	}
+}
+
+// TestMarkInbox_Inserts 写入 Inbox 携带 event_id + tenant_id。
+func TestMarkInbox_Inserts(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	mock.ExpectExec("INSERT IGNORE INTO agent_inbox").
+		WithArgs("evt-1", "tenant-A").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := s.MarkInbox(context.Background(), "tenant-A", "evt-1"); err != nil {
+		t.Fatalf("MarkInbox: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expectations not met: %v", err)
+	}
+}
+
+// TestLoadCheckpoint_ReadsState 读取检查点返回 graph 版本、当前节点、状态 JSON。
+func TestLoadCheckpoint_ReadsState(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	mock.ExpectQuery("FROM checkpoint").
+		WithArgs("run-1").
+		WillReturnRows(sqlmock.NewRows([]string{"graph_version", "current_node_id", "state_json"}).
+			AddRow(int64(3), "node-1", []byte(`{"messages":[],"node_outputs":null}`)))
+	v, node, state, err := s.LoadCheckpoint(context.Background(), "run-1")
+	if err != nil || v != 3 || node != "node-1" || len(state) == 0 {
+		t.Fatalf("LoadCheckpoint: v=%d node=%s state=%s err=%v", v, node, string(state), err)
+	}
+}
+
+// TestSaveCheckpoint_UpsertsState 检查点写入为 upsert（ON DUPLICATE KEY UPDATE）。
+func TestSaveCheckpoint_UpsertsState(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	mock.ExpectExec("INSERT INTO checkpoint").
+		WithArgs("run-1", int64(2), "node-1", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := s.SaveCheckpoint(context.Background(), "run-1", 2, "node-1", model.RunContext{Messages: []model.ChatTurn{{Role: "user", Content: "hi"}}}); err != nil {
+		t.Fatalf("SaveCheckpoint: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expectations not met: %v", err)
+	}
+}

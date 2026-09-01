@@ -35,6 +35,9 @@ type fakeStore struct {
 	markReadyCalls     []string
 	runCompleteCalls   []string
 	runHasFailureCalls []string
+
+	// Inbox 模拟：已处理事件集合。InboxSeen 查表、MarkInbox 写表。
+	inbox map[string]bool
 }
 
 type getRunCall struct{ tenant, id string }
@@ -80,6 +83,16 @@ func (f *fakeStore) RunHasFailure(_ context.Context, tenant, _ string) (bool, er
 	f.runHasFailureCalls = append(f.runHasFailureCalls, tenant)
 	return f.runHasFailure, f.runHasFailureErr
 }
+func (f *fakeStore) InboxSeen(_ context.Context, _, eventID string) (bool, error) {
+	return f.inbox[eventID], nil
+}
+func (f *fakeStore) MarkInbox(_ context.Context, _, eventID string) error {
+	if f.inbox == nil {
+		f.inbox = map[string]bool{}
+	}
+	f.inbox[eventID] = true
+	return nil
+}
 
 // fakeQueue 记录入队任务，用于断言子节点被正确投递且携带租户。
 type fakeQueue struct {
@@ -108,6 +121,34 @@ func TestResumer_IgnoresUnrelatedEvent(t *testing.T) {
 	}
 	if len(fs.getRunCalls)+len(fs.updateCASCalls)+len(fs.childrenCalls) != 0 {
 		t.Errorf("expected no store calls for unrelated event, got %+v", fs)
+	}
+}
+
+// TestResumer_InboxDedup 同一事件第二次投递应被 Inbox 跳过，不重复推进 DAG。
+func TestResumer_InboxDedup(t *testing.T) {
+	fs := &fakeStore{
+		getRun:      &model.Run{ID: "run-1", TenantID: "tenant-A", Version: 3, Status: model.RunRunning},
+		casOK:       true,
+		runComplete: true,
+	}
+	r := &Resumer{Store: fs, Queue: &fakeQueue{}}
+	evt := completedEvent()
+	if err := r.Handle(context.Background(), evt); err != nil {
+		t.Fatalf("first handle: %v", err)
+	}
+	firstChildren := len(fs.childrenCalls)
+	if firstChildren != 1 {
+		t.Fatalf("expected 1 children call on first handle, got %d", firstChildren)
+	}
+	// 第二次投递：InboxSeen 命中，应直接跳过，不再查 Children。
+	if err := r.Handle(context.Background(), evt); err != nil {
+		t.Fatalf("second handle: %v", err)
+	}
+	if len(fs.childrenCalls) != firstChildren {
+		t.Errorf("inbox should dedup: children calls grew %d -> %d", firstChildren, len(fs.childrenCalls))
+	}
+	if !fs.inbox[evt.ID] {
+		t.Errorf("inbox should contain event %s after first handle", evt.ID)
 	}
 }
 

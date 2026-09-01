@@ -30,10 +30,11 @@ type ToolCallStore interface {
 
 // Dispatcher 按 node.Type 路由到具体执行器。未识别类型返回错误，避免静默失败。
 type Dispatcher struct {
-	LLM      llm.Client
-	Tools    *tool.Registry
-	ToolStore ToolCallStore // 工具调用幂等存储；为 nil 时工具退化为直接执行（测试/无 DB 场景）
-	SubAgent Executor      // 子 Agent 执行器（递归运行子 Run），当前为占位实现
+	LLM           llm.Client
+	Tools         *tool.Registry
+	ToolStore     ToolCallStore      // 工具调用幂等存储；为 nil 时工具退化为直接执行（测试/无 DB 场景）
+	SubAgent      Executor          // 子 Agent 执行器（递归运行子 Run），当前为占位实现
+	ContextLoader func(ctx context.Context, runID string) ([]llm.Message, error) // 从 checkpoint 重建对话历史
 }
 
 // Execute 根据 node.Type 分发：
@@ -60,7 +61,18 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 	if d.LLM == nil {
 		return "", fmt.Errorf("llm client not configured")
 	}
-	resp, err := d.LLM.Complete(ctx, llm.Request{Messages: []llm.Message{{Role: llm.RoleUser, Content: n.Input}}})
+	// 从 checkpoint 重建对话历史：历史在前，当前 user prompt 在后，保证 Agent 上下文连续。
+	msgs := []llm.Message{{Role: llm.RoleUser, Content: n.Input}}
+	if d.ContextLoader != nil {
+		hist, err := d.ContextLoader(ctx, n.RunID)
+		if err != nil {
+			return "", fmt.Errorf("load context: %w", err)
+		}
+		if len(hist) > 0 {
+			msgs = append(hist, msgs...)
+		}
+	}
+	resp, err := d.LLM.Complete(ctx, llm.Request{Messages: msgs})
 	if err != nil {
 		return "", fmt.Errorf("llm: %w", err)
 	}

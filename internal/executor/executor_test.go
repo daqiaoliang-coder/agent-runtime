@@ -5,6 +5,7 @@ import (
 	"agent-runtime/internal/model"
 	"agent-runtime/internal/tool"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -29,6 +30,35 @@ func TestDispatcher_LLMNode_CallsClient(t *testing.T) {
 	}
 	if out != "hello from llm" {
 		t.Errorf("output = %q, want %q", out, "hello from llm")
+	}
+}
+
+// TestDispatcher_LLM_PrependsContextHistory LLM 节点应从 ContextLoader 重建对话历史并前置。
+func TestDispatcher_LLM_PrependsContextHistory(t *testing.T) {
+	var got []llm.Message
+	stub := &llm.Stub{Responder: func(req llm.Request) string {
+		got = req.Messages
+		return "ok"
+	}}
+	d := &Dispatcher{LLM: stub, ContextLoader: func(_ context.Context, _ string) ([]llm.Message, error) {
+		return []llm.Message{{Role: llm.RoleAssistant, Content: "prior"}}, nil
+	}}
+	if _, err := d.Execute(context.Background(), &model.Node{Type: model.NodeLLM, Input: "next", RunID: "run-1"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 || got[0].Content != "prior" || got[1].Content != "next" {
+		t.Errorf("expected [prior, next], got %+v", got)
+	}
+}
+
+// TestDispatcher_LLM_ContextLoaderError_Propagates ContextLoader 报错应传播，不静默吞掉。
+func TestDispatcher_LLM_ContextLoaderError_Propagates(t *testing.T) {
+	d := &Dispatcher{LLM: llm.Echo(), ContextLoader: func(_ context.Context, _ string) ([]llm.Message, error) {
+		return nil, errors.New("db down")
+	}}
+	_, err := d.Execute(context.Background(), &model.Node{Type: model.NodeLLM, Input: "x", RunID: "r"})
+	if err == nil || !strings.Contains(err.Error(), "db down") {
+		t.Fatalf("expected context load error, got %v", err)
 	}
 }
 
