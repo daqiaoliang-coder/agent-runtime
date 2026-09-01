@@ -1,3 +1,5 @@
+// cmd/outbox 是事件发布入口：定时抢占 Outbox 表中的待发消息，
+// 发送到 RocketMQ，失败则退避重试，成功后标记 PUBLISHED，实现可靠投递。
 package main
 
 import (

@@ -1,3 +1,5 @@
+// cmd/recovery 是崩溃恢复入口：定时扫描租约过期节点重置为 PENDING，
+// 同时补投递 READY 节点，关闭“提交 READY 后崩溃未入队”的投递缺口。
 package main
 
 import (

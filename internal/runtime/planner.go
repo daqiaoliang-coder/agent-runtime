@@ -5,9 +5,19 @@ import (
 	"fmt"
 )
 
+// Planner 负责将用户输入转化为可执行的 DAG 计划。
+// 实现可替换为基于 LLM 的动态规划器，DemoPlanner 为演示用的静态规划器。
 type Planner interface {
 	Plan(run *model.Run) (model.Plan, error)
 }
+
+// DemoPlanner 是一个演示用规划器，生成固定的 DAG：
+//
+//	Search A ──┐
+//	           ├──> Reason ──> Report
+//	Search B ──┘
+//
+// 其中 Search A/B 为可并行的工具节点，Reason 依赖两者，Report 依赖 Reason。
 type DemoPlanner struct{}
 
 func (DemoPlanner) Plan(run *model.Run) (model.Plan, error) {

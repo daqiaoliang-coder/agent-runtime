@@ -1,3 +1,4 @@
+// cmd/worker 是任务执行入口：连接 MySQL/Redis/RocketMQ，阻塞消费队列并调用 Worker.Handle 执行节点。
 package main
 
 import (

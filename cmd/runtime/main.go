@@ -1,3 +1,4 @@
+// cmd/runtime 是 Run 创建入口：连接 MySQL/Redis，调用 Runtime.CreateRun 生成 DAG 并投递初始任务。
 package main
 
 import (

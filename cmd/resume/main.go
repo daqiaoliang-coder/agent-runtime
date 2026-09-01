@@ -1,3 +1,4 @@
+// cmd/resume 是 DAG 推进入口：消费 RocketMQ 完成事件，调用 Resumer.Handle 激活后继节点并收敛 Run。
 package main
 
 import (
