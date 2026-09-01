@@ -94,3 +94,13 @@ type Event struct {
 // OutboxMessage 是 MySQL Outbox 表中的待发布消息。
 // 节点完成时与状态变更写入同一事务，保证至少一次投递到 RocketMQ。
 type OutboxMessage struct{ ID, EventType, AggregateID, Payload string }
+
+// ToolCall 记录一次工具调用的幂等状态，对应 tool_call 表。
+// IdempotencyKey 全局唯一，由 (run_id, node_id, tool_name, input) 派生、跨重试稳定。
+// 状态机：RUNNING -> SUCCESS/FAILED。SUCCESS 的记录可被复用以跳过重复副作用。
+type ToolCall struct {
+	CallID, TenantID, RunID, NodeID, ToolName, IdempotencyKey string
+	Status                                                     string
+	Output                                                     string
+	Attempt                                                    int
+}

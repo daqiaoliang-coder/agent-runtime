@@ -156,3 +156,105 @@ func TestClaimNode_TenantMismatch_NoRowAffected(t *testing.T) {
 		t.Errorf("expected no claim for mismatched tenant")
 	}
 }
+
+// TestClaimToolCall_InsertsRunningWithTenant 验证工具调用幂等抢占：
+// INSERT IGNORE 必须写入 tenant_id 与 status='RUNNING'，1 行受影响时返回 true。
+func TestClaimToolCall_InsertsRunningWithTenant(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	// 参数顺序：callID, tenant, runID, nodeID, toolName, idempotencyKey, input, attempt
+	mock.ExpectExec("INSERT IGNORE INTO tool_call").
+		WithArgs("call-1", "tenant-A", "run-1", "node-1", "search", "call-1", "q", 0).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	ok, err := s.ClaimToolCall(context.Background(), "tenant-A", "call-1", "run-1", "node-1", "search", "call-1", "q", 0)
+	if err != nil {
+		t.Fatalf("ClaimToolCall: %v", err)
+	}
+	if !ok {
+		t.Errorf("expected new claim (1 row affected)")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expectations not met: %v", err)
+	}
+}
+
+// TestClaimToolCall_ConflictReturnsFalse 幂等键冲突（0 行受影响）应返回 false 而非报错。
+func TestClaimToolCall_ConflictReturnsFalse(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	mock.ExpectExec("INSERT IGNORE INTO tool_call").
+		WithArgs("call-1", "tenant-A", "run-1", "node-1", "search", "call-1", "q", 0).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	ok, err := s.ClaimToolCall(context.Background(), "tenant-A", "call-1", "run-1", "node-1", "search", "call-1", "q", 0)
+	if err != nil {
+		t.Fatalf("ClaimToolCall: %v", err)
+	}
+	if ok {
+		t.Errorf("expected false on idempotency-key conflict")
+	}
+}
+
+// TestGetToolCall_TenantFilter 读取工具调用必须按租户 + 幂等键过滤。
+func TestGetToolCall_TenantFilter(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	rows := sqlmock.NewRows([]string{"call_id", "tenant_id", "run_id", "node_id", "tool_name", "idempotency_key", "status", "output", "attempt"}).
+		AddRow("call-1", "tenant-A", "run-1", "node-1", "search", "call-1", "SUCCESS", "result-1", 0)
+	mock.ExpectQuery("FROM tool_call").
+		WithArgs("call-1", "tenant-A").
+		WillReturnRows(rows)
+	tc, err := s.GetToolCall(context.Background(), "tenant-A", "call-1")
+	if err != nil {
+		t.Fatalf("GetToolCall: %v", err)
+	}
+	if tc.Status != "SUCCESS" || tc.Output != "result-1" || tc.TenantID != "tenant-A" {
+		t.Errorf("unexpected tool call: %+v", tc)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expectations not met: %v", err)
+	}
+}
+
+// TestGetToolCall_TenantMismatch_NoRow 错误租户读不到其他租户的工具调用。
+func TestGetToolCall_TenantMismatch_NoRow(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	mock.ExpectQuery("FROM tool_call").
+		WithArgs("call-1", "tenant-B").
+		WillReturnError(sql.ErrNoRows)
+	_, err := s.GetToolCall(context.Background(), "tenant-B", "call-1")
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows for mismatched tenant, got %v", err)
+	}
+}
+
+// TestReclaimToolCall_OnlyFailed 仅 FAILED 状态可回收为 RUNNING。
+func TestReclaimToolCall_OnlyFailed(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	mock.ExpectExec("UPDATE tool_call SET status='RUNNING'").
+		WithArgs("call-1", "tenant-A").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	ok, err := s.ReclaimToolCall(context.Background(), "tenant-A", "call-1")
+	if err != nil {
+		t.Fatalf("ReclaimToolCall: %v", err)
+	}
+	if !ok {
+		t.Errorf("expected reclaim success for FAILED call")
+	}
+}
+
+// TestCompleteToolCall_SetsSuccess 成功落库必须写 output 并置 SUCCESS。
+func TestCompleteToolCall_SetsSuccess(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	mock.ExpectExec("status='SUCCESS'").
+		WithArgs("result-1", "call-1", "tenant-A").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := s.CompleteToolCall(context.Background(), "tenant-A", "call-1", "result-1"); err != nil {
+		t.Fatalf("CompleteToolCall: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expectations not met: %v", err)
+	}
+}

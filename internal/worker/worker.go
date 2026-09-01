@@ -91,20 +91,23 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 }
 
 // NewFromEnv 从环境变量 WORKER_ID 读取标识，缺省时按时间戳生成。
-// 默认注入 executor.NewDefault（Stub LLM + 演示工具）；配置 OPENAI_API_KEY 时切换为真实 HTTP 客户端。
+// 默认使用 Echo（Stub）LLM + Search/Calculator 工具，并注入真实 store 启用 tool_call 幂等。
+// 配置 OPENAI_BASE_URL + OPENAI_API_KEY 时切换为真实 OpenAI 兼容 HTTP 客户端。
 func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker {
 	id := os.Getenv("WORKER_ID")
 	if id == "" {
 		id = fmt.Sprintf("worker-%d", time.Now().UnixNano())
 	}
-	w := &Worker{Store: s, Queue: q, Events: r, ID: id, Exec: executor.NewDefault()}
+	tools := tool.NewRegistry()
+	tools.Register(tool.Search{})
+	tools.Register(tool.Calculator{})
+	var client llm.Client = llm.Echo()
 	if base := os.Getenv("OPENAI_BASE_URL"); base != "" {
 		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
-			tools := tool.NewRegistry()
-			tools.Register(tool.Search{})
-			tools.Register(tool.Calculator{})
-			w.Exec = &executor.Dispatcher{LLM: llm.NewOpenAIClient(base, key), Tools: tools}
+			client = llm.NewOpenAIClient(base, key)
 		}
 	}
-	return w
+	// ToolStore=s 使 TOOL 节点经 tool_call 表保证幂等（SUCCESS 复用、崩溃在途拒绝重执行）。
+	return &Worker{Store: s, Queue: q, Events: r, ID: id,
+		Exec: &executor.Dispatcher{LLM: client, Tools: tools, ToolStore: s}}
 }

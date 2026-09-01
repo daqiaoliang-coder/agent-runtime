@@ -355,4 +355,49 @@ func (s *MySQL) ReadyTasks(ctx context.Context, limit int) ([]model.Task, error)
 	return tasks, rows.Err()
 }
 
+// ClaimToolCall 以 INSERT IGNORE 抢占工具调用记录（status=RUNNING）。
+// idempotency_key 的 UNIQUE 约束保证：同一 (node,tool,input) 只有一个 RUNNING 拥有者。
+// 返回 true=新建并占有、false=已存在（需走 GetToolCall 判断复用/拒绝）。
+func (s *MySQL) ClaimToolCall(ctx context.Context, tenant, callID, runID, nodeID, toolName, idempotencyKey, input string, attempt int) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `INSERT IGNORE INTO tool_call(call_id,tenant_id,run_id,node_id,tool_name,idempotency_key,status,input,attempt) VALUES(?,?,?,?,?,?,'RUNNING',?,?)`,
+		callID, tenant, runID, nodeID, toolName, idempotencyKey, input, attempt)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// GetToolCall 按租户 + 幂等键读取工具调用记录，复用结果或判断停滞状态。
+func (s *MySQL) GetToolCall(ctx context.Context, tenant, idempotencyKey string) (*model.ToolCall, error) {
+	tc := &model.ToolCall{}
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT call_id,tenant_id,run_id,node_id,tool_name,idempotency_key,status,COALESCE(output,''),attempt FROM tool_call WHERE idempotency_key=? AND tenant_id=?`,
+		idempotencyKey, tenant).Scan(&tc.CallID, &tc.TenantID, &tc.RunID, &tc.NodeID, &tc.ToolName, &tc.IdempotencyKey, &tc.Status, &tc.Output, &tc.Attempt)
+	return tc, err
+}
+
+// ReclaimToolCall 将 FAILED 的调用回收为 RUNNING（attempt+1），用于失败重试。
+// 仅 FAILED 可回收；RUNNING 不可回收（避免并发重复占有）。
+func (s *MySQL) ReclaimToolCall(ctx context.Context, tenant, callID string) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `UPDATE tool_call SET status='RUNNING',attempt=attempt+1 WHERE call_id=? AND tenant_id=? AND status='FAILED'`, callID, tenant)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// CompleteToolCall 标记调用成功并写入输出，仅当当前为 RUNNING 时生效。
+func (s *MySQL) CompleteToolCall(ctx context.Context, tenant, callID, output string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE tool_call SET status='SUCCESS',output=? WHERE call_id=? AND tenant_id=? AND status='RUNNING'`, output, callID, tenant)
+	return err
+}
+
+// FailToolCall 标记调用失败，仅当当前为 RUNNING 时生效。
+func (s *MySQL) FailToolCall(ctx context.Context, tenant, callID string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE tool_call SET status='FAILED' WHERE call_id=? AND tenant_id=? AND status='RUNNING'`, callID, tenant)
+	return err
+}
+
 var ErrNotFound = errors.New("not found")
