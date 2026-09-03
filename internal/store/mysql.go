@@ -457,3 +457,53 @@ func (s *MySQL) RecordLLMUsage(ctx context.Context, u model.LLMUsage) error {
 }
 
 var ErrNotFound = errors.New("not found")
+
+// InterruptRun atomically creates the human approval record and moves the Run into
+// WAITING_HUMAN. This is the durable equivalent of an in-memory blocking channel.
+func (s *MySQL) InterruptRun(ctx context.Context, tenant, runID, nodeID, reason string, version int64) (bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE agent_run SET status=?,current_node_id=?,output=?,version=version+1,updated_at=NOW(6) WHERE run_id=? AND tenant_id=? AND version=? AND status=?`, model.RunWaitingHuman, nodeID, reason, runID, tenant, version, model.RunRunning)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n != 1 {
+		return false, err
+	}
+	id := fmt.Sprintf("interrupt-%d", time.Now().UnixNano())
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_interrupt(interrupt_id,run_id,tenant_id,node_id,reason,status) VALUES(?,?,?,?,?,'WAITING')`, id, runID, tenant, nodeID, reason); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ResumeRun atomically resolves the interrupt and moves the Run back to RUNNING.
+func (s *MySQL) ResumeRun(ctx context.Context, tenant, runID, decision string, version int64) (bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE agent_run SET status=?,output=?,version=version+1,updated_at=NOW(6) WHERE run_id=? AND tenant_id=? AND version=? AND status=?`, model.RunRunning, decision, runID, tenant, version, model.RunWaitingHuman)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n != 1 {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_interrupt SET status='RESOLVED',decision=?,resolved_at=NOW(6) WHERE run_id=? AND tenant_id=? AND status='WAITING'`, decision, runID, tenant); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
