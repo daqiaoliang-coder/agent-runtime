@@ -3,8 +3,12 @@
 package executor
 
 import (
+	"agent-runtime/internal/adapters/llm"
+	tooladapter "agent-runtime/internal/adapters/tool"
+	"agent-runtime/internal/contracts"
 	"agent-runtime/internal/llm"
 	"agent-runtime/internal/model"
+	"agent-runtime/internal/providers"
 	"agent-runtime/internal/tool"
 	"agent-runtime/internal/trace"
 	"context"
@@ -45,13 +49,17 @@ type Pricer func(model string, promptTokens, completionTokens int) float64
 
 // Dispatcher 按 node.Type 路由到具体执行器。未识别类型返回错误，避免静默失败。
 type Dispatcher struct {
+	// ModelProvider/ToolProvider are the v3 stable extension points. Legacy LLM/Tools
+	// remain supported so existing deployments and tests do not need a flag day migration.
+	ModelProvider providers.ModelProvider
+	ToolProvider  providers.ToolProvider
 	LLM           llm.Client
 	Tools         *tool.Registry
-	ToolStore     ToolCallStore      // 工具调用幂等存储；为 nil 时工具退化为直接执行（测试/无 DB 场景）
-	SubAgent      Executor          // 子 Agent 执行器（递归运行子 Run），当前为占位实现
+	ToolStore     ToolCallStore                                                  // 工具调用幂等存储；为 nil 时工具退化为直接执行（测试/无 DB 场景）
+	SubAgent      Executor                                                       // 子 Agent 执行器（递归运行子 Run），当前为占位实现
 	ContextLoader func(ctx context.Context, runID string) ([]llm.Message, error) // 从 checkpoint 重建对话历史
-	UsageRecorder UsageRecorder     // LLM token/cost 持久化；为 nil 时不落库
-	Pricer        Pricer            // 成本估算函数；为 nil 时 cost 记 0
+	UsageRecorder UsageRecorder                                                  // LLM token/cost 持久化；为 nil 时不落库
+	Pricer        Pricer                                                         // 成本估算函数；为 nil 时 cost 记 0
 }
 
 // Execute 根据 node.Type 分发：
@@ -97,9 +105,6 @@ func (d *Dispatcher) Execute(ctx context.Context, n *model.Node) (string, error)
 func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, error) {
 	ctx, span := trace.StartSpan(ctx, "executor.llm")
 	defer span.End()
-	if d.LLM == nil {
-		return "", fmt.Errorf("llm client not configured")
-	}
 	// 从 checkpoint 重建对话历史：历史在前，当前 user prompt 在后，保证 Agent 上下文连续。
 	msgs := []llm.Message{{Role: llm.RoleUser, Content: n.Input}}
 	if d.ContextLoader != nil {
@@ -111,9 +116,29 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 			msgs = append(hist, msgs...)
 		}
 	}
-	resp, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs})
-	if err != nil {
-		return "", fmt.Errorf("llm: %w", err)
+	var resp llm.Response
+	if d.ModelProvider != nil {
+		request := contracts.GenerateRequest{Model: modelForNode(n)}
+		for _, m := range msgs {
+			request.Messages = append(request.Messages, contracts.Message{Role: contracts.Role(m.Role), Content: m.Content})
+		}
+		generated, err := d.ModelProvider.Generate(ctx, request)
+		if err != nil {
+			return "", fmt.Errorf("llm: %w", err)
+		}
+		resp = llm.Response{
+			Content: generated.Message.Content,
+			Model:   generated.Model,
+			Usage:   llm.Usage{PromptTokens: generated.Usage.PromptTokens, CompletionTokens: generated.Usage.CompletionTokens, TotalTokens: generated.Usage.TotalTokens},
+		}
+	} else {
+		if d.LLM == nil {
+			return "", fmt.Errorf("llm client not configured")
+		}
+		resp, err = d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs})
+		if err != nil {
+			return "", fmt.Errorf("llm: %w", err)
+		}
 	}
 	// 将 token 用量与模型记入 span，便于在追踪系统中按 token 维度聚合分析。
 	span.SetAttributes(
@@ -152,6 +177,16 @@ func (d *Dispatcher) executeTool(ctx context.Context, n *model.Node) (string, er
 	ctx, span := trace.StartSpan(ctx, "executor.tool")
 	defer span.End()
 	span.SetAttributes(attribute.String("tool.name", n.Name))
+	if d.ToolProvider != nil {
+		if d.ToolStore == nil {
+			result, err := d.ToolProvider.CallTool(ctx, contracts.ToolCallRequest{Name: n.Name, Arguments: n.Input})
+			if err != nil {
+				return "", fmt.Errorf("tool %q: %w", n.Name, err)
+			}
+			return result.Output, nil
+		}
+		return d.executeToolProviderIdempotent(ctx, n)
+	}
 	if d.Tools == nil {
 		return "", fmt.Errorf("tool registry not configured")
 	}
@@ -174,6 +209,53 @@ func (d *Dispatcher) executeTool(ctx context.Context, n *model.Node) (string, er
 //   - 命中 SUCCESS：复用已持久化输出，不重复执行副作用；
 //   - 命中 FAILED：回收为 RUNNING 重试一次（失败通常发生在副作用之前）；
 //   - 命中 RUNNING（崩溃在途）：副作用状态未知，拒绝盲目重执行（非幂等工具安全优先）。
+func (d *Dispatcher) executeToolProviderIdempotent(ctx context.Context, n *model.Node) (string, error) {
+	callID := idempotencyKey(n.RunID, n.ID, n.Name, n.Input)
+	isNew, err := d.ToolStore.ClaimToolCall(ctx, n.TenantID, callID, n.RunID, n.ID, n.Name, callID, n.Input, n.Attempt)
+	if err != nil {
+		return "", fmt.Errorf("claim tool call: %w", err)
+	}
+	if isNew {
+		return d.runAndPersistToolProvider(ctx, n, callID)
+	}
+	rec, err := d.ToolStore.GetToolCall(ctx, n.TenantID, callID)
+	if err != nil {
+		return "", fmt.Errorf("load tool call: %w", err)
+	}
+	switch rec.Status {
+	case "SUCCESS":
+		return rec.Output, nil
+	case "FAILED":
+		reclaimed, err := d.ToolStore.ReclaimToolCall(ctx, n.TenantID, callID)
+		if err != nil {
+			return "", fmt.Errorf("reclaim tool call: %w", err)
+		}
+		if !reclaimed {
+			return "", fmt.Errorf("tool call %s not reclaimable", callID)
+		}
+		return d.runAndPersistToolProvider(ctx, n, callID)
+	case "RUNNING":
+		return "", fmt.Errorf("tool call %s stale RUNNING; refusing re-execution (non-idempotent safety)", callID)
+	default:
+		return "", fmt.Errorf("tool call %s unknown status %q", callID, rec.Status)
+	}
+}
+
+func (d *Dispatcher) runAndPersistToolProvider(ctx context.Context, n *model.Node, callID string) (string, error) {
+	result, err := d.ToolProvider.CallTool(ctx, contracts.ToolCallRequest{CallID: callID, Name: n.Name, Arguments: n.Input})
+	if err != nil || result.IsError {
+		_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
+		if err != nil {
+			return "", fmt.Errorf("tool %q: %w", n.Name, err)
+		}
+		return "", fmt.Errorf("tool %q returned error", n.Name)
+	}
+	if err := d.ToolStore.CompleteToolCall(ctx, n.TenantID, callID, result.Output); err != nil {
+		return "", fmt.Errorf("complete tool call: %w", err)
+	}
+	return result.Output, nil
+}
+
 func (d *Dispatcher) executeToolIdempotent(ctx context.Context, n *model.Node, t tool.Tool) (string, error) {
 	callID := idempotencyKey(n.RunID, n.ID, n.Name, n.Input)
 	isNew, err := d.ToolStore.ClaimToolCall(ctx, n.TenantID, callID, n.RunID, n.ID, n.Name, callID, n.Input, n.Attempt)
@@ -239,7 +321,7 @@ func NewDefault() *Dispatcher {
 	tools := tool.NewRegistry()
 	tools.Register(tool.Search{})
 	tools.Register(tool.Calculator{})
-	return &Dispatcher{LLM: llm.Echo(), Tools: tools}
+	return &Dispatcher{LLM: llm.Echo(), Tools: tools, ModelProvider: llmadapter.New(llm.Echo()), ToolProvider: tooladapter.New(tools)}
 }
 
 // NewWithStore 在 NewDefault 基础上注入工具调用幂等存储，使 TOOL 节点经 tool_call 表保证幂等。
@@ -247,4 +329,39 @@ func NewWithStore(s ToolCallStore) *Dispatcher {
 	d := NewDefault()
 	d.ToolStore = s
 	return d
+}
+
+// StreamLLM exposes the v3 streaming contract without forcing callers to know the
+// concrete model SDK. Native provider streaming is used when available; legacy clients
+// are represented as a single text delta followed by completion.
+func (d *Dispatcher) StreamLLM(ctx context.Context, n *model.Node) (<-chan contracts.ModelEvent, error) {
+	if d.ModelProvider != nil {
+		msgs := []contracts.Message{{Role: contracts.RoleUser, Content: n.Input}}
+		if d.ContextLoader != nil {
+			hist, err := d.ContextLoader(ctx, n.RunID)
+			if err != nil {
+				return nil, fmt.Errorf("load context: %w", err)
+			}
+			if len(hist) > 0 {
+				msgs = make([]contracts.Message, 0, len(hist)+1)
+				for _, m := range hist {
+					msgs = append(msgs, contracts.Message{Role: contracts.Role(m.Role), Content: m.Content})
+				}
+				msgs = append(msgs, contracts.Message{Role: contracts.RoleUser, Content: n.Input})
+			}
+		}
+		return d.ModelProvider.Stream(ctx, contracts.GenerateRequest{Model: modelForNode(n), Messages: msgs})
+	}
+	if d.LLM == nil {
+		return nil, fmt.Errorf("llm client not configured")
+	}
+	resp, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: []llm.Message{{Role: llm.RoleUser, Content: n.Input}}})
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan contracts.ModelEvent, 2)
+	ch <- contracts.ModelEvent{Type: contracts.ModelEventTextDelta, Delta: resp.Content}
+	ch <- contracts.ModelEvent{Type: contracts.ModelEventCompleted, Usage: contracts.Usage{PromptTokens: resp.Usage.PromptTokens, CompletionTokens: resp.Usage.CompletionTokens, TotalTokens: resp.Usage.TotalTokens}}
+	close(ch)
+	return ch, nil
 }

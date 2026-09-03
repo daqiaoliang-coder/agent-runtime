@@ -234,3 +234,12 @@ go test ./...
 - `internal/retry`：退避策略与抖动
 - `internal/worker`：成本估算（DefaultPricer）
 - `internal/trace`：OTel 初始化与 no-op 降级
+
+## v3 Agent Framework Layer
+
+The runtime keeps its durable execution kernel and adds provider/adapter contracts for
+Model, Tool, Memory, Prompt, MCP, Skill and Sandbox. `RuntimeEvent` normalizes run/node/
+text/tool signals for streaming consumers, middleware provides lifecycle/tool/event hooks,
+and `internal/agent/react` provides a provider-agnostic ReAct loop. HITL interruptions are
+persisted as `WAITING_HUMAN` state in `run_interrupt`, so human approval survives process
+restarts. See `docs/architecture-v3.md`.

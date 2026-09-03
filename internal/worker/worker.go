@@ -3,6 +3,9 @@
 package worker
 
 import (
+	"agent-runtime/internal/adapters/llm"
+	tooladapter "agent-runtime/internal/adapters/tool"
+	"agent-runtime/internal/contracts"
 	"agent-runtime/internal/event"
 	"agent-runtime/internal/executor"
 	"agent-runtime/internal/llm"
@@ -28,12 +31,13 @@ import (
 // ID 用于租约归属标识；Exec 执行节点（默认为带 Stub LLM + 演示工具的 Dispatcher）。
 // Events 字段预留给直接发布场景（当前完成/失败事件经 Outbox 投递）。
 type Worker struct {
-	Store  *store.MySQL
-	Queue  *queue.RedisQueue
-	Events *event.RocketMQ
-	Exec   executor.Executor
-	Retry  retry.Policy
-	ID     string
+	Store         *store.MySQL
+	Queue         *queue.RedisQueue
+	Events        *event.RocketMQ
+	RuntimeEvents event.Sink
+	Exec          executor.Executor
+	Retry         retry.Policy
+	ID            string
 }
 
 // Handle 处理单个任务，流程：
@@ -65,6 +69,10 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	if !ok {
 		return nil
 	}
+	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
+		ID: fmt.Sprintf("runtime-event-%s-start-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
+		Type: contracts.EventNodeStarted, Timestamp: time.Now(), Data: map[string]any{"type": n.Type, "name": n.Name, "attempt": n.Attempt},
+	})
 	n, _ = w.Store.GetNode(ctx, n.TenantID, n.ID)
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -111,6 +119,10 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		if _, ferr := w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{ID: fe.ID, EventType: fe.Type, AggregateID: n.RunID, Payload: string(payload)}); ferr != nil {
 			return fmt.Errorf("persist failure: %w (exec err: %v)", ferr, execErr)
 		}
+		w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
+			ID: fmt.Sprintf("runtime-event-%s-failed-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
+			Type: contracts.EventNodeFailed, Timestamp: time.Now(), Data: map[string]any{"error": execErr.Error(), "attempt": n.Attempt},
+		})
 		return nil
 	}
 
@@ -123,7 +135,17 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	if err != nil {
 		return err
 	}
+	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
+		ID: fmt.Sprintf("runtime-event-%s-finished-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
+		Type: contracts.EventNodeFinished, Timestamp: time.Now(), Data: map[string]any{"output": output, "attempt": n.Attempt},
+	})
 	return nil
+}
+
+func (w *Worker) emitRuntimeEvent(ctx context.Context, ev contracts.RuntimeEvent) {
+	if w.RuntimeEvents != nil {
+		_ = w.RuntimeEvents.Emit(ctx, ev)
+	}
 }
 
 // saveCheckpoint 累积更新 Run 检查点：追加本节点的输入/输出到对话历史与 NodeOutputs。
@@ -164,7 +186,7 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	// ToolStore=s 使 TOOL 节点经 tool_call 表保证幂等（SUCCESS 复用、崩溃在途拒绝重执行）。
 	// Retry=指数退避策略，失败可重试节点置回 READY 并按 ready_at 补投递，耗尽入 DLQ。
 	// UsageRecorder=s 使 LLM 节点的 token 用量与成本落 llm_usage 表，支撑成本分析。
-	disp := &executor.Dispatcher{LLM: client, Tools: tools, ToolStore: s, UsageRecorder: s, Pricer: DefaultPricer}
+	disp := &executor.Dispatcher{LLM: client, Tools: tools, ModelProvider: llmadapter.New(client), ToolProvider: tooladapter.New(tools), ToolStore: s, UsageRecorder: s, Pricer: DefaultPricer}
 	// ContextLoader 从 checkpoint 重建对话历史，使崩溃恢复后的 LLM 节点保持上下文连续。
 	disp.ContextLoader = func(ctx context.Context, runID string) ([]llm.Message, error) {
 		_, _, stateJSON, err := s.LoadCheckpoint(ctx, runID)

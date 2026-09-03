@@ -8,11 +8,12 @@ import "time"
 type RunStatus string
 
 const (
-	RunPending   RunStatus = "PENDING"   // 已创建，尚未开始调度
-	RunRunning   RunStatus = "RUNNING"   // 运行中
-	RunSuccess   RunStatus = "SUCCESS"   // 全部节点成功完成
-	RunFailed    RunStatus = "FAILED"    // 存在失败节点或运行出错
-	RunCancelled RunStatus = "CANCELLED" // 被取消
+	RunPending      RunStatus = "PENDING"       // 已创建，尚未开始调度
+	RunRunning      RunStatus = "RUNNING"       // 运行中
+	RunWaitingHuman RunStatus = "WAITING_HUMAN" // 等待人工确认
+	RunSuccess      RunStatus = "SUCCESS"       // 全部节点成功完成
+	RunFailed       RunStatus = "FAILED"        // 存在失败节点或运行出错
+	RunCancelled    RunStatus = "CANCELLED"     // 被取消
 )
 
 // NodeStatus 表示 DAG 中单个节点（步骤）的状态。
@@ -20,11 +21,12 @@ const (
 type NodeStatus string
 
 const (
-	NodePending NodeStatus = "PENDING" // 已入库，依赖尚未满足
-	NodeReady   NodeStatus = "READY"   // 依赖就绪，可被投递到队列
-	NodeRunning NodeStatus = "RUNNING" // 已被 worker 认领并执行中
-	NodeSuccess NodeStatus = "SUCCESS" // 执行成功
-	NodeFailed  NodeStatus = "FAILED"  // 执行失败
+	NodePending      NodeStatus = "PENDING"       // 已入库，依赖尚未满足
+	NodeReady        NodeStatus = "READY"         // 依赖就绪，可被投递到队列
+	NodeRunning      NodeStatus = "RUNNING"       // 已被 worker 认领并执行中
+	NodeWaitingHuman NodeStatus = "WAITING_HUMAN" // 等待人工确认
+	NodeSuccess      NodeStatus = "SUCCESS"       // 执行成功
+	NodeFailed       NodeStatus = "FAILED"        // 执行失败
 )
 
 // NodeType 表示节点的执行类型，决定 worker 如何处理该节点。
@@ -100,9 +102,9 @@ type OutboxMessage struct{ ID, EventType, AggregateID, Payload string }
 // 状态机：RUNNING -> SUCCESS/FAILED。SUCCESS 的记录可被复用以跳过重复副作用。
 type ToolCall struct {
 	CallID, TenantID, RunID, NodeID, ToolName, IdempotencyKey string
-	Status                                                     string
-	Output                                                     string
-	Attempt                                                    int
+	Status                                                    string
+	Output                                                    string
+	Attempt                                                   int
 }
 
 // ChatTurn 是对话历史中的一轮，用于 Checkpoint 上下文恢复。
@@ -123,7 +125,7 @@ type RunContext struct {
 // 用于按 run/tenant/model 维度聚合统计 token 用量与花费，支撑成本分析与配额管控。
 type LLMUsage struct {
 	ID, RunID, NodeID, TenantID, Model string
-	PromptTokens, CompletionTokens      int
-	TotalTokens                         int
-	Cost                                float64
+	PromptTokens, CompletionTokens     int
+	TotalTokens                        int
+	Cost                               float64
 }
