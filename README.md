@@ -120,7 +120,7 @@ agent-runtime/
 │   └── outbox/           # Outbox → RocketMQ
 │
 ├── internal/
-│   ├── contracts/        # Runtime 稳定语义合同
+│   ├── contracts/        # Runtime 稳定语义契约
 │   ├── providers/        # Model / Tool / MCP / Memory 等能力接口
 │   ├── adapters/         # 第三方 SDK → Provider
 │   │   ├── llm/
@@ -828,9 +828,9 @@ resumer.handle
 - `attempt`
 - `node.type`
 - `llm.model`
-- Token Usage
-- Tool Name
-- Event Type
+- `Token Usage`
+- `Tool Name`
+- `Event Type`
 
 支持 `OTEL_DISABLED=1` 降级到 no-op tracer，不阻断业务启动。
 
