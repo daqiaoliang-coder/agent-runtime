@@ -151,20 +151,40 @@ func (e *Executor) handleFailure(step *AgentStep, cause error) error {
 	})
 }
 
+// checkpoint 累积已完成步骤并写快照：先读已有检查点，把新完成的步骤追加进 Completed，
+// 保证断点恢复时能拿到完整进度，而不是只有最后一个步骤。
 func (e *Executor) checkpoint(runID, stepID string) error {
 	run, err := e.store.GetRun(runID)
 	if err != nil {
 		return err
 	}
 
+	completed := []string{stepID}
+	if existing, err := e.store.GetCheckpoint(runID); err == nil {
+		completed = existing.Completed
+		// 去重：同一逻辑操作重放时（at-least-once）避免重复记录。
+		if !containsStep(completed, stepID) {
+			completed = append(completed, stepID)
+		}
+	}
+
 	return e.store.SaveCheckpoint(&Checkpoint{
 		RunID:       runID,
 		StepID:      stepID,
 		Version:     run.Version,
-		Completed:   []string{stepID},
+		Completed:   completed,
 		CurrentStep: stepID,
 		CreatedAt:   time.Now(),
 	})
+}
+
+func containsStep(list []string, id string) bool {
+	for _, item := range list {
+		if item == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Executor) emit(event Event) {

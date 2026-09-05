@@ -81,9 +81,9 @@ func (p *LLMPlanner) Plan(ctx context.Context, run *model.Run) (model.Plan, erro
 // planJSON 是 LLM 返回的 JSON 计划的解析结构。
 type planJSON struct {
 	Nodes []struct {
-		ID, ParentNodeID       string
-		Type, Name, Input      string
-		DependsOn              []string
+		ID, ParentNodeID  string
+		Type, Name, Input string
+		DependsOn         []string
 	} `json:"nodes"`
 }
 

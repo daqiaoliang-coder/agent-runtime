@@ -60,9 +60,9 @@ func (s *hitlFakeStore) ResumeRun(_ context.Context, _, _, decision string, vers
 	return true, nil
 }
 
-type fakeQueue struct{}
+type hitlFakeQueue struct{}
 
-func (fakeQueue) Enqueue(context.Context, model.Task) error { return nil }
+func (hitlFakeQueue) Enqueue(context.Context, model.Task) error { return nil }
 
 type noopPlanner struct{}
 
@@ -70,7 +70,7 @@ func (noopPlanner) Plan(context.Context, *model.Run) (model.Plan, error) { retur
 
 func TestRuntime_HITLInterruptAndResume(t *testing.T) {
 	s := &hitlFakeStore{run: &model.Run{ID: "r1", TenantID: "t1", Status: model.RunRunning, Version: 0, UpdatedAt: time.Now()}}
-	r := &Runtime{Store: s, Queue: fakeQueue{}, Planner: noopPlanner{}}
+	r := &Runtime{Store: s, Queue: hitlFakeQueue{}, Planner: noopPlanner{}}
 	if err := r.Interrupt(context.Background(), "t1", "r1", "n1", "approve deployment"); err != nil {
 		t.Fatal(err)
 	}

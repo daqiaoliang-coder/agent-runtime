@@ -12,7 +12,7 @@ const (
 	RoleSystem    Role = "system"    // 系统指令，设定 Agent 行为约束
 	RoleUser      Role = "user"      // 用户输入
 	RoleAssistant Role = "assistant" // LLM 输出
-	RoleTool      Role = "tool"       // 工具调用结果回填给 LLM
+	RoleTool      Role = "tool"      // 工具调用结果回填给 LLM
 )
 
 // Message 是 chat completion 风格的单条消息，Role 与 Content 成对出现。
