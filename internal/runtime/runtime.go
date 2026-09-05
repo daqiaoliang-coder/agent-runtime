@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -52,7 +53,19 @@ func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input string) (*
 	if !ok {
 		return nil, fmt.Errorf("run version conflict")
 	}
+	// 关键日志：Run 创建并切到 RUNNING，标志一次 Agent 运行的真正起点，串联调度入口与下游 worker。
+	log.Printf("run created run=%s tenant=%s agent=%s root_nodes=%d", run.ID, run.TenantID, run.AgentID, countRoots(plan.Nodes))
 	return r.Store.GetRun(ctx, run.TenantID, run.ID)
+}
+
+// countRoots 统计 DAG 中无依赖的根节点数，用于在创建日志中反映初始并行度。
+func countRoots(nodes []model.PlanNode) (n int) {
+	for _, x := range nodes {
+		if len(x.DependsOn) == 0 {
+			n++
+		}
+	}
+	return n
 }
 
 // EventJSON 将领域事件序列化为 JSON 字符串，便于投递到消息中间件。

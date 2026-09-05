@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -135,10 +136,11 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 		if d.LLM == nil {
 			return "", fmt.Errorf("llm client not configured")
 		}
-		resp, err = d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs})
+		got, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs})
 		if err != nil {
 			return "", fmt.Errorf("llm: %w", err)
 		}
+		resp = got
 	}
 	// 将 token 用量与模型记入 span，便于在追踪系统中按 token 维度聚合分析。
 	span.SetAttributes(
@@ -235,6 +237,8 @@ func (d *Dispatcher) executeToolProviderIdempotent(ctx context.Context, n *model
 		}
 		return d.runAndPersistToolProvider(ctx, n, callID)
 	case "RUNNING":
+		// 关键日志：停滞的 RUNNING 工具调用拒绝重执行，副作用状态未知，是运维侧定位"卡死"工具调用的关键信号。
+		log.Printf("tool call refused re-execution call_id=%s run=%s node=%s tenant=%s (stale RUNNING)", callID, n.RunID, n.ID, n.TenantID)
 		return "", fmt.Errorf("tool call %s stale RUNNING; refusing re-execution (non-idempotent safety)", callID)
 	default:
 		return "", fmt.Errorf("tool call %s unknown status %q", callID, rec.Status)

@@ -6,6 +6,7 @@ import (
 	"agent-runtime/internal/trace"
 	"context"
 	"fmt"
+	"log"
 
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -120,6 +121,8 @@ func (r *Resumer) process(ctx context.Context, e model.Event) error {
 		// 版本冲突意味着并发已推进，非致命错误，返回 nil 避免事件无意义重试。
 		return nil
 	}
+	// 关键日志：Run 收敛到终态，标志 DAG 全部节点结束，是 Runtime 最重要的一次状态跃迁。
+	log.Printf("run settled run=%s tenant=%s status=%s trigger_node=%s", e.RunID, e.TenantID, status, e.NodeID)
 	return nil
 }
 

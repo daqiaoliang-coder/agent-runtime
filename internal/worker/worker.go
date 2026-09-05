@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -69,6 +70,8 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	if !ok {
 		return nil
 	}
+	// 关键日志：节点认领成功，标记执行入口，便于在普通日志中追踪 worker 调度边界。
+	log.Printf("worker=%s claimed node run=%s node=%s tenant=%s type=%s attempt=%d", w.ID, n.RunID, n.ID, n.TenantID, n.Type, n.Attempt)
 	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
 		ID: fmt.Sprintf("runtime-event-%s-start-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 		Type: contracts.EventNodeStarted, Timestamp: time.Now(), Data: map[string]any{"type": n.Type, "name": n.Name, "attempt": n.Attempt},
@@ -110,9 +113,13 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 				// 版本/状态已变（可能被恢复抢占），不 ack，任务重投递由恢复机制收敛。
 				return fmt.Errorf("retry cas conflict for %s (exec err: %v)", n.ID, execErr)
 			}
+			// 关键日志：节点执行失败但仍在重试预算内，记录退避点，便于观察重试节流。
+			log.Printf("node retried run=%s node=%s attempt=%d->%d backoff_until=%s err=%v", n.RunID, n.ID, n.Attempt, next, readyAt.Format(time.RFC3339), execErr)
 			return nil
 		}
 		// 重试耗尽：入死信队列 + 失败事件，由 Resume 收敛 Run 为 FAILED。
+		// 关键日志：重试耗尽进入死信队列，标志该节点不可恢复，需人工介入或下游兜底。
+		log.Printf("node dead-lettered run=%s node=%s attempt=%d err=%v", n.RunID, n.ID, n.Attempt, execErr)
 		_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, execErr.Error(), next, output)
 		fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: execErr.Error(), Timestamp: time.Now()}
 		payload, _ := json.Marshal(fe)
@@ -135,6 +142,8 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	if err != nil {
 		return err
 	}
+	// 关键日志：节点执行完成，标志一次成功的 LLM 推理或工具调用落地。
+	log.Printf("node completed run=%s node=%s tenant=%s attempt=%d output_bytes=%d", n.RunID, n.ID, n.TenantID, n.Attempt, len(output))
 	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
 		ID: fmt.Sprintf("runtime-event-%s-finished-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 		Type: contracts.EventNodeFinished, Timestamp: time.Now(), Data: map[string]any{"output": output, "attempt": n.Attempt},

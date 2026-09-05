@@ -13,11 +13,14 @@ import (
 	"time"
 )
 
+// StepRunner 解耦 ReAct 循环与具体执行：引擎只负责决策，LLM/工具调用由 Runner 承担。
+// 这样同一引擎可跑在内存中，也可由 durable runtime kernel 承载执行。
 type StepRunner interface {
 	RunLLM(context.Context, contracts.GenerateRequest) (contracts.GenerateResponse, error)
 	RunTool(context.Context, contracts.ToolCallRequest) (contracts.ToolResult, error)
 }
 
+// ProviderRunner 是基于 providers 接口的 StepRunner 实现，桥接到 v3 稳定扩展点。
 type ProviderRunner struct {
 	Model providers.ModelProvider
 	Tool  providers.ToolProvider
@@ -30,6 +33,8 @@ func (r ProviderRunner) RunTool(ctx context.Context, req contracts.ToolCallReque
 	return r.Tool.CallTool(ctx, req)
 }
 
+// Engine 是无状态的 ReAct 推理引擎。ToolChain 在每次工具调用前后生效，
+// Events 用于把推理/工具过程发布到运行时事件流。
 type Engine struct {
 	Runner        StepRunner
 	ToolChain     *middleware.ToolChain
@@ -37,17 +42,22 @@ type Engine struct {
 	MaxIterations int
 }
 
+// Input 是一次 ReAct 会话的输入，ExecutionContext 携带租户/追踪身份。
 type Input struct {
 	ExecutionContext contracts.ExecutionContext
 	Messages         []contracts.Message
 	Tools            []contracts.ToolDefinition
 }
 
+// Result 是一次 ReAct 会话的输出，Iterations 反映思考-行动的循环次数。
 type Result struct {
 	Message    contracts.Message
 	Iterations int
 }
 
+// Run 执行 ReAct 循环：思考(调 LLM)->若返回 ToolCalls 则执行工具并把结果回填给 LLM->继续，
+// 直到 LLM 不再请求工具（给出最终回答）或达到 MaxIterations（默认 8，防止失控循环）。
+// 每次工具调用经 ToolChain.Before/After 拦截，所有动作以 RuntimeEvent 形式发布到 Events。
 func (e *Engine) Run(ctx context.Context, in Input) (Result, error) {
 	if e.Runner == nil {
 		return Result{}, fmt.Errorf("react: step runner not configured")
