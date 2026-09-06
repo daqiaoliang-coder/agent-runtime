@@ -28,8 +28,8 @@ func TestGetRun_IncludesTenantFilter(t *testing.T) {
 	s, mock, cleanup := newMockStore(t)
 	defer cleanup()
 	now := time.Now()
-	rows := sqlmock.NewRows([]string{"run_id", "tenant_id", "agent_id", "status", "version", "input", "output", "current_node_id", "max_steps", "steps", "created_at", "updated_at"}).
-		AddRow("run-1", "tenant-A", "agent-1", model.RunRunning, 1, "in", "", "", 50, 0, now, now)
+	rows := sqlmock.NewRows([]string{"run_id", "tenant_id", "agent_id", "status", "version", "input", "output", "current_node_id", "max_steps", "steps", "max_rounds", "max_tokens", "created_at", "updated_at"}).
+		AddRow("run-1", "tenant-A", "agent-1", model.RunRunning, 1, "in", "", "", 50, 0, 10, 0, now, now)
 	// 查询必须包含 tenant_id（regexp 部分匹配），且参数为 (run_id, tenant)。
 	mock.ExpectQuery("tenant_id").
 		WithArgs("run-1", "tenant-A").

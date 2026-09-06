@@ -170,3 +170,69 @@ func TestResumer_ReplanRequested_DepsNotReady_NotActivated(t *testing.T) {
 		t.Errorf("no tasks should be enqueued when deps not ready, got %d", len(q.enqueued))
 	}
 }
+
+// TestResumer_ReplanRequested_MaxRoundsExceeded 续规轮次超限时不应续规，
+// 直接 CAS 到 FAILED。
+func TestResumer_ReplanRequested_MaxRoundsExceeded(t *testing.T) {
+	planner := &replanPlanner{}
+	fs := &fakeStore{
+		getRun:         &model.Run{ID: "run-1", Status: model.RunRunning, Version: 2, MaxRounds: 1},
+		casOK:          true,
+		completedNodes: []model.Node{{ID: "reflect-1", Status: model.NodeSuccess, PlanningRound: 1}},
+	}
+	r := &Resumer{Store: fs, Queue: &fakeQueue{}, Planner: planner}
+	if err := r.Handle(context.Background(), replanEvent()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if planner.called {
+		t.Error("Planner.Replan should not be called when max rounds exceeded")
+	}
+	if len(fs.insertPlanCalls) != 0 {
+		t.Errorf("InsertPlan should not be called, got %d", len(fs.insertPlanCalls))
+	}
+	if len(fs.updateCASCalls) != 1 || fs.updateCASCalls[0].status != model.RunFailed {
+		t.Errorf("expected CAS to FAILED, got %+v", fs.updateCASCalls)
+	}
+}
+
+// TestResumer_ReplanRequested_MaxStepsExceeded 节点总数超限时不应续规。
+func TestResumer_ReplanRequested_MaxStepsExceeded(t *testing.T) {
+	planner := &replanPlanner{}
+	fs := &fakeStore{
+		getRun:         &model.Run{ID: "run-1", Status: model.RunRunning, Version: 2, MaxSteps: 3},
+		casOK:          true,
+		countNodes:     3,
+		completedNodes: []model.Node{{ID: "reflect-1", Status: model.NodeSuccess, PlanningRound: 1}},
+	}
+	r := &Resumer{Store: fs, Queue: &fakeQueue{}, Planner: planner}
+	if err := r.Handle(context.Background(), replanEvent()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if planner.called {
+		t.Error("Planner.Replan should not be called when max steps exceeded")
+	}
+	if len(fs.updateCASCalls) != 1 || fs.updateCASCalls[0].status != model.RunFailed {
+		t.Errorf("expected CAS to FAILED, got %+v", fs.updateCASCalls)
+	}
+}
+
+// TestResumer_ReplanRequested_TokenBudgetExceeded token 预算耗尽时不应续规。
+func TestResumer_ReplanRequested_TokenBudgetExceeded(t *testing.T) {
+	planner := &replanPlanner{}
+	fs := &fakeStore{
+		getRun:         &model.Run{ID: "run-1", Status: model.RunRunning, Version: 2, MaxTokens: 5000},
+		casOK:          true,
+		runTokenUsage:  5000,
+		completedNodes: []model.Node{{ID: "reflect-1", Status: model.NodeSuccess, PlanningRound: 1}},
+	}
+	r := &Resumer{Store: fs, Queue: &fakeQueue{}, Planner: planner}
+	if err := r.Handle(context.Background(), replanEvent()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if planner.called {
+		t.Error("Planner.Replan should not be called when token budget exceeded")
+	}
+	if len(fs.updateCASCalls) != 1 || fs.updateCASCalls[0].status != model.RunFailed {
+		t.Errorf("expected CAS to FAILED, got %+v", fs.updateCASCalls)
+	}
+}

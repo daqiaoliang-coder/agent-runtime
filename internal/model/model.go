@@ -43,12 +43,16 @@ const (
 
 // Run 是一次完整的 Agent 运行记录，对应 agent_run 表。
 // Version 用于乐观锁（CAS），避免并发更新覆盖。
+// MaxSteps 限制 DAG 节点总数（含多轮 Plan 追加的节点），防止 Planner 死循环。
+// MaxRounds 限制多轮 Plan 的续规轮次上限，0 表示不限制。
+// MaxTokens 限制 Run 累计 LLM token 消耗上限，0 表示不限制。
 type Run struct {
 	ID, TenantID, AgentID        string
 	Status                       RunStatus
 	Version                      int64
 	Input, Output, CurrentNodeID string
 	MaxSteps, Steps              int
+	MaxRounds, MaxTokens         int
 	CreatedAt, UpdatedAt         time.Time
 }
 

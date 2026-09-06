@@ -166,11 +166,15 @@ func (r *Resumer) tryConvergeCancelled(ctx context.Context, e model.Event, run *
 }
 
 // handleReplan 执行多轮 Plan 的续规流程：
-// 1. 查询已完成节点（含 outputs）作为 Planner 的上下文；
-// 2. 调用 Planner.Replan 产出新一轮节点；
-// 3. 将新节点无 DependsOn 的根链接到触发续规的 REFLECT 节点（e.NodeID）；
-// 4. InsertPlan 追加节点 + 边到同一 Run 的 DAG；
-// 5. 激活依赖已就绪的新节点（REFLECT 已 SUCCESS，直接挂接的根节点可立即执行）。
+// 1. 检查死循环防护（PlanningRound 上限、节点总数上限、token 预算上限）；
+// 2. 查询已完成节点（含 outputs）作为 Planner 的上下文；
+// 3. 调用 Planner.Replan 产出新一轮节点；
+// 4. 将新节点无 DependsOn 的根链接到触发续规的 REFLECT 节点（e.NodeID）；
+// 5. InsertPlan 追加节点 + 边到同一 Run 的 DAG；
+// 6. 激活依赖已就绪的新节点（REFLECT 已 SUCCESS，直接挂接的根节点可立即执行）。
+//
+// 防护命中时：不追加新节点，直接 CAS 将 Run 收敛到 FAILED，避免 Planner 持续
+// 输出 replan 决策导致无限续规。
 func (r *Resumer) handleReplan(ctx context.Context, e model.Event, run *model.Run) error {
 	if r.Planner == nil {
 		return fmt.Errorf("replan requested but planner not configured")
@@ -178,6 +182,10 @@ func (r *Resumer) handleReplan(ctx context.Context, e model.Event, run *model.Ru
 	completed, err := r.Store.CompletedNodes(ctx, e.TenantID, e.RunID)
 	if err != nil {
 		return fmt.Errorf("load completed nodes for replan: %w", err)
+	}
+	// 死循环防护：检查续规轮次、节点总数、token 预算是否超限。
+	if reason := r.checkReplanLimits(ctx, e, run, completed); reason != "" {
+		return r.convergeOnLimit(ctx, e, run, reason)
 	}
 	plan, err := r.Planner.Replan(ctx, run, completed)
 	if err != nil {
@@ -212,6 +220,51 @@ func (r *Resumer) handleReplan(ctx context.Context, e model.Event, run *model.Ru
 		}
 	}
 	log.Printf("run replanned run=%s tenant=%s trigger_node=%s new_nodes=%d", e.RunID, e.TenantID, e.NodeID, len(plan.Nodes))
+	return nil
+}
+
+// checkReplanLimits 检查多轮 Plan 的三道防线：续规轮次、节点总数、token 预算。
+// 返回非空 reason 表示防线命中，调用方应拒绝续规并收敛 Run。
+func (r *Resumer) checkReplanLimits(ctx context.Context, e model.Event, run *model.Run, completed []model.Node) string {
+	// 防线 1：续规轮次上限。
+	next := nextRound(completed)
+	if run.MaxRounds > 0 && next > run.MaxRounds {
+		return fmt.Sprintf("max rounds exceeded: next round %d > limit %d", next, run.MaxRounds)
+	}
+	// 防线 2：节点总数上限（复用 MaxSteps，含所有轮次的节点）。
+	if run.MaxSteps > 0 {
+		count, err := r.Store.CountNodes(ctx, e.TenantID, e.RunID)
+		if err != nil {
+			log.Printf("warn: count nodes for replan limits: %v", err)
+		} else if count >= run.MaxSteps {
+			return fmt.Sprintf("max steps exceeded: nodes %d >= limit %d", count, run.MaxSteps)
+		}
+	}
+	// 防线 3：token 预算上限。
+	if run.MaxTokens > 0 {
+		used, err := r.Store.RunTokenUsage(ctx, e.TenantID, e.RunID)
+		if err != nil {
+			log.Printf("warn: token usage for replan limits: %v", err)
+		} else if used >= run.MaxTokens {
+			return fmt.Sprintf("token budget exhausted: used %d >= limit %d", used, run.MaxTokens)
+		}
+	}
+	return ""
+}
+
+// convergeOnLimit 在防线命中时将 Run 直接 CAS 到 FAILED。
+// REFLECT 节点已完成（触发 ReplanRequested），不追加新节点则所有节点均终态，
+// 无需等待后续事件驱动收敛。
+func (r *Resumer) convergeOnLimit(ctx context.Context, e model.Event, run *model.Run, reason string) error {
+	ok, err := r.Store.UpdateRunCAS(ctx, e.TenantID, e.RunID, run.Version, model.RunFailed, e.NodeID, reason)
+	if err != nil {
+		return fmt.Errorf("converge on limit: %w", err)
+	}
+	if !ok {
+		// 版本冲突：并发已推进，返回 nil 避免事件无意义重试。
+		return nil
+	}
+	log.Printf("run failed on limit run=%s tenant=%s trigger_node=%s reason=%q", e.RunID, e.TenantID, e.NodeID, reason)
 	return nil
 }
 

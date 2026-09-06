@@ -41,6 +41,12 @@ func (s *hitlFakeStore) RunHasFailure(context.Context, string, string) (bool, er
 func (s *hitlFakeStore) CompletedNodes(context.Context, string, string) ([]model.Node, error) {
 	return nil, nil
 }
+func (s *hitlFakeStore) CountNodes(context.Context, string, string) (int, error) {
+	return 0, nil
+}
+func (s *hitlFakeStore) RunTokenUsage(context.Context, string, string) (int, error) {
+	return 0, nil
+}
 func (s *hitlFakeStore) InboxSeen(context.Context, string, string) (bool, error) { return false, nil }
 func (s *hitlFakeStore) MarkInbox(context.Context, string, string) error         { return nil }
 func (s *hitlFakeStore) InterruptRun(_ context.Context, _, _, _, _ string, version int64) (bool, error) {

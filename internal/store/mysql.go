@@ -35,14 +35,14 @@ func (s *MySQL) Close() { _ = s.DB.Close() }
 
 // CreateRun 插入一条 Run 记录，初始状态为 PENDING。租户由 r.TenantID 携带。
 func (s *MySQL) CreateRun(ctx context.Context, r *model.Run) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO agent_run(run_id,tenant_id,agent_id,status,version,input,max_steps) VALUES(?,?,?,?,?,?,?)`, r.ID, r.TenantID, r.AgentID, r.Status, r.Version, r.Input, r.MaxSteps)
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO agent_run(run_id,tenant_id,agent_id,status,version,input,max_steps,max_rounds,max_tokens) VALUES(?,?,?,?,?,?,?,?,?,?)`, r.ID, r.TenantID, r.AgentID, r.Status, r.Version, r.Input, r.MaxSteps, r.MaxRounds, r.MaxTokens)
 	return err
 }
 
 // GetRun 按 tenant + run_id 读取 Run，租户不匹配则返回 sql.ErrNoRows。
 func (s *MySQL) GetRun(ctx context.Context, tenant, id string) (*model.Run, error) {
 	r := &model.Run{}
-	err := s.DB.QueryRowContext(ctx, `SELECT run_id,tenant_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,created_at,updated_at FROM agent_run WHERE run_id=? AND tenant_id=?`, id, tenant).Scan(&r.ID, &r.TenantID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.CreatedAt, &r.UpdatedAt)
+	err := s.DB.QueryRowContext(ctx, `SELECT run_id,tenant_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,max_rounds,max_tokens,created_at,updated_at FROM agent_run WHERE run_id=? AND tenant_id=?`, id, tenant).Scan(&r.ID, &r.TenantID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.MaxRounds, &r.MaxTokens, &r.CreatedAt, &r.UpdatedAt)
 	return r, err
 }
 
@@ -242,6 +242,20 @@ func (s *MySQL) RunHasFailure(ctx context.Context, tenant, runID string) (bool, 
 	var n int
 	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_node WHERE run_id=? AND tenant_id=? AND status=?`, runID, tenant, model.NodeFailed).Scan(&n)
 	return n > 0, err
+}
+
+// CountNodes 统计指定租户的 Run 下的节点总数（含所有轮次），用于多轮 Plan 死循环防护。
+func (s *MySQL) CountNodes(ctx context.Context, tenant, runID string) (int, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_node WHERE run_id=? AND tenant_id=?`, runID, tenant).Scan(&n)
+	return n, err
+}
+
+// RunTokenUsage 汇总指定租户的 Run 下所有 LLM 调用的累计 token 消耗，用于 token 预算防护。
+func (s *MySQL) RunTokenUsage(ctx context.Context, tenant, runID string) (int, error) {
+	var total int
+	err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(SUM(total_tokens),0) FROM llm_usage WHERE run_id=? AND tenant_id=?`, runID, tenant).Scan(&total)
+	return total, err
 }
 
 // CompletedNodes 返回指定 Run 下所有 SUCCESS 节点（按完成时间排序），供 Planner.Replan
@@ -574,7 +588,7 @@ func (s *MySQL) CancelRun(ctx context.Context, tenant, runID, reason string, ver
 // 收敛：取消遗留的 PENDING/READY 节点，并在全部节点终态时 CAS 到 CANCELLED。
 // 系统级扫描（不限定租户），返回的 Run 携带 tenant_id 以便后续操作做租户隔离。
 func (s *MySQL) CancelRequestedRuns(ctx context.Context, limit int) ([]model.Run, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT run_id,tenant_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,created_at,updated_at FROM agent_run WHERE status=? LIMIT ?`, model.RunCancelRequested, limit)
+	rows, err := s.DB.QueryContext(ctx, `SELECT run_id,tenant_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,max_rounds,max_tokens,created_at,updated_at FROM agent_run WHERE status=? LIMIT ?`, model.RunCancelRequested, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -582,7 +596,7 @@ func (s *MySQL) CancelRequestedRuns(ctx context.Context, limit int) ([]model.Run
 	var out []model.Run
 	for rows.Next() {
 		var r model.Run
-		if err := rows.Scan(&r.ID, &r.TenantID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.TenantID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.MaxRounds, &r.MaxTokens, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

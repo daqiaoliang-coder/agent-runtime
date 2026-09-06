@@ -33,7 +33,7 @@ type Runtime struct {
 // 所有落库与入队操作均携带租户身份（run.TenantID），保证后续跨进程链路可做租户隔离。
 func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input string) (*model.Run, error) {
 	id := fmt.Sprintf("run-%d", time.Now().UnixNano())
-	run := &model.Run{ID: id, TenantID: tenant, AgentID: agent, Status: model.RunPending, Input: input, MaxSteps: 50, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	run := &model.Run{ID: id, TenantID: tenant, AgentID: agent, Status: model.RunPending, Input: input, MaxSteps: 50, MaxRounds: 10, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	if err := r.Store.CreateRun(ctx, run); err != nil {
 		return nil, err
 	}

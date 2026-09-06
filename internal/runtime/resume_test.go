@@ -36,6 +36,12 @@ type fakeStore struct {
 	completedNodes    []model.Node
 	completedNodesErr error
 
+	// CountNodes / RunTokenUsage 模拟（用于多轮 Plan 死循环防护）
+	countNodes        int
+	countNodesErr     error
+	runTokenUsage     int
+	runTokenUsageErr  error
+
 	// 调用记录（仅记录 tenant 参数，用于断言租户透传）
 	getRunCalls        []getRunCall
 	updateCASCalls     []casCall
@@ -119,6 +125,12 @@ func (f *fakeStore) CancelRun(_ context.Context, tenant, runID, reason string, v
 }
 func (f *fakeStore) CompletedNodes(_ context.Context, _, _ string) ([]model.Node, error) {
 	return f.completedNodes, f.completedNodesErr
+}
+func (f *fakeStore) CountNodes(_ context.Context, _, _ string) (int, error) {
+	return f.countNodes, f.countNodesErr
+}
+func (f *fakeStore) RunTokenUsage(_ context.Context, _, _ string) (int, error) {
+	return f.runTokenUsage, f.runTokenUsageErr
 }
 
 // fakeQueue 记录入队任务，用于断言子节点被正确投递且携带租户。

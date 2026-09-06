@@ -108,6 +108,30 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		}
 	}()
 
+	// Token 预算检查：LLM/REFLECT 节点执行前校验累计 token 是否超限。
+	// 超限时直接失败（不可重试），避免无意义的 LLM 调用与 token 浪费。
+	if run.MaxTokens > 0 && (n.Type == model.NodeLLM || n.Type == model.NodeReflect) {
+		used, terr := w.Store.RunTokenUsage(ctx, n.TenantID, n.RunID)
+		if terr != nil {
+			log.Printf("warn: token usage check failed run=%s node=%s err=%v", n.RunID, n.ID, terr)
+		} else if used >= run.MaxTokens {
+			budgetErr := fmt.Errorf("token budget exceeded: used %d >= limit %d", used, run.MaxTokens)
+			span.RecordError(budgetErr)
+			span.SetStatus(codes.Error, budgetErr.Error())
+			next := n.Attempt + 1
+			log.Printf("node dead-lettered (token budget) run=%s node=%s attempt=%d", n.RunID, n.ID, n.Attempt)
+			_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, budgetErr.Error(), next, "")
+			fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: budgetErr.Error(), Timestamp: time.Now()}
+			payload, _ := json.Marshal(fe)
+			_, _ = w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{ID: fe.ID, EventType: fe.Type, AggregateID: n.RunID, Payload: string(payload)})
+			w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
+				ID: fmt.Sprintf("runtime-event-%s-failed-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
+				Type: contracts.EventNodeFailed, Timestamp: time.Now(), Data: map[string]any{"error": budgetErr.Error(), "attempt": n.Attempt},
+			})
+			return nil
+		}
+	}
+
 	// 执行节点：替换原先的占位字符串拼接，真正发起 LLM 推理或工具调用。
 	output, execErr := w.Exec.Execute(ctx, n)
 	if execErr != nil {

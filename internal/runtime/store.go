@@ -20,6 +20,8 @@ type Store interface {
 	RunComplete(ctx context.Context, tenant, runID string) (bool, error)
 	RunHasFailure(ctx context.Context, tenant, runID string) (bool, error)
 	CompletedNodes(ctx context.Context, tenant, runID string) ([]model.Node, error)
+	CountNodes(ctx context.Context, tenant, runID string) (int, error)
+	RunTokenUsage(ctx context.Context, tenant, runID string) (int, error)
 	// 消费端幂等 Inbox：InboxSeen 处理前查表，MarkInbox 处理后写表，去重 RocketMQ 至少一次投递。
 	InboxSeen(ctx context.Context, tenant, eventID string) (bool, error)
 	MarkInbox(ctx context.Context, tenant, eventID string) error
