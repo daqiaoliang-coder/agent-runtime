@@ -147,7 +147,16 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		return nil
 	}
 
-	e := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepCompleted", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Output: output, Timestamp: time.Now()}
+	// REFLECT 节点：解析决策，若 "replan" 则发 ReplanRequested 事件代替 AgentStepCompleted。
+	// 节点仍标记 SUCCESS（决策本身执行成功），仅事件类型不同，驱动 Resumer 走续规路径。
+	eventType := "AgentStepCompleted"
+	if n.Type == model.NodeReflect {
+		var decision struct{ Action string `json:"action"` }
+		if jerr := json.Unmarshal([]byte(output), &decision); jerr == nil && decision.Action == "replan" {
+			eventType = "ReplanRequested"
+		}
+	}
+	e := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: eventType, RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Output: output, Timestamp: time.Now()}
 	payload, _ := json.Marshal(e)
 	// 累积检查点上下文（对话历史 + 节点输出），在节点完成前落盘，供崩溃恢复重建 Agent 上下文。
 	w.saveCheckpoint(ctx, n, output)

@@ -14,9 +14,11 @@ import (
 // Resumer 是事件驱动的 DAG 推进器。
 // 它消费 RocketMQ 中的节点完成/失败事件，激活后继节点并在全部完成时收敛 Run。
 // Store/Queue 为接口类型，便于单元测试注入 fake。
+// Planner 用于多轮 Plan：ReplanRequested 事件触发时调用 Planner.Replan 续规划。
 type Resumer struct {
-	Store Store
-	Queue Queue
+	Store   Store
+	Queue   Queue
+	Planner Planner
 }
 
 // Handle 处理单个领域事件：
@@ -37,7 +39,7 @@ func (r *Resumer) Handle(ctx context.Context, e model.Event) error {
 		attribute.String("node.id", e.NodeID),
 		attribute.String("tenant.id", e.TenantID),
 	)
-	if e.Type != "AgentStepCompleted" && e.Type != "AgentStepFailed" {
+	if e.Type != "AgentStepCompleted" && e.Type != "AgentStepFailed" && e.Type != "ReplanRequested" {
 		return nil
 	}
 	// 消费端幂等 Inbox：处理前查表，已处理过的事件直接跳过，去重 RocketMQ 至少一次投递的重复消息。
@@ -61,6 +63,17 @@ func (r *Resumer) Handle(ctx context.Context, e model.Event) error {
 
 // process 执行事件推进逻辑（原 Handle 主体）。返回 error 时不写 Inbox，触发重投递。
 func (r *Resumer) process(ctx context.Context, e model.Event) error {
+	// ReplanRequested：REFLECT 节点决定续规，调 Planner.Replan 追加新节点到 DAG。
+	if e.Type == "ReplanRequested" {
+		run, err := r.Store.GetRun(ctx, e.TenantID, e.RunID)
+		if err != nil {
+			return fmt.Errorf("load run for replan: %w", err)
+		}
+		if run.Status == model.RunCancelRequested {
+			return nil // 已取消，不续规
+		}
+		return r.handleReplan(ctx, e, run)
+	}
 	// 先获取 Run：Failed 与 Completed 两条路径都需要 version 做 CAS，且需要检查取消。
 	run, err := r.Store.GetRun(ctx, e.TenantID, e.RunID)
 	if err != nil {
@@ -149,6 +162,56 @@ func (r *Resumer) tryConvergeCancelled(ctx context.Context, e model.Event, run *
 		return nil
 	}
 	log.Printf("run cancelled run=%s tenant=%s trigger_node=%s", e.RunID, e.TenantID, e.NodeID)
+	return nil
+}
+
+// handleReplan 执行多轮 Plan 的续规流程：
+// 1. 查询已完成节点（含 outputs）作为 Planner 的上下文；
+// 2. 调用 Planner.Replan 产出新一轮节点；
+// 3. 将新节点无 DependsOn 的根链接到触发续规的 REFLECT 节点（e.NodeID）；
+// 4. InsertPlan 追加节点 + 边到同一 Run 的 DAG；
+// 5. 激活依赖已就绪的新节点（REFLECT 已 SUCCESS，直接挂接的根节点可立即执行）。
+func (r *Resumer) handleReplan(ctx context.Context, e model.Event, run *model.Run) error {
+	if r.Planner == nil {
+		return fmt.Errorf("replan requested but planner not configured")
+	}
+	completed, err := r.Store.CompletedNodes(ctx, e.TenantID, e.RunID)
+	if err != nil {
+		return fmt.Errorf("load completed nodes for replan: %w", err)
+	}
+	plan, err := r.Planner.Replan(ctx, run, completed)
+	if err != nil {
+		return fmt.Errorf("planner replan: %w", err)
+	}
+	// 链接：新节点中 DependsOn 为空的根节点挂接到触发续规的 REFLECT 节点。
+	for i, n := range plan.Nodes {
+		if len(n.DependsOn) == 0 {
+			plan.Nodes[i].DependsOn = []string{e.NodeID}
+		}
+		if plan.Nodes[i].ParentNodeID == "" {
+			plan.Nodes[i].ParentNodeID = e.NodeID
+		}
+	}
+	if err := r.Store.InsertPlan(ctx, e.RunID, e.TenantID, plan); err != nil {
+		return fmt.Errorf("insert replan nodes: %w", err)
+	}
+	// 激活依赖已就绪的新节点：REFLECT 节点已 SUCCESS，直接挂接的根节点立即可执行。
+	for _, n := range plan.Nodes {
+		ready, err := r.Store.DependenciesReady(ctx, e.TenantID, n.ID)
+		if err != nil {
+			return fmt.Errorf("check deps for replan node %s: %w", n.ID, err)
+		}
+		if !ready {
+			continue
+		}
+		if err := r.Store.MarkReady(ctx, e.TenantID, n.ID); err != nil {
+			return fmt.Errorf("mark ready replan node %s: %w", n.ID, err)
+		}
+		if err := r.Queue.Enqueue(ctx, model.Task{RunID: e.RunID, NodeID: n.ID, TenantID: e.TenantID}); err != nil {
+			return fmt.Errorf("enqueue replan node %s: %w", n.ID, err)
+		}
+	}
+	log.Printf("run replanned run=%s tenant=%s trigger_node=%s new_nodes=%d", e.RunID, e.TenantID, e.NodeID, len(plan.Nodes))
 	return nil
 }
 

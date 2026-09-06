@@ -104,8 +104,8 @@ func TestGetNode_IncludesTenantFilter(t *testing.T) {
 	defer cleanup()
 	now := time.Now()
 	// 列顺序与 GetNode 的 Scan 一致（lease_until/started_at/finished_at 可为 NULL）。
-	rows := sqlmock.NewRows([]string{"node_id", "run_id", "tenant_id", "parent_node_id", "type", "name", "input", "output", "status", "attempt", "version", "lease_owner", "lease_until", "created_at", "started_at", "finished_at"}).
-		AddRow("node-1", "run-1", "tenant-A", "", model.NodeLLM, "reason", "in", "", model.NodePending, 0, int64(0), "", nil, now, nil, nil)
+	rows := sqlmock.NewRows([]string{"node_id", "run_id", "tenant_id", "parent_node_id", "type", "name", "input", "output", "status", "attempt", "version", "lease_owner", "lease_until", "planning_round", "created_at", "started_at", "finished_at"}).
+		AddRow("node-1", "run-1", "tenant-A", "", model.NodeLLM, "reason", "in", "", model.NodePending, 0, int64(0), "", nil, 1, now, nil, nil)
 	mock.ExpectQuery("tenant_id").
 		WithArgs("node-1", "tenant-A").
 		WillReturnRows(rows)

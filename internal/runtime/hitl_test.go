@@ -38,6 +38,9 @@ func (s *hitlFakeStore) RunComplete(context.Context, string, string) (bool, erro
 func (s *hitlFakeStore) RunHasFailure(context.Context, string, string) (bool, error) {
 	return false, nil
 }
+func (s *hitlFakeStore) CompletedNodes(context.Context, string, string) ([]model.Node, error) {
+	return nil, nil
+}
 func (s *hitlFakeStore) InboxSeen(context.Context, string, string) (bool, error) { return false, nil }
 func (s *hitlFakeStore) MarkInbox(context.Context, string, string) error         { return nil }
 func (s *hitlFakeStore) InterruptRun(_ context.Context, _, _, _, _ string, version int64) (bool, error) {
@@ -67,6 +70,9 @@ func (hitlFakeQueue) Enqueue(context.Context, model.Task) error { return nil }
 type noopPlanner struct{}
 
 func (noopPlanner) Plan(context.Context, *model.Run) (model.Plan, error) { return model.Plan{}, nil }
+func (noopPlanner) Replan(context.Context, *model.Run, []model.Node) (model.Plan, error) {
+	return model.Plan{}, nil
+}
 
 func TestRuntime_HITLInterruptAndResume(t *testing.T) {
 	s := &hitlFakeStore{run: &model.Run{ID: "r1", TenantID: "t1", Status: model.RunRunning, Version: 0, UpdatedAt: time.Now()}}

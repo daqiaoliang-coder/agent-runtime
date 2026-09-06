@@ -76,7 +76,7 @@ func (s *MySQL) InsertPlan(ctx context.Context, runID, tenant string, p model.Pl
 	}
 	defer tx.Rollback()
 	for _, n := range p.Nodes {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO agent_node(node_id,run_id,tenant_id,parent_node_id,type,name,input,status) VALUES(?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE node_id=node_id`, n.ID, runID, tenant, n.ParentNodeID, n.Type, n.Name, n.Input, model.NodePending); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO agent_node(node_id,run_id,tenant_id,parent_node_id,type,name,input,status,planning_round) VALUES(?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE node_id=node_id`, n.ID, runID, tenant, n.ParentNodeID, n.Type, n.Name, n.Input, model.NodePending, planningRoundOrDefault(n.PlanningRound)); err != nil {
 			return err
 		}
 	}
@@ -90,11 +90,19 @@ func (s *MySQL) InsertPlan(ctx context.Context, runID, tenant string, p model.Pl
 	return tx.Commit()
 }
 
+// planningRoundOrDefault 将 0 规范化为 1（默认第一轮）。
+func planningRoundOrDefault(r int) int {
+	if r <= 0 {
+		return 1
+	}
+	return r
+}
+
 // GetNode 按 tenant + node_id 读取节点，租户不匹配返回 sql.ErrNoRows。
 func (s *MySQL) GetNode(ctx context.Context, tenant, id string) (*model.Node, error) {
 	n := &model.Node{}
 	var lease, started, finished sql.NullTime
-	err := s.DB.QueryRowContext(ctx, `SELECT node_id,run_id,tenant_id,COALESCE(parent_node_id,''),type,name,COALESCE(input,''),COALESCE(output,''),status,attempt,version,COALESCE(lease_owner,''),lease_until,created_at,started_at,finished_at FROM agent_node WHERE node_id=? AND tenant_id=?`, id, tenant).Scan(&n.ID, &n.RunID, &n.TenantID, &n.ParentNodeID, &n.Type, &n.Name, &n.Input, &n.Output, &n.Status, &n.Attempt, &n.Version, &n.LeaseOwner, &lease, &n.CreatedAt, &started, &finished)
+	err := s.DB.QueryRowContext(ctx, `SELECT node_id,run_id,tenant_id,COALESCE(parent_node_id,''),type,name,COALESCE(input,''),COALESCE(output,''),status,attempt,version,COALESCE(lease_owner,''),lease_until,planning_round,created_at,started_at,finished_at FROM agent_node WHERE node_id=? AND tenant_id=?`, id, tenant).Scan(&n.ID, &n.RunID, &n.TenantID, &n.ParentNodeID, &n.Type, &n.Name, &n.Input, &n.Output, &n.Status, &n.Attempt, &n.Version, &n.LeaseOwner, &lease, &n.PlanningRound, &n.CreatedAt, &started, &finished)
 	if err != nil {
 		return nil, err
 	}
@@ -234,6 +242,36 @@ func (s *MySQL) RunHasFailure(ctx context.Context, tenant, runID string) (bool, 
 	var n int
 	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_node WHERE run_id=? AND tenant_id=? AND status=?`, runID, tenant, model.NodeFailed).Scan(&n)
 	return n > 0, err
+}
+
+// CompletedNodes 返回指定 Run 下所有 SUCCESS 节点（按完成时间排序），供 Planner.Replan
+// 读取前序节点的 outputs 作为续规上下文。
+func (s *MySQL) CompletedNodes(ctx context.Context, tenant, runID string) ([]model.Node, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT node_id,run_id,tenant_id,COALESCE(parent_node_id,''),type,name,COALESCE(input,''),COALESCE(output,''),status,attempt,version,COALESCE(lease_owner,''),lease_until,planning_round,created_at,started_at,finished_at FROM agent_node WHERE run_id=? AND tenant_id=? AND status=? ORDER BY finished_at`, runID, tenant, model.NodeSuccess)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Node
+	for rows.Next() {
+		var n model.Node
+		var lease, started, finished sql.NullTime
+		if err := rows.Scan(&n.ID, &n.RunID, &n.TenantID, &n.ParentNodeID, &n.Type, &n.Name, &n.Input, &n.Output, &n.Status, &n.Attempt, &n.Version, &n.LeaseOwner, &lease, &n.PlanningRound, &n.CreatedAt, &started, &finished); err != nil {
+			return nil, err
+		}
+		if lease.Valid {
+			t := lease.Time
+			n.LeaseUntil = &t
+		}
+		if started.Valid {
+			n.StartedAt = started.Time
+		}
+		if finished.Valid {
+			n.FinishedAt = finished.Time
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
 }
 
 func (s *MySQL) SaveCheckpoint(ctx context.Context, runID string, version int64, nodeID string, state any) error {

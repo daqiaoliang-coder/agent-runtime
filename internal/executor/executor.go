@@ -14,8 +14,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -98,6 +100,13 @@ func (d *Dispatcher) Execute(ctx context.Context, n *model.Node) (string, error)
 			return d.SubAgent.Execute(ctx, n)
 		}
 		return "", fmt.Errorf("sub-agent executor not configured")
+	case model.NodeReflect:
+		out, err := d.executeReflect(ctx, n)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		return out, err
 	default:
 		return "", fmt.Errorf("unknown node type %q", n.Type)
 	}
@@ -172,6 +181,94 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 		})
 	}
 	return resp.Content, nil
+}
+
+// reflectDecision 是 REFLECT 节点输出的 JSON 结构。
+// Action="replan" 触发 Resumer 续规划；Action="finish" 走正常收敛。
+type reflectDecision struct {
+	Action string `json:"action"`
+	Reason string `json:"reason"`
+}
+
+const reflectSystemPrompt = `You are a reflection node in an agent runtime.
+Evaluate the progress so far and decide whether to continue (replan) or finish.
+Respond with ONLY a JSON object, no prose: {"action":"replan"|"finish","reason":"..."}`
+
+// executeReflect 执行反思节点：加载 checkpoint 上下文，调 LLM 评估进度，
+// 返回 JSON 决策 {"action":"replan"|"finish","reason":"..."}。
+// worker 据此决定发 ReplanRequested 还是 AgentStepCompleted 事件。
+func (d *Dispatcher) executeReflect(ctx context.Context, n *model.Node) (string, error) {
+	ctx, span := trace.StartSpan(ctx, "executor.reflect")
+	defer span.End()
+	// 从 checkpoint 重建对话历史作为评估上下文。
+	msgs := []llm.Message{
+		{Role: llm.RoleSystem, Content: reflectSystemPrompt},
+		{Role: llm.RoleUser, Content: n.Input},
+	}
+	if d.ContextLoader != nil {
+		hist, err := d.ContextLoader(ctx, n.RunID)
+		if err != nil {
+			return "", fmt.Errorf("load context for reflect: %w", err)
+		}
+		if len(hist) > 0 {
+			// 历史在前，反思指令在后。
+			msgs = append(hist, msgs...)
+		}
+	}
+	var resp llm.Response
+	if d.ModelProvider != nil {
+		request := contracts.GenerateRequest{Model: modelForNode(n)}
+		for _, m := range msgs {
+			request.Messages = append(request.Messages, contracts.Message{Role: contracts.Role(m.Role), Content: m.Content})
+		}
+		generated, err := d.ModelProvider.Generate(ctx, request)
+		if err != nil {
+			return "", fmt.Errorf("reflect llm: %w", err)
+		}
+		resp = llm.Response{Content: generated.Message.Content, Model: generated.Model}
+	} else {
+		if d.LLM == nil {
+			return "", fmt.Errorf("llm client not configured for reflect")
+		}
+		got, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs})
+		if err != nil {
+			return "", fmt.Errorf("reflect llm: %w", err)
+		}
+		resp = got
+	}
+	// 解析 LLM 输出为 reflectDecision；解析失败时默认 finish（不阻断流程）。
+	var decision reflectDecision
+	raw := extractJSON(resp.Content)
+	if err := json.Unmarshal([]byte(raw), &decision); err != nil || (decision.Action != "replan" && decision.Action != "finish") {
+		// LLM 未返回有效 JSON 或 action 不合法：默认 finish，避免卡死。
+		decision = reflectDecision{Action: "finish", Reason: "reflect output unparseable, defaulting to finish"}
+	}
+	out, _ := json.Marshal(decision)
+	span.SetAttributes(
+		attribute.String("reflect.action", decision.Action),
+		attribute.String("llm.model", resp.Model),
+	)
+	return string(out), nil
+}
+
+// extractJSON 从可能含 Markdown 代码块或前后说明文本的响应中提取首个 JSON 对象。
+func extractJSON(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		s = strings.TrimPrefix(s, "```json")
+		s = strings.TrimPrefix(s, "```")
+		s = strings.TrimSuffix(s, "```")
+		s = strings.TrimSpace(s)
+	}
+	start := strings.Index(s, "{")
+	if start < 0 {
+		return s
+	}
+	end := strings.LastIndex(s, "}")
+	if end < start {
+		return s
+	}
+	return s[start : end+1]
 }
 
 // executeTool 执行工具节点。配置了 ToolStore 时走幂等路径，否则退化为直接执行。

@@ -38,6 +38,7 @@ const (
 	NodeLLM      NodeType = "LLM"       // LLM 推理节点
 	NodeTool     NodeType = "TOOL"      // 工具调用节点
 	NodeSubAgent NodeType = "SUB_AGENT" // 子 Agent 节点
+	NodeReflect  NodeType = "REFLECT"   // 反思节点：评估进度，决定续规或收尾
 )
 
 // Run 是一次完整的 Agent 运行记录，对应 agent_run 表。
@@ -63,16 +64,19 @@ type Node struct {
 	Version                           int64
 	LeaseOwner                        string
 	LeaseUntil                        *time.Time
+	PlanningRound                     int
 	CreatedAt, StartedAt, FinishedAt  time.Time
 }
 
 // PlanNode 是规划阶段产出的节点描述，尚未落库。
 // DependsOn 列出依赖节点 ID，构成 DAG 边。
+// PlanningRound 标识该节点属于第几轮规划（0 视为 1），用于多轮 Plan 的可观测性。
 type PlanNode struct {
 	ID, ParentNodeID string
 	Type             NodeType
 	Name, Input      string
 	DependsOn        []string
+	PlanningRound    int
 }
 
 // Plan 是一次规划的结果，包含全部待执行节点。
