@@ -61,12 +61,18 @@ func (r *Resumer) Handle(ctx context.Context, e model.Event) error {
 
 // process 执行事件推进逻辑（原 Handle 主体）。返回 error 时不写 Inbox，触发重投递。
 func (r *Resumer) process(ctx context.Context, e model.Event) error {
+	// 先获取 Run：Failed 与 Completed 两条路径都需要 version 做 CAS，且需要检查取消。
+	run, err := r.Store.GetRun(ctx, e.TenantID, e.RunID)
+	if err != nil {
+		return fmt.Errorf("load run: %w", err)
+	}
+	// 取消优先：Run 处于 CANCEL_REQUESTED 时，不推进 DAG 也不标 FAILED，
+	// 仅检查是否所有节点终态（含 CANCELLED）以收敛到 CANCELLED。
+	if run.Status == model.RunCancelRequested {
+		return r.tryConvergeCancelled(ctx, e, run)
+	}
 	if e.Type == "AgentStepFailed" {
-		// 修复 Bug2：必须先拿到 Run 当前 version，再用 CAS 标记失败，否则 WHERE version=0 永不匹配。
-		run, err := r.Store.GetRun(ctx, e.TenantID, e.RunID)
-		if err != nil {
-			return fmt.Errorf("load run for failure: %w", err)
-		}
+		// Bug2 修复保持：run.Version 来自上方 GetRun，CAS 标记 FAILED。
 		_, err = r.Store.UpdateRunCAS(ctx, e.TenantID, e.RunID, run.Version, model.RunFailed, "", e.Error)
 		return err
 	}
@@ -98,14 +104,10 @@ func (r *Resumer) process(ctx context.Context, e model.Event) error {
 	if !complete {
 		return nil
 	}
-	// 修复 Bug3：不再用 _ 吞掉错误，DB 失败时显式返回，避免后续 run 为 nil 触发 panic。
+	// Bug3 修复保持：不再用 _ 吞掉错误，DB 失败时显式返回。
 	failed, err := r.Store.RunHasFailure(ctx, e.TenantID, e.RunID)
 	if err != nil {
 		return fmt.Errorf("check run failure: %w", err)
-	}
-	run, err := r.Store.GetRun(ctx, e.TenantID, e.RunID)
-	if err != nil {
-		return fmt.Errorf("load run for completion: %w", err)
 	}
 	status := model.RunSuccess
 	out := "completed"
@@ -123,6 +125,30 @@ func (r *Resumer) process(ctx context.Context, e model.Event) error {
 	}
 	// 关键日志：Run 收敛到终态，标志 DAG 全部节点结束，是 Runtime 最重要的一次状态跃迁。
 	log.Printf("run settled run=%s tenant=%s status=%s trigger_node=%s", e.RunID, e.TenantID, status, e.NodeID)
+	return nil
+}
+
+// tryConvergeCancelled 在 Run 处于 CANCEL_REQUESTED 时尝试收敛到 CANCELLED。
+// 不推进 DAG（子节点要么已被 CancelRun 取消，要么已在终态）；仅当所有节点
+// 均为终态（SUCCESS/FAILED/CANCELLED）时才 CAS 到 CANCELLED。
+// RUNNING 节点完成后会再次投递事件触发本路径，直到可收敛。
+func (r *Resumer) tryConvergeCancelled(ctx context.Context, e model.Event, run *model.Run) error {
+	complete, err := r.Store.RunComplete(ctx, e.TenantID, e.RunID)
+	if err != nil {
+		return fmt.Errorf("check run complete for cancel: %w", err)
+	}
+	if !complete {
+		return nil
+	}
+	ok, err := r.Store.UpdateRunCAS(ctx, e.TenantID, e.RunID, run.Version, model.RunCancelled, e.NodeID, "cancelled by user")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// 版本冲突意味着并发已推进（或 Run 已偏离 CANCEL_REQUESTED），返回 nil 避免事件重试。
+		return nil
+	}
+	log.Printf("run cancelled run=%s tenant=%s trigger_node=%s", e.RunID, e.TenantID, e.NodeID)
 	return nil
 }
 

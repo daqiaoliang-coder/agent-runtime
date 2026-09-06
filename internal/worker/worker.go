@@ -63,6 +63,20 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	if err != nil {
 		return err
 	}
+	// 取消/终态检查：若 Run 已不在 RUNNING（被取消、已成功/失败），不再认领节点。
+	// 这是用户取消的最终防线：CancelRun 已取消 PENDING/READY 节点，但 RecoverExpired
+	// 可能在此之后把崩溃的 RUNNING 节点重置回 PENDING 并补投递，此时 worker 须拒绝执行。
+	run, err := w.Store.GetRun(ctx, t.TenantID, t.RunID)
+	if err != nil {
+		return err
+	}
+	if run.Status != model.RunRunning {
+		if n.Status == model.NodePending || n.Status == model.NodeReady {
+			_, _ = w.Store.CancelNode(ctx, t.TenantID, t.NodeID, n.Version)
+		}
+		log.Printf("worker=%s skip node run=%s node=%s run_status=%s", w.ID, t.RunID, t.NodeID, run.Status)
+		return nil
+	}
 	ok, err := w.Store.ClaimNode(ctx, n.TenantID, n.ID, n.Version, w.ID, 30*time.Second)
 	if err != nil {
 		return err

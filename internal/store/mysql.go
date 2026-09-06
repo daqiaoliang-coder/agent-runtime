@@ -222,10 +222,10 @@ func (s *MySQL) MarkReady(ctx context.Context, tenant, nodeID string) error {
 	return err
 }
 
-// RunComplete 检查指定租户的 Run 下是否所有节点均已终态。
+// RunComplete 检查指定租户的 Run 下是否所有节点均已终态（SUCCESS/FAILED/CANCELLED）。
 func (s *MySQL) RunComplete(ctx context.Context, tenant, runID string) (bool, error) {
 	var n int
-	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_node WHERE run_id=? AND tenant_id=? AND status NOT IN (?,?)`, runID, tenant, model.NodeSuccess, model.NodeFailed).Scan(&n)
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_node WHERE run_id=? AND tenant_id=? AND status NOT IN (?,?,?)`, runID, tenant, model.NodeSuccess, model.NodeFailed, model.NodeCancelled).Scan(&n)
 	return n == 0, err
 }
 
@@ -506,4 +506,71 @@ func (s *MySQL) ResumeRun(ctx context.Context, tenant, runID, decision string, v
 		return false, err
 	}
 	return true, nil
+}
+
+// CancelRun 在单事务中将 Run 从 RUNNING 切换到 CANCEL_REQUESTED，同时把该 Run 下
+// 所有 PENDING/READY 节点置为 CANCELLED，防止 worker 在取消后继续认领新节点。
+// RUNNING 节点不被触及：它们要么自然完成（Resumer 据此收敛），要么租约过期后被
+// recovery 的取消扫描处理。CAS 失败（version 不匹配或状态非 RUNNING）返回 false。
+func (s *MySQL) CancelRun(ctx context.Context, tenant, runID, reason string, version int64) (bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE agent_run SET status=?,output=NULLIF(?,''),version=version+1,updated_at=NOW(6) WHERE run_id=? AND tenant_id=? AND version=? AND status=?`, model.RunCancelRequested, reason, runID, tenant, version, model.RunRunning)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,finished_at=NOW(6) WHERE run_id=? AND tenant_id=? AND status IN (?,?)`, model.NodeCancelled, runID, tenant, model.NodePending, model.NodeReady); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// CancelRequestedRuns 扫描处于 CANCEL_REQUESTED 状态的 Run，供 recovery 周期性
+// 收敛：取消遗留的 PENDING/READY 节点，并在全部节点终态时 CAS 到 CANCELLED。
+// 系统级扫描（不限定租户），返回的 Run 携带 tenant_id 以便后续操作做租户隔离。
+func (s *MySQL) CancelRequestedRuns(ctx context.Context, limit int) ([]model.Run, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT run_id,tenant_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,created_at,updated_at FROM agent_run WHERE status=? LIMIT ?`, model.RunCancelRequested, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Run
+	for rows.Next() {
+		var r model.Run
+		if err := rows.Scan(&r.ID, &r.TenantID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// CancelRunNodes 将指定 Run 下所有 PENDING/READY 节点置为 CANCELLED。
+// 用于 recovery 的取消扫描：覆盖 CancelRun 之后因租约过期被 RecoverExpired
+// 重置回 PENDING 的节点（worker 的 Run 状态检查是最终防线，防止此类节点被执行）。
+func (s *MySQL) CancelRunNodes(ctx context.Context, tenant, runID string) (int64, error) {
+	res, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,finished_at=NOW(6) WHERE run_id=? AND tenant_id=? AND status IN (?,?)`, model.NodeCancelled, runID, tenant, model.NodePending, model.NodeReady)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// CancelNode 在 worker 侧做单节点取消：仅当节点仍为 PENDING/READY 时 CAS 到 CANCELLED。
+// 用于 worker 发现 Run 已非 RUNNING 时，阻止该节点被执行。
+func (s *MySQL) CancelNode(ctx context.Context, tenant, id string, version int64) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=? AND status IN (?,?)`, model.NodeCancelled, id, tenant, version, model.NodePending, model.NodeReady)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
 }

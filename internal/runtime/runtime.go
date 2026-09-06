@@ -9,6 +9,12 @@ import (
 	"time"
 )
 
+// CancelStore 把 Run 翻到 CANCEL_REQUESTED 并取消其 PENDING/READY 节点的原子操作。
+// 与 HITLStore 同理：以独立接口暴露，*store.MySQL 天然满足，fakeStore 可按需实现。
+type CancelStore interface {
+	CancelRun(ctx context.Context, tenant, runID, reason string, version int64) (bool, error)
+}
+
 // Runtime 负责创建 Run 并完成初始调度。
 // 它组合了持久化（Store）、任务队列（Queue）和规划器（Planner）。
 // Store/Queue 为接口类型，便于单元测试注入 fake。
@@ -70,3 +76,31 @@ func countRoots(nodes []model.PlanNode) (n int) {
 
 // EventJSON 将领域事件序列化为 JSON 字符串，便于投递到消息中间件。
 func EventJSON(e model.Event) string { b, _ := json.Marshal(e); return string(b) }
+
+// Cancel 请求取消一个运行中的 Run：通过 CAS 把 Run 从 RUNNING 切到 CANCEL_REQUESTED，
+// 并在同一事务内把该 Run 下所有 PENDING/READY 节点置为 CANCELLED，阻止 worker 认领新节点。
+// 正在执行的 RUNNING 节点不被中断：它们会自然完成，Resumer 据此收敛 Run 到 CANCELLED。
+// 仅 RunRunning 状态可被取消；并发变更（version 不匹配）返回错误而非静默失败。
+func (r *Runtime) Cancel(ctx context.Context, tenant, runID, reason string) error {
+	cs, ok := r.Store.(CancelStore)
+	if !ok {
+		return fmt.Errorf("cancel store is not configured")
+	}
+	run, err := r.Store.GetRun(ctx, tenant, runID)
+	if err != nil {
+		return err
+	}
+	if run.Status != model.RunRunning {
+		return fmt.Errorf("run %s cannot be cancelled from %s", runID, run.Status)
+	}
+	ok, err = cs.CancelRun(ctx, tenant, runID, reason, run.Version)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("run %s changed while cancelling", runID)
+	}
+	// 关键日志：用户取消请求已落盘，Run 进入 CANCEL_REQUESTED，等待节点收敛到 CANCELLED。
+	log.Printf("run cancel requested run=%s tenant=%s reason=%q", runID, tenant, reason)
+	return nil
+}

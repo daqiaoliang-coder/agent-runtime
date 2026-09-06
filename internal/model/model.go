@@ -8,12 +8,13 @@ import "time"
 type RunStatus string
 
 const (
-	RunPending      RunStatus = "PENDING"       // 已创建，尚未开始调度
-	RunRunning      RunStatus = "RUNNING"       // 运行中
-	RunWaitingHuman RunStatus = "WAITING_HUMAN" // 等待人工确认
-	RunSuccess      RunStatus = "SUCCESS"       // 全部节点成功完成
-	RunFailed       RunStatus = "FAILED"        // 存在失败节点或运行出错
-	RunCancelled    RunStatus = "CANCELLED"     // 被取消
+	RunPending         RunStatus = "PENDING"          // 已创建，尚未开始调度
+	RunRunning         RunStatus = "RUNNING"          // 运行中
+	RunWaitingHuman    RunStatus = "WAITING_HUMAN"    // 等待人工确认
+	RunCancelRequested RunStatus = "CANCEL_REQUESTED" // 用户已请求取消，等待节点收敛
+	RunSuccess         RunStatus = "SUCCESS"          // 全部节点成功完成
+	RunFailed          RunStatus = "FAILED"           // 存在失败节点或运行出错
+	RunCancelled       RunStatus = "CANCELLED"        // 已收敛到取消终态
 )
 
 // NodeStatus 表示 DAG 中单个节点（步骤）的状态。
@@ -27,6 +28,7 @@ const (
 	NodeWaitingHuman NodeStatus = "WAITING_HUMAN" // 等待人工确认
 	NodeSuccess      NodeStatus = "SUCCESS"       // 执行成功
 	NodeFailed       NodeStatus = "FAILED"        // 执行失败
+	NodeCancelled    NodeStatus = "CANCELLED"     // 因 Run 被取消而终止
 )
 
 // NodeType 表示节点的执行类型，决定 worker 如何处理该节点。
