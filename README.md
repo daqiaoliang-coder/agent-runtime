@@ -146,7 +146,11 @@ agent-runtime/
 │   ├── 004_retry_dlq.sql
 │   ├── 005_inbox.sql
 │   ├── 006_llm_usage.sql
-│   └── 007_hitl.sql
+│   ├── 007_hitl.sql
+│   ├── 008_run_cancel.sql
+│   ├── 009_run_limits.sql
+│   ├── 010_run_steps.sql
+│   └── 011_planner_decision.sql
 │
 └── docs/
     ├── design.md
