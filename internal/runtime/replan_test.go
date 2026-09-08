@@ -216,6 +216,110 @@ func TestResumer_ReplanRequested_MaxStepsExceeded(t *testing.T) {
 	}
 }
 
+// TestResumer_ReplanRequested_DecisionReused_NoSecondLLMCall 验证 P0-5 不变量：
+// ReplanRequested 事件重投（或 InsertPlan 前崩溃重放）时，GetDecision 命中已有决策，
+// 必须复用原 Plan，不得再次调用非确定性 LLM。
+func TestResumer_ReplanRequested_DecisionReused_NoSecondLLMCall(t *testing.T) {
+	reusedNode := model.PlanNode{ID: "run-1:r2:finish", Type: model.NodeLLM, Name: "finish", Input: "reused decision"}
+	planner := &replanPlanner{plan: model.Plan{Nodes: []model.PlanNode{reusedNode}}}
+	fs := &fakeStore{
+		getRun:         &model.Run{ID: "run-1", TenantID: "tenant-A", Version: 1, Status: model.RunRunning},
+		depsReady:      true,
+		completedNodes: []model.Node{{ID: "reflect-1", Name: "reflect", Output: `{"action":"replan"}`, Status: model.NodeSuccess, PlanningRound: 1}},
+		// 模拟已存在决策：事件重投时命中
+		decisionExists: true,
+		decisionPlan:   model.Plan{Nodes: []model.PlanNode{reusedNode}},
+	}
+	q := &fakeQueue{}
+	r := &Resumer{Store: fs, Queue: q, Planner: planner}
+	if err := r.Handle(context.Background(), replanEvent()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 核心断言：LLM 不得被再次调用
+	if planner.called {
+		t.Fatal("P0-5 violation: Planner.Replan was called when a persisted decision exists")
+	}
+	// 复用的 Plan 仍应被 InsertPlan + 激活
+	if len(fs.insertPlanCalls) != 1 {
+		t.Fatalf("expected 1 InsertPlan (reuse), got %d", len(fs.insertPlanCalls))
+	}
+	if len(fs.markReadyCalls) != 1 || fs.markReadyCalls[0].nodeID != "run-1:r2:finish" {
+		t.Errorf("expected MarkReady for reused node, got %+v", fs.markReadyCalls)
+	}
+	// GetDecision 应以 round=2 查询（nextRound: max PlanningRound=1 + 1）
+	if len(fs.getDecisionCalls) != 1 {
+		t.Fatalf("expected 1 GetDecision call, got %d", len(fs.getDecisionCalls))
+	}
+	if fs.getDecisionCalls[0].round != 2 {
+		t.Errorf("expected round=2, got %d", fs.getDecisionCalls[0].round)
+	}
+	if fs.getDecisionCalls[0].triggerNodeID != "reflect-1" {
+		t.Errorf("expected trigger=reflect-1, got %s", fs.getDecisionCalls[0].triggerNodeID)
+	}
+	// 复用路径不应再写决策
+	if len(fs.saveDecisionCalls) != 0 {
+		t.Errorf("SaveDecision should not be called on reuse, got %d", len(fs.saveDecisionCalls))
+	}
+}
+
+// TestResumer_ReplanRequested_FirstCall_PersistsDecision 验证首次处理 ReplanRequested 时，
+// Planner.Replan 生成新计划后必须 SaveDecision 持久化，以便后续重投能复用。
+func TestResumer_ReplanRequested_FirstCall_PersistsDecision(t *testing.T) {
+	newNode := model.PlanNode{ID: "run-1:r2:finish", Type: model.NodeLLM, Name: "finish", Input: "final answer"}
+	planner := &replanPlanner{plan: model.Plan{Nodes: []model.PlanNode{newNode}}}
+	fs := &fakeStore{
+		getRun:         &model.Run{ID: "run-1", TenantID: "tenant-A", Version: 1, Status: model.RunRunning},
+		depsReady:      true,
+		completedNodes: []model.Node{{ID: "reflect-1", Name: "reflect", Output: `{"action":"replan"}`, Status: model.NodeSuccess, PlanningRound: 1}},
+		decisionExists: false, // 首次调用，无已有决策
+	}
+	q := &fakeQueue{}
+	r := &Resumer{Store: fs, Queue: q, Planner: planner}
+	if err := r.Handle(context.Background(), replanEvent()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 首次必须调用 LLM
+	if !planner.called {
+		t.Fatal("expected Planner.Replan to be called on first replan")
+	}
+	// 必须持久化决策
+	if len(fs.saveDecisionCalls) != 1 {
+		t.Fatalf("expected 1 SaveDecision call, got %d", len(fs.saveDecisionCalls))
+	}
+	got := fs.saveDecisionCalls[0]
+	if got.round != 2 {
+		t.Errorf("expected round=2, got %d", got.round)
+	}
+	if got.triggerNodeID != "reflect-1" {
+		t.Errorf("expected trigger=reflect-1, got %s", got.triggerNodeID)
+	}
+	if len(got.plan.Nodes) != 1 || got.plan.Nodes[0].ID != "run-1:r2:finish" {
+		t.Errorf("expected saved plan with finish node, got %+v", got.plan)
+	}
+}
+
+// TestResumer_ReplanRequested_SaveDecisionError_Propagates 持久化决策失败应返回错误，
+// 触发事件重投；重投后因决策未保存会重新调用 LLM（恢复到首次调用路径）。
+func TestResumer_ReplanRequested_SaveDecisionError_Propagates(t *testing.T) {
+	want := errors.New("decision store write failed")
+	planner := &replanPlanner{plan: model.Plan{Nodes: []model.PlanNode{{ID: "run-1:r2:n", Type: model.NodeLLM}}}}
+	fs := &fakeStore{
+		getRun:         &model.Run{ID: "run-1", Status: model.RunRunning, Version: 1},
+		depsReady:      true,
+		completedNodes: []model.Node{{ID: "reflect-1", Status: model.NodeSuccess, PlanningRound: 1}},
+		saveDecisionErr: want,
+	}
+	r := &Resumer{Store: fs, Queue: &fakeQueue{}, Planner: planner}
+	err := r.Handle(context.Background(), replanEvent())
+	if err == nil || !errors.Is(err, want) {
+		t.Fatalf("expected wrapped save-decision error, got %v", err)
+	}
+	// 持久化失败时不应 InsertPlan（避免计划已入库但决策未保存的不一致）
+	if len(fs.insertPlanCalls) != 0 {
+		t.Errorf("InsertPlan should not be called when SaveDecision fails, got %d", len(fs.insertPlanCalls))
+	}
+}
+
 // TestResumer_ReplanRequested_TokenBudgetExceeded token 预算耗尽时不应续规。
 func TestResumer_ReplanRequested_TokenBudgetExceeded(t *testing.T) {
 	planner := &replanPlanner{}

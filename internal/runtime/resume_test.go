@@ -42,6 +42,14 @@ type fakeStore struct {
 	runTokenUsage     int
 	runTokenUsageErr  error
 
+	// DecisionStore 模拟（用于决策持久化与复用）
+	decisionExists bool
+	decisionPlan   model.Plan
+	getDecisionErr error
+	saveDecisionErr error
+	getDecisionCalls []decisionCall
+	saveDecisionCalls []decisionCall
+
 	// 调用记录（仅记录 tenant 参数，用于断言租户透传）
 	getRunCalls        []getRunCall
 	updateCASCalls     []casCall
@@ -69,6 +77,11 @@ type cancelRunCall struct {
 }
 type insertPlanCall struct{ plan model.Plan }
 type markReadyCall struct{ tenant, nodeID string }
+type decisionCall struct {
+	runID, tenant, triggerNodeID string
+	round                        int
+	plan                         model.Plan
+}
 
 func (f *fakeStore) CreateRun(context.Context, *model.Run) error { return nil }
 func (f *fakeStore) GetRun(_ context.Context, tenant, id string) (*model.Run, error) {
@@ -131,6 +144,17 @@ func (f *fakeStore) CountNodes(_ context.Context, _, _ string) (int, error) {
 }
 func (f *fakeStore) RunTokenUsage(_ context.Context, _, _ string) (int, error) {
 	return f.runTokenUsage, f.runTokenUsageErr
+}
+func (f *fakeStore) GetDecision(_ context.Context, runID, tenant, triggerNodeID string, round int) (model.Plan, bool, error) {
+	f.getDecisionCalls = append(f.getDecisionCalls, decisionCall{runID, tenant, triggerNodeID, round, f.decisionPlan})
+	if f.getDecisionErr != nil {
+		return model.Plan{}, false, f.getDecisionErr
+	}
+	return f.decisionPlan, f.decisionExists, nil
+}
+func (f *fakeStore) SaveDecision(_ context.Context, runID, tenant, triggerNodeID string, round int, plan model.Plan) error {
+	f.saveDecisionCalls = append(f.saveDecisionCalls, decisionCall{runID, tenant, triggerNodeID, round, plan})
+	return f.saveDecisionErr
 }
 
 // fakeQueue 记录入队任务，用于断言子节点被正确投递且携带租户。

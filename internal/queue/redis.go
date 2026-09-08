@@ -74,6 +74,30 @@ func (q *RedisQueue) Consume(ctx context.Context, consumer string, handler func(
 // Ping 检查 Redis 连通性。
 func (q *RedisQueue) Ping(ctx context.Context) error { return q.Client.Ping(ctx).Err() }
 
+// ReclaimPending 回收消费者组 PEL 中停滞超过 minIdle 的未确认消息：
+// 将其归属改为指定 consumer 后重新入队为新消息并确认旧消息，
+// 使正常 Consume 循环可重新消费。用于 worker 崩溃后未 Ack 消息的回收。
+// 重复投递由 worker 侧 ClaimNode CAS 拦截，不会产生重复副作用。
+func (q *RedisQueue) ReclaimPending(ctx context.Context, consumer string, minIdle time.Duration, count int64) (int, error) {
+	msgs, _, err := q.Client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Group: q.Group, Consumer: consumer, MinIdle: minIdle,
+		Stream: q.Stream, Start: "0-0", Count: count,
+	}).Result()
+	if err != nil && err != redis.Nil {
+		return 0, err
+	}
+	for _, msg := range msgs {
+		if raw, ok := msg.Values["task"].(string); ok {
+			var t model.Task
+			if json.Unmarshal([]byte(raw), &t) == nil {
+				_ = q.Enqueue(ctx, t)
+			}
+		}
+		_, _ = q.Client.XAck(ctx, q.Stream, q.Group, msg.ID).Result()
+	}
+	return len(msgs), nil
+}
+
 // String 返回队列的可读标识。
 func (q *RedisQueue) String() string {
 	return fmt.Sprintf("redis://%s/%s", q.Client.Options().Addr, q.Stream)

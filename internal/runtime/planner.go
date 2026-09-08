@@ -76,17 +76,19 @@ func (p *LLMPlanner) Plan(ctx context.Context, run *model.Run) (model.Plan, erro
 	}
 	plan := model.Plan{Nodes: make([]model.PlanNode, 0, len(pj.Nodes))}
 	for _, n := range pj.Nodes {
-		// 节点 ID 缺省时按 run + 序号兜底，避免空 ID 导致依赖解析失败。
+		// 节点 ID 缺省时按序号兜底，命名空间化由 namespacePlan 统一处理。
 		if n.ID == "" {
-			n.ID = fmt.Sprintf("%s:n%d", run.ID, len(plan.Nodes))
+			n.ID = fmt.Sprintf("n%d", len(plan.Nodes))
 		}
 		plan.Nodes = append(plan.Nodes, model.PlanNode{
 			ID: n.ID, ParentNodeID: n.ParentNodeID, Type: model.NodeType(n.Type),
 			Name: n.Name, Input: n.Input, DependsOn: n.DependsOn,
 		})
 	}
-	if len(plan.Nodes) == 0 {
-		return model.Plan{}, fmt.Errorf("llm planner: produced empty plan")
+	// 服务端命名空间化：所有 node_id 加 run 前缀，防止跨 Run 撞全局主键。
+	namespacePlan(&plan, run.ID)
+	if err := validatePlan(plan); err != nil {
+		return model.Plan{}, fmt.Errorf("llm planner: invalid plan: %w", err)
 	}
 	return plan, nil
 }
@@ -142,20 +144,20 @@ func (p *LLMPlanner) Replan(ctx context.Context, run *model.Run, completed []mod
 		return model.Plan{}, fmt.Errorf("llm replan: parse plan json: %w", err)
 	}
 	round := nextRound(completed)
-	prefix := fmt.Sprintf("%s:r%d:", run.ID, round)
 	plan := model.Plan{Nodes: make([]model.PlanNode, 0, len(pj.Nodes))}
 	for _, n := range pj.Nodes {
-		id := n.ID
-		if id == "" {
-			id = fmt.Sprintf("%sn%d", prefix, len(plan.Nodes))
+		if n.ID == "" {
+			n.ID = fmt.Sprintf("n%d", len(plan.Nodes))
 		}
 		plan.Nodes = append(plan.Nodes, model.PlanNode{
-			ID: id, ParentNodeID: n.ParentNodeID, Type: model.NodeType(n.Type),
+			ID: n.ID, ParentNodeID: n.ParentNodeID, Type: model.NodeType(n.Type),
 			Name: n.Name, Input: n.Input, DependsOn: n.DependsOn, PlanningRound: round,
 		})
 	}
-	if len(plan.Nodes) == 0 {
-		return model.Plan{}, fmt.Errorf("llm replan: produced empty plan")
+	// 服务端命名空间化：续规节点 ID 加 run + 轮次前缀，防止跨 Run/跨轮次撞全局主键。
+	namespacePlan(&plan, fmt.Sprintf("%s:r%d", run.ID, round))
+	if err := validatePlan(plan); err != nil {
+		return model.Plan{}, fmt.Errorf("llm replan: invalid plan: %w", err)
 	}
 	return plan, nil
 }
@@ -180,4 +182,94 @@ func extractJSON(s string) string {
 		return s
 	}
 	return s[start : end+1]
+}
+
+// namespacePlan 为 LLM 返回的节点 ID 添加 run 级命名空间前缀，防止跨 Run 撞全局主键。
+// 同时更新 DependsOn 和 ParentNodeID 中对同批次节点的引用。
+// 引用既有节点（来自前序轮次，已是命名空间化 ID）的边不会匹配映射，保持不变。
+func namespacePlan(plan *model.Plan, prefix string) {
+	idMap := make(map[string]string, len(plan.Nodes))
+	for i, n := range plan.Nodes {
+		ns := prefix + ":" + n.ID
+		idMap[n.ID] = ns
+		plan.Nodes[i].ID = ns
+	}
+	for i, n := range plan.Nodes {
+		for j, dep := range n.DependsOn {
+			if ns, ok := idMap[dep]; ok {
+				plan.Nodes[i].DependsOn[j] = ns
+			}
+		}
+		if n.ParentNodeID != "" {
+			if ns, ok := idMap[n.ParentNodeID]; ok {
+				plan.Nodes[i].ParentNodeID = ns
+			}
+		}
+	}
+}
+
+// validatePlan 校验 DAG 完整性：
+//   - 非空计划；
+//   - 无空 ID、无重复 ID；
+//   - 节点类型合法；
+//   - 所有 DependsOn 指向已知节点（无悬空引用）；
+//   - 无环（Kahn 拓扑排序）。
+func validatePlan(plan model.Plan) error {
+	if len(plan.Nodes) == 0 {
+		return fmt.Errorf("plan is empty")
+	}
+	ids := make(map[string]bool, len(plan.Nodes))
+	for _, n := range plan.Nodes {
+		if n.ID == "" {
+			return fmt.Errorf("plan contains empty node ID")
+		}
+		if ids[n.ID] {
+			return fmt.Errorf("duplicate node ID: %s", n.ID)
+		}
+		ids[n.ID] = true
+		switch n.Type {
+		case model.NodeLLM, model.NodeTool, model.NodeSubAgent, model.NodeReflect:
+		default:
+			return fmt.Errorf("node %s has invalid type %q", n.ID, n.Type)
+		}
+	}
+	// 悬空依赖检查。
+	for _, n := range plan.Nodes {
+		for _, dep := range n.DependsOn {
+			if !ids[dep] {
+				return fmt.Errorf("node %s depends on unknown node %s", n.ID, dep)
+			}
+		}
+	}
+	// 环检测：Kahn 拓扑排序，若拓扑序长度 < 节点数则有环。
+	inDeg := make(map[string]int, len(plan.Nodes))
+	adj := make(map[string][]string, len(plan.Nodes))
+	for _, n := range plan.Nodes {
+		inDeg[n.ID] += len(n.DependsOn)
+		for _, dep := range n.DependsOn {
+			adj[dep] = append(adj[dep], n.ID)
+		}
+	}
+	var queue []string
+	for id, d := range inDeg {
+		if d == 0 {
+			queue = append(queue, id)
+		}
+	}
+	visited := 0
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		visited++
+		for _, next := range adj[cur] {
+			inDeg[next]--
+			if inDeg[next] == 0 {
+				queue = append(queue, next)
+			}
+		}
+	}
+	if visited != len(plan.Nodes) {
+		return fmt.Errorf("plan contains a cycle")
+	}
+	return nil
 }

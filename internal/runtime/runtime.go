@@ -44,6 +44,12 @@ func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input string) (*
 	if err := r.Store.InsertPlan(ctx, run.ID, run.TenantID, plan); err != nil {
 		return nil, err
 	}
+	// 先将 Run 切换到 RUNNING，再入队根节点，避免 worker 抢先消费时看到 PENDING 而误取消。
+	// 根节点已 MarkReady，即使入队失败，ReadyTasks 扫描也会在恢复周期中补投递。
+	ok, _ := r.Store.UpdateRunCAS(ctx, run.TenantID, run.ID, run.Version, model.RunRunning, "", "")
+	if !ok {
+		return nil, fmt.Errorf("run version conflict")
+	}
 	// 仅入队无依赖的根节点，其余节点等待依赖完成后由 Resumer 推进。
 	for _, n := range plan.Nodes {
 		if len(n.DependsOn) == 0 {
@@ -54,10 +60,6 @@ func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input string) (*
 				return nil, err
 			}
 		}
-	}
-	ok, _ := r.Store.UpdateRunCAS(ctx, run.TenantID, run.ID, run.Version, model.RunRunning, "", "")
-	if !ok {
-		return nil, fmt.Errorf("run version conflict")
 	}
 	// 关键日志：Run 创建并切到 RUNNING，标志一次 Agent 运行的真正起点，串联调度入口与下游 worker。
 	log.Printf("run created run=%s tenant=%s agent=%s root_nodes=%d", run.ID, run.TenantID, run.AgentID, countRoots(plan.Nodes))

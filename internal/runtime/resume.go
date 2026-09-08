@@ -21,6 +21,14 @@ type Resumer struct {
 	Planner Planner
 }
 
+// DecisionStore 持久化 Planner 决策，使 ReplanRequested 事件重投时复用原决策，
+// 避免重复调用非确定性 LLM 生成不同计划。*store.MySQL 天然满足该接口。
+// 与 CancelStore 同理：以独立接口暴露，fakeStore 可按需实现。
+type DecisionStore interface {
+	SaveDecision(ctx context.Context, runID, tenant, triggerNodeID string, round int, plan model.Plan) error
+	GetDecision(ctx context.Context, runID, tenant, triggerNodeID string, round int) (model.Plan, bool, error)
+}
+
 // Handle 处理单个领域事件：
 //   - AgentStepFailed：先读取当前 Run 版本再 CAS 标记 FAILED（修复：此前传 version=0 永不命中）；
 //   - AgentStepCompleted：检查后继子节点的依赖是否全部就绪，就绪则标记 READY 并入队；
@@ -187,9 +195,12 @@ func (r *Resumer) handleReplan(ctx context.Context, e model.Event, run *model.Ru
 	if reason := r.checkReplanLimits(ctx, e, run, completed); reason != "" {
 		return r.convergeOnLimit(ctx, e, run, reason)
 	}
-	plan, err := r.Planner.Replan(ctx, run, completed)
+	// 决策复用：以 (run,trigger_node,round) 为唯一键。事件重投或插入计划后崩溃时，
+	// 命中已有决策即复用原 Plan，避免重复调用非确定性 LLM 生成不同计划。
+	round := nextRound(completed)
+	plan, err := r.loadOrReplan(ctx, e, run, completed, round)
 	if err != nil {
-		return fmt.Errorf("planner replan: %w", err)
+		return err
 	}
 	// 链接：新节点中 DependsOn 为空的根节点挂接到触发续规的 REFLECT 节点。
 	for i, n := range plan.Nodes {
@@ -219,8 +230,38 @@ func (r *Resumer) handleReplan(ctx context.Context, e model.Event, run *model.Ru
 			return fmt.Errorf("enqueue replan node %s: %w", n.ID, err)
 		}
 	}
-	log.Printf("run replanned run=%s tenant=%s trigger_node=%s new_nodes=%d", e.RunID, e.TenantID, e.NodeID, len(plan.Nodes))
+	log.Printf("run replanned run=%s tenant=%s trigger_node=%s round=%d new_nodes=%d", e.RunID, e.TenantID, e.NodeID, round, len(plan.Nodes))
 	return nil
+}
+
+// loadOrReplan 实现决策持久化与复用：
+//   - 首次处理 ReplanRequested：调用 Planner.Replan 生成新计划，并 SaveDecision 持久化；
+//   - 事件重投或插入计划后崩溃重放：GetDecision 命中即复用原计划，跳过 LLM 调用。
+//
+// 若 Store 未实现 DecisionStore（如部分 fakeStore），退化为每次调用 Planner.Replan，
+// 并打印告警提示生产环境应启用决策持久化以避免重复 LLM 调用。
+func (r *Resumer) loadOrReplan(ctx context.Context, e model.Event, run *model.Run, completed []model.Node, round int) (model.Plan, error) {
+	ds, ok := r.Store.(DecisionStore)
+	if !ok {
+		log.Printf("warn: store does not implement DecisionStore; replan decisions will not be persisted run=%s", e.RunID)
+		return r.Planner.Replan(ctx, run, completed)
+	}
+	// 复用检查：命中已有决策直接返回，保证幂等重放不会触发第二次 LLM 调用。
+	if plan, exists, err := ds.GetDecision(ctx, e.RunID, e.TenantID, e.NodeID, round); err != nil {
+		return model.Plan{}, fmt.Errorf("get decision: %w", err)
+	} else if exists {
+		log.Printf("replan decision reused run=%s tenant=%s trigger_node=%s round=%d", e.RunID, e.TenantID, e.NodeID, round)
+		return plan, nil
+	}
+	// 首次调用：生成新决策并持久化。保存失败即返回错误，事件重投后会重新进入本路径。
+	plan, err := r.Planner.Replan(ctx, run, completed)
+	if err != nil {
+		return model.Plan{}, fmt.Errorf("planner replan: %w", err)
+	}
+	if err := ds.SaveDecision(ctx, e.RunID, e.TenantID, e.NodeID, round, plan); err != nil {
+		return model.Plan{}, fmt.Errorf("save decision: %w", err)
+	}
+	return plan, nil
 }
 
 // checkReplanLimits 检查多轮 Plan 的三道防线：续规轮次、节点总数、token 预算。

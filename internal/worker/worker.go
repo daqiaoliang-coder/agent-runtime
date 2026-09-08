@@ -63,16 +63,22 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	if err != nil {
 		return err
 	}
-	// 取消/终态检查：若 Run 已不在 RUNNING（被取消、已成功/失败），不再认领节点。
-	// 这是用户取消的最终防线：CancelRun 已取消 PENDING/READY 节点，但 RecoverExpired
-	// 可能在此之后把崩溃的 RUNNING 节点重置回 PENDING 并补投递，此时 worker 须拒绝执行。
+	// 状态机检查：明确区分取消、终态与可恢复暂停状态。
+	//   - CANCEL_REQUESTED / 终态（SUCCESS/FAILED/CANCELLED）：取消尚未执行的节点，阻止其被认领。
+	//     这是用户取消的最终防线：CancelRun 已取消 PENDING/READY 节点，但 RecoverExpired
+	//     可能在此之后把崩溃的 RUNNING 节点重置回 PENDING 并补投递，此时 worker 须拒绝执行。
+	//   - WAITING_HUMAN：不执行也不取消，等待人工审批恢复为 RUNNING 后重新调度。
+	//   - PENDING：Run 尚未完成初始化调度，不执行不取消，由恢复扫描补投递。
 	run, err := w.Store.GetRun(ctx, t.TenantID, t.RunID)
 	if err != nil {
 		return err
 	}
 	if run.Status != model.RunRunning {
-		if n.Status == model.NodePending || n.Status == model.NodeReady {
-			_, _ = w.Store.CancelNode(ctx, t.TenantID, t.NodeID, n.Version)
+		switch run.Status {
+		case model.RunCancelRequested, model.RunSuccess, model.RunFailed, model.RunCancelled:
+			if n.Status == model.NodePending || n.Status == model.NodeReady {
+				_, _ = w.Store.CancelNode(ctx, t.TenantID, t.NodeID, n.Version)
+			}
 		}
 		log.Printf("worker=%s skip node run=%s node=%s run_status=%s", w.ID, t.RunID, t.NodeID, run.Status)
 		return nil
@@ -182,9 +188,9 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	}
 	e := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: eventType, RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Output: output, Timestamp: time.Now()}
 	payload, _ := json.Marshal(e)
-	// 累积检查点上下文（对话历史 + 节点输出），在节点完成前落盘，供崩溃恢复重建 Agent 上下文。
-	w.saveCheckpoint(ctx, n, output)
 	// 节点完成 + Outbox 事件在同一事务内提交，保证状态与事件一致。
+	// 上下文不再通过 checkpoint 累积（存在读改写竞态），改由 ContextLoader 从已提交的
+	// SUCCESS 节点派生，保证并行节点不会相互覆盖对话历史。
 	_, err = w.Store.CompleteNodeWithOutbox(ctx, n, output, model.OutboxMessage{ID: e.ID, EventType: e.Type, AggregateID: n.RunID, Payload: string(payload)})
 	if err != nil {
 		return err
@@ -202,24 +208,6 @@ func (w *Worker) emitRuntimeEvent(ctx context.Context, ev contracts.RuntimeEvent
 	if w.RuntimeEvents != nil {
 		_ = w.RuntimeEvents.Emit(ctx, ev)
 	}
-}
-
-// saveCheckpoint 累积更新 Run 检查点：追加本节点的输入/输出到对话历史与 NodeOutputs。
-// 最佳努力落盘（忽略错误）：节点状态由 CompleteNodeWithOutbox 事务保证，检查点为上下文缓存。
-func (w *Worker) saveCheckpoint(ctx context.Context, n *model.Node, output string) {
-	_, _, stateJSON, err := w.Store.LoadCheckpoint(ctx, n.RunID)
-	var rc model.RunContext
-	if err == nil && len(stateJSON) > 0 {
-		_ = json.Unmarshal(stateJSON, &rc)
-	}
-	if rc.NodeOutputs == nil {
-		rc.NodeOutputs = map[string]string{}
-	}
-	rc.NodeOutputs[n.Name] = output
-	rc.Messages = append(rc.Messages,
-		model.ChatTurn{Role: string(llm.RoleUser), Content: n.Input},
-		model.ChatTurn{Role: string(llm.RoleAssistant), Content: output})
-	_ = w.Store.SaveCheckpoint(ctx, n.RunID, n.Version, n.ID, rc)
 }
 
 // NewFromEnv 从环境变量 WORKER_ID 读取标识，缺省时按时间戳生成。
@@ -243,22 +231,23 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	// Retry=指数退避策略，失败可重试节点置回 READY 并按 ready_at 补投递，耗尽入 DLQ。
 	// UsageRecorder=s 使 LLM 节点的 token 用量与成本落 llm_usage 表，支撑成本分析。
 	disp := &executor.Dispatcher{LLM: client, Tools: tools, ModelProvider: llmadapter.New(client), ToolProvider: tooladapter.New(tools), ToolStore: s, UsageRecorder: s, Pricer: DefaultPricer}
-	// ContextLoader 从 checkpoint 重建对话历史，使崩溃恢复后的 LLM 节点保持上下文连续。
-	disp.ContextLoader = func(ctx context.Context, runID string) ([]llm.Message, error) {
-		_, _, stateJSON, err := s.LoadCheckpoint(ctx, runID)
+	// ContextLoader 从已提交的 SUCCESS 节点派生对话历史（按完成时间排序），
+	// 避免对 checkpoint 做读改写导致的并行节点竞态。上下文以已提交状态为事实，
+	// 无需额外的累积写入——崩溃恢复后也能从持久化的节点输出重建完整上下文。
+	disp.ContextLoader = func(ctx context.Context, tenant, runID string) ([]llm.Message, error) {
+		nodes, err := s.CompletedNodes(ctx, tenant, runID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return nil, nil // 无历史检查点（根节点首次执行），非错误
+				return nil, nil
 			}
 			return nil, err
 		}
-		var rc model.RunContext
-		if err := json.Unmarshal(stateJSON, &rc); err != nil {
-			return nil, err
-		}
-		msgs := make([]llm.Message, 0, len(rc.Messages))
-		for _, m := range rc.Messages {
-			msgs = append(msgs, llm.Message{Role: llm.Role(m.Role), Content: m.Content})
+		msgs := make([]llm.Message, 0, len(nodes)*2)
+		for _, n := range nodes {
+			msgs = append(msgs,
+				llm.Message{Role: llm.RoleUser, Content: n.Input},
+				llm.Message{Role: llm.RoleAssistant, Content: n.Output},
+			)
 		}
 		return msgs, nil
 	}

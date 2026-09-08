@@ -35,7 +35,7 @@ func (s *MySQL) Close() { _ = s.DB.Close() }
 
 // CreateRun 插入一条 Run 记录，初始状态为 PENDING。租户由 r.TenantID 携带。
 func (s *MySQL) CreateRun(ctx context.Context, r *model.Run) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO agent_run(run_id,tenant_id,agent_id,status,version,input,max_steps,max_rounds,max_tokens) VALUES(?,?,?,?,?,?,?,?,?,?)`, r.ID, r.TenantID, r.AgentID, r.Status, r.Version, r.Input, r.MaxSteps, r.MaxRounds, r.MaxTokens)
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO agent_run(run_id,tenant_id,agent_id,status,version,input,max_steps,max_rounds,max_tokens) VALUES(?,?,?,?,?,?,?,?,?)`, r.ID, r.TenantID, r.AgentID, r.Status, r.Version, r.Input, r.MaxSteps, r.MaxRounds, r.MaxTokens)
 	return err
 }
 
@@ -162,9 +162,13 @@ func (s *MySQL) RenewLease(ctx context.Context, tenant, id, owner string, versio
 	return n == 1, nil
 }
 
-// RecoverExpired 扫描 RUNNING 但租约已过期的节点，在事务内将其重置为 PENDING，
+// RecoverExpired 扫描 RUNNING 但租约已过期的节点，在事务内将其重置为 READY，
 // 配合 SELECT ... FOR UPDATE SKIP LOCKED 实现多实例安全的抢占式恢复。
 // 这是系统级扫描（不限定租户），返回的任务携带 tenant_id 以便恢复投递。
+//
+// 崩溃安全：直接置为 READY（而非 PENDING）并清除 ready_at，使 ReadyTasks 扫描
+// 能在下一周期补投递——即使恢复进程在事务提交后、入队前崩溃，节点也不会卡在
+// PENDING 状态无人处理。恢复流程自身因此可恢复。
 func (s *MySQL) RecoverExpired(ctx context.Context, limit int) ([]model.Task, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -188,7 +192,7 @@ func (s *MySQL) RecoverExpired(ctx context.Context, limit int) ([]model.Task, er
 		return nil, err
 	}
 	for _, t := range tasks {
-		if _, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,lease_owner=NULL,lease_until=NULL,version=version+1 WHERE node_id=? AND tenant_id=?`, model.NodePending, t.NodeID, t.TenantID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,lease_owner=NULL,lease_until=NULL,ready_at=NULL,version=version+1 WHERE node_id=? AND tenant_id=?`, model.NodeReady, t.NodeID, t.TenantID); err != nil {
 			return nil, err
 		}
 	}
@@ -479,6 +483,13 @@ func (s *MySQL) FailToolCall(ctx context.Context, tenant, callID string) error {
 	return err
 }
 
+// MarkToolCallUnknown 标记调用为歧义失败（UNKNOWN），仅当当前为 RUNNING 时生效。
+// 用于超时/网络中断等远端可能已执行但响应丢失的场景，阻止盲目重试产生重复副作用。
+func (s *MySQL) MarkToolCallUnknown(ctx context.Context, tenant, callID string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE tool_call SET status='UNKNOWN' WHERE call_id=? AND tenant_id=? AND status='RUNNING'`, callID, tenant)
+	return err
+}
+
 // InboxSeen 查询事件是否已被该租户消费过（消费端幂等 Inbox 的查表步骤）。
 // 采用"处理前查表、处理后写表"的标记后模式：崩溃在处理中途不会误标完成，重投递可幂等重放。
 func (s *MySQL) InboxSeen(ctx context.Context, tenant, eventID string) (bool, error) {
@@ -506,6 +517,40 @@ func (s *MySQL) RecordLLMUsage(ctx context.Context, u model.LLMUsage) error {
 		`INSERT INTO llm_usage(usage_id,run_id,node_id,tenant_id,model,prompt_tokens,completion_tokens,total_tokens,cost) VALUES(?,?,?,?,?,?,?,?,?,?)`,
 		u.ID, u.RunID, u.NodeID, u.TenantID, u.Model, u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.Cost)
 	return err
+}
+
+// SaveDecision 持久化 Planner 决策（Plan JSON），以 (run,trigger_node,round) 为唯一键。
+// 事件重投时 GetDecision 命中已有记录即可复用原决策，避免重复调用非确定性 LLM。
+// ON DUPLICATE KEY UPDATE 保证幂等：同一决策重复保存不影响结果。
+func (s *MySQL) SaveDecision(ctx context.Context, runID, tenant, triggerNodeID string, round int, plan model.Plan) error {
+	b, err := json.Marshal(plan)
+	if err != nil {
+		return fmt.Errorf("marshal plan: %w", err)
+	}
+	decisionID := fmt.Sprintf("%s:%s:%d", runID, triggerNodeID, round)
+	_, err = s.DB.ExecContext(ctx,
+		`INSERT INTO planner_decision(decision_id,run_id,tenant_id,trigger_node_id,planning_round,plan_json) VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE plan_json=VALUES(plan_json)`,
+		decisionID, runID, tenant, triggerNodeID, round, b)
+	return err
+}
+
+// GetDecision 按 (run,trigger_node,round) 读取已持久化的 Planner 决策。
+// 返回 (plan, true, nil) 表示命中；(_, false, nil) 表示无记录（首次调用）。
+func (s *MySQL) GetDecision(ctx context.Context, runID, tenant, triggerNodeID string, round int) (model.Plan, bool, error) {
+	decisionID := fmt.Sprintf("%s:%s:%d", runID, triggerNodeID, round)
+	var planJSON []byte
+	err := s.DB.QueryRowContext(ctx, `SELECT plan_json FROM planner_decision WHERE decision_id=? AND tenant_id=?`, decisionID, tenant).Scan(&planJSON)
+	if err == sql.ErrNoRows {
+		return model.Plan{}, false, nil
+	}
+	if err != nil {
+		return model.Plan{}, false, err
+	}
+	var plan model.Plan
+	if err := json.Unmarshal(planJSON, &plan); err != nil {
+		return model.Plan{}, false, fmt.Errorf("unmarshal plan: %w", err)
+	}
+	return plan, true, nil
 }
 
 var ErrNotFound = errors.New("not found")
@@ -606,7 +651,7 @@ func (s *MySQL) CancelRequestedRuns(ctx context.Context, limit int) ([]model.Run
 
 // CancelRunNodes 将指定 Run 下所有 PENDING/READY 节点置为 CANCELLED。
 // 用于 recovery 的取消扫描：覆盖 CancelRun 之后因租约过期被 RecoverExpired
-// 重置回 PENDING 的节点（worker 的 Run 状态检查是最终防线，防止此类节点被执行）。
+// 重置回 READY 的节点（worker 的 Run 状态检查是最终防线，防止此类节点被执行）。
 func (s *MySQL) CancelRunNodes(ctx context.Context, tenant, runID string) (int64, error) {
 	res, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,finished_at=NOW(6) WHERE run_id=? AND tenant_id=? AND status IN (?,?)`, model.NodeCancelled, runID, tenant, model.NodePending, model.NodeReady)
 	if err != nil {

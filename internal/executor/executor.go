@@ -15,8 +15,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 	"time"
 
@@ -38,6 +40,24 @@ type ToolCallStore interface {
 	ReclaimToolCall(ctx context.Context, tenant, callID string) (bool, error)
 	CompleteToolCall(ctx context.Context, tenant, callID, output string) error
 	FailToolCall(ctx context.Context, tenant, callID string) error
+	MarkToolCallUnknown(ctx context.Context, tenant, callID string) error
+}
+
+// isAmbiguousFailure 判断错误是否为"远端可能已执行但响应丢失"的歧义失败
+// （超时/取消/网络中断）。这类失败副作用状态未知，不应盲目标记 FAILED 后重试，
+// 需标记为 UNKNOWN 以阻止重复副作用，等待人工确认或下游幂等查询解决。
+func isAmbiguousFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return false
 }
 
 // UsageRecorder 持久化 LLM token 消耗与成本（*store.MySQL 天然实现）。
@@ -60,7 +80,7 @@ type Dispatcher struct {
 	Tools         *tool.Registry
 	ToolStore     ToolCallStore                                                  // 工具调用幂等存储；为 nil 时工具退化为直接执行（测试/无 DB 场景）
 	SubAgent      Executor                                                       // 子 Agent 执行器（递归运行子 Run），当前为占位实现
-	ContextLoader func(ctx context.Context, runID string) ([]llm.Message, error) // 从 checkpoint 重建对话历史
+	ContextLoader func(ctx context.Context, tenant, runID string) ([]llm.Message, error) // 从已提交节点重建对话历史
 	UsageRecorder UsageRecorder                                                  // LLM token/cost 持久化；为 nil 时不落库
 	Pricer        Pricer                                                         // 成本估算函数；为 nil 时 cost 记 0
 }
@@ -118,7 +138,7 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 	// 从 checkpoint 重建对话历史：历史在前，当前 user prompt 在后，保证 Agent 上下文连续。
 	msgs := []llm.Message{{Role: llm.RoleUser, Content: n.Input}}
 	if d.ContextLoader != nil {
-		hist, err := d.ContextLoader(ctx, n.RunID)
+		hist, err := d.ContextLoader(ctx, n.TenantID, n.RunID)
 		if err != nil {
 			return "", fmt.Errorf("load context: %w", err)
 		}
@@ -206,7 +226,7 @@ func (d *Dispatcher) executeReflect(ctx context.Context, n *model.Node) (string,
 		{Role: llm.RoleUser, Content: n.Input},
 	}
 	if d.ContextLoader != nil {
-		hist, err := d.ContextLoader(ctx, n.RunID)
+		hist, err := d.ContextLoader(ctx, n.TenantID, n.RunID)
 		if err != nil {
 			return "", fmt.Errorf("load context for reflect: %w", err)
 		}
@@ -304,10 +324,11 @@ func (d *Dispatcher) executeTool(ctx context.Context, n *model.Node) (string, er
 }
 
 // executeToolIdempotent 实现工具调用的幂等：经 tool_call 表落库，
-//   - 新建调用：执行工具，成功落 SUCCESS、失败落 FAILED；
+//   - 新建调用：执行工具，成功落 SUCCESS、确定失败落 FAILED、歧义失败落 UNKNOWN；
 //   - 命中 SUCCESS：复用已持久化输出，不重复执行副作用；
 //   - 命中 FAILED：回收为 RUNNING 重试一次（失败通常发生在副作用之前）；
-//   - 命中 RUNNING（崩溃在途）：副作用状态未知，拒绝盲目重执行（非幂等工具安全优先）。
+//   - 命中 RUNNING（崩溃在途）：副作用状态未知，拒绝盲目重执行（非幂等工具安全优先）；
+//   - 命中 UNKNOWN（超时/网络中断）：远端可能已执行，拒绝盲目重执行。
 func (d *Dispatcher) executeToolProviderIdempotent(ctx context.Context, n *model.Node) (string, error) {
 	callID := idempotencyKey(n.RunID, n.ID, n.Name, n.Input)
 	isNew, err := d.ToolStore.ClaimToolCall(ctx, n.TenantID, callID, n.RunID, n.ID, n.Name, callID, n.Input, n.Attempt)
@@ -333,10 +354,11 @@ func (d *Dispatcher) executeToolProviderIdempotent(ctx context.Context, n *model
 			return "", fmt.Errorf("tool call %s not reclaimable", callID)
 		}
 		return d.runAndPersistToolProvider(ctx, n, callID)
-	case "RUNNING":
-		// 关键日志：停滞的 RUNNING 工具调用拒绝重执行，副作用状态未知，是运维侧定位"卡死"工具调用的关键信号。
-		log.Printf("tool call refused re-execution call_id=%s run=%s node=%s tenant=%s (stale RUNNING)", callID, n.RunID, n.ID, n.TenantID)
-		return "", fmt.Errorf("tool call %s stale RUNNING; refusing re-execution (non-idempotent safety)", callID)
+	case "RUNNING", "UNKNOWN":
+		// 关键日志：停滞的 RUNNING 或歧义 UNKNOWN 工具调用拒绝重执行，副作用状态未知，
+		// 是运维侧定位"卡死"/"歧义"工具调用的关键信号。
+		log.Printf("tool call refused re-execution call_id=%s run=%s node=%s tenant=%s (stale %s)", callID, n.RunID, n.ID, n.TenantID, rec.Status)
+		return "", fmt.Errorf("tool call %s stale %s; refusing re-execution (non-idempotent safety)", callID, rec.Status)
 	default:
 		return "", fmt.Errorf("tool call %s unknown status %q", callID, rec.Status)
 	}
@@ -344,11 +366,19 @@ func (d *Dispatcher) executeToolProviderIdempotent(ctx context.Context, n *model
 
 func (d *Dispatcher) runAndPersistToolProvider(ctx context.Context, n *model.Node, callID string) (string, error) {
 	result, err := d.ToolProvider.CallTool(ctx, contracts.ToolCallRequest{CallID: callID, Name: n.Name, Arguments: n.Input})
-	if err != nil || result.IsError {
-		_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
-		if err != nil {
-			return "", fmt.Errorf("tool %q: %w", n.Name, err)
+	if err != nil {
+		// 区分歧义失败与确定失败：超时/取消/网络中断时远端可能已执行副作用，
+		// 标记 UNKNOWN 阻止盲目重试；其他错误标记 FAILED 允许安全重试。
+		if isAmbiguousFailure(err) {
+			_ = d.ToolStore.MarkToolCallUnknown(ctx, n.TenantID, callID)
+		} else {
+			_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
 		}
+		return "", fmt.Errorf("tool %q: %w", n.Name, err)
+	}
+	if result.IsError {
+		// 工具返回了确定性错误结果（副作用未发生或工具自报错误），标记 FAILED 允许重试。
+		_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
 		return "", fmt.Errorf("tool %q returned error", n.Name)
 	}
 	if err := d.ToolStore.CompleteToolCall(ctx, n.TenantID, callID, result.Output); err != nil {
@@ -384,19 +414,25 @@ func (d *Dispatcher) executeToolIdempotent(ctx context.Context, n *model.Node, t
 			return "", fmt.Errorf("tool call %s not reclaimable", callID)
 		}
 		return d.runAndPersistTool(ctx, n, t, callID)
-	case "RUNNING":
-		// 停滞的进行中调用：副作用状态未知，为非幂等工具安全拒绝盲目重执行。
-		return "", fmt.Errorf("tool call %s stale RUNNING; refusing re-execution (non-idempotent safety)", callID)
+	case "RUNNING", "UNKNOWN":
+		// 停滞 RUNNING 或歧义 UNKNOWN：副作用状态未知，为非幂等工具安全拒绝盲目重执行。
+		log.Printf("tool call refused re-execution call_id=%s run=%s node=%s tenant=%s (stale %s)", callID, n.RunID, n.ID, n.TenantID, rec.Status)
+		return "", fmt.Errorf("tool call %s stale %s; refusing re-execution (non-idempotent safety)", callID, rec.Status)
 	default:
 		return "", fmt.Errorf("tool call %s unknown status %q", callID, rec.Status)
 	}
 }
 
 // runAndPersistTool 执行工具并按结果更新 tool_call 状态。
+// 歧义失败（超时/取消）标记为 UNKNOWN 以阻止盲目重试；确定失败标记为 FAILED 允许重试。
 func (d *Dispatcher) runAndPersistTool(ctx context.Context, n *model.Node, t tool.Tool, callID string) (string, error) {
 	out, err := t.Execute(ctx, n.Input)
 	if err != nil {
-		_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
+		if isAmbiguousFailure(err) {
+			_ = d.ToolStore.MarkToolCallUnknown(ctx, n.TenantID, callID)
+		} else {
+			_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
+		}
 		return "", fmt.Errorf("tool %q: %w", n.Name, err)
 	}
 	if err := d.ToolStore.CompleteToolCall(ctx, n.TenantID, callID, out); err != nil {
@@ -439,7 +475,7 @@ func (d *Dispatcher) StreamLLM(ctx context.Context, n *model.Node) (<-chan contr
 	if d.ModelProvider != nil {
 		msgs := []contracts.Message{{Role: contracts.RoleUser, Content: n.Input}}
 		if d.ContextLoader != nil {
-			hist, err := d.ContextLoader(ctx, n.RunID)
+			hist, err := d.ContextLoader(ctx, n.TenantID, n.RunID)
 			if err != nil {
 				return nil, fmt.Errorf("load context: %w", err)
 			}

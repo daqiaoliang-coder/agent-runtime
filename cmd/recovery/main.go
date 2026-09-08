@@ -1,7 +1,8 @@
-// cmd/recovery 是崩溃恢复入口：定时扫描租约过期节点重置为 PENDING，
-// 同时补投递 READY 节点，关闭“提交 READY 后崩溃未入队”的投递缺口。
+// cmd/recovery 是崩溃恢复入口：定时扫描租约过期节点重置为 READY，
+// 同时补投递 READY 节点，关闭"提交 READY 后崩溃未入队"的投递缺口。
 // 此外执行取消扫描：取消 CANCEL_REQUESTED Run 下遗留的 PENDING/READY 节点，
 // 并在全部节点终态时收敛 Run 到 CANCELLED，作为 Resumer 崩溃的安全网。
+// 同时回收 Redis Streams PEL 中停滞的未确认消息，覆盖 worker 崩溃后消息无人处理的缺口。
 package main
 
 import (
@@ -41,7 +42,7 @@ func main() {
 			return
 		case <-ticker.C:
 			// 取消扫描：处理 CANCEL_REQUESTED 的 Run。
-			// 1. 取消遗留的 PENDING/READY 节点（覆盖 RecoverExpired 重置回 PENDING 的竞态）；
+			// 1. 取消遗留的 PENDING/READY 节点（覆盖 RecoverExpired 重置回 READY 的竞态）；
 			// 2. 若全部节点终态，CAS 收敛到 CANCELLED（Resumer 崩溃时的安全网）。
 			runs, err := s.CancelRequestedRuns(ctx, 100)
 			if err != nil {
@@ -83,6 +84,13 @@ func main() {
 				if err := q.Enqueue(ctx, t); err != nil {
 					log.Println("enqueue recovered task:", err)
 				}
+			}
+			// 回收 Redis Streams PEL 中停滞的未确认消息（worker 崩溃后未 Ack），
+			// 重新入队使其可被正常消费。重复投递由 ClaimNode CAS 拦截。
+			if n, err := q.ReclaimPending(ctx, "recovery", 30*time.Second, 100); err != nil {
+				log.Println("reclaim pending:", err)
+			} else if n > 0 {
+				log.Printf("reclaimed %d stale PEL messages", n)
 			}
 		}
 	}
