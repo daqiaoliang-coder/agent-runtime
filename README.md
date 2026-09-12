@@ -713,6 +713,35 @@ Human Resume
 
 ***
 
+## Policy Gateway
+
+Tool execution is guarded by an extensible Policy Gateway:
+
+```text
+Tool Call
+   |
+   v
+Policy Chain
+   |
+   +--> ALLOW ------------> Claim -> Execute
+   |
+   +--> REQUIRE_APPROVAL -> WAITING_HUMAN
+   |                         |
+   |                         v
+   |                      Approve
+   |                         |
+   |                         v
+   |                      Resume -> READY -> Execute
+   |
+   +--> DENY -------------> Fail
+```
+
+The policy layer is deliberately separated from executors and persistence. Policies can be composed with `DENY > REQUIRE_APPROVAL > ALLOW` precedence.
+
+See [docs/policy-gateway.md](docs/policy-gateway.md) for the decision model, extension points and limitations.
+
+***
+
 ## 15. 动态 DAG
 
 Runtime 支持通过 Planner 生成动态执行计划。

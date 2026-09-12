@@ -64,5 +64,19 @@ func (r *Runtime) Resume(ctx context.Context, tenant, runID, decision string) er
 	}
 	// 关键日志：Run 从 WAITING_HUMAN 恢复执行，标志人工决策回流到自动流程。
 	log.Printf("run resumed run=%s tenant=%s decision=%q", runID, tenant, decision)
+
+	// The policy gate interrupts before ClaimNode, so the node is still READY.
+	// Requeue the interrupted node after the durable Run transition. This makes
+	// approval a real pause/resume boundary rather than an in-process wait.
+	if run.CurrentNodeID != "" {
+		if err := r.Store.MarkReady(ctx, tenant, run.CurrentNodeID); err != nil {
+			return fmt.Errorf("mark interrupted node ready: %w", err)
+		}
+		if err := r.Queue.Enqueue(ctx, model.Task{
+			RunID: runID, NodeID: run.CurrentNodeID, TenantID: tenant,
+		}); err != nil {
+			return fmt.Errorf("enqueue interrupted node: %w", err)
+		}
+	}
 	return nil
 }
