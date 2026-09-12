@@ -8,12 +8,13 @@ import "time"
 type RunStatus string
 
 const (
-	RunPending      RunStatus = "PENDING"       // 已创建，尚未开始调度
-	RunRunning      RunStatus = "RUNNING"       // 运行中
-	RunWaitingHuman RunStatus = "WAITING_HUMAN" // 等待人工确认
-	RunSuccess      RunStatus = "SUCCESS"       // 全部节点成功完成
-	RunFailed       RunStatus = "FAILED"        // 存在失败节点或运行出错
-	RunCancelled    RunStatus = "CANCELLED"     // 被取消
+	RunPending         RunStatus = "PENDING"          // 已创建，尚未开始调度
+	RunRunning         RunStatus = "RUNNING"          // 运行中
+	RunWaitingHuman    RunStatus = "WAITING_HUMAN"    // 等待人工确认
+	RunCancelRequested RunStatus = "CANCEL_REQUESTED" // 用户已请求取消，等待节点收敛
+	RunSuccess         RunStatus = "SUCCESS"          // 全部节点成功完成
+	RunFailed          RunStatus = "FAILED"           // 存在失败节点或运行出错
+	RunCancelled       RunStatus = "CANCELLED"        // 已收敛到取消终态
 )
 
 // NodeStatus 表示 DAG 中单个节点（步骤）的状态。
@@ -27,6 +28,7 @@ const (
 	NodeWaitingHuman NodeStatus = "WAITING_HUMAN" // 等待人工确认
 	NodeSuccess      NodeStatus = "SUCCESS"       // 执行成功
 	NodeFailed       NodeStatus = "FAILED"        // 执行失败
+	NodeCancelled    NodeStatus = "CANCELLED"     // 因 Run 被取消而终止
 )
 
 // NodeType 表示节点的执行类型，决定 worker 如何处理该节点。
@@ -36,16 +38,21 @@ const (
 	NodeLLM      NodeType = "LLM"       // LLM 推理节点
 	NodeTool     NodeType = "TOOL"      // 工具调用节点
 	NodeSubAgent NodeType = "SUB_AGENT" // 子 Agent 节点
+	NodeReflect  NodeType = "REFLECT"   // 反思节点：评估进度，决定续规或收尾
 )
 
 // Run 是一次完整的 Agent 运行记录，对应 agent_run 表。
 // Version 用于乐观锁（CAS），避免并发更新覆盖。
+// MaxSteps 限制 DAG 节点总数（含多轮 Plan 追加的节点），防止 Planner 死循环。
+// MaxRounds 限制多轮 Plan 的续规轮次上限，0 表示不限制。
+// MaxTokens 限制 Run 累计 LLM token 消耗上限，0 表示不限制。
 type Run struct {
 	ID, TenantID, AgentID        string
 	Status                       RunStatus
 	Version                      int64
 	Input, Output, CurrentNodeID string
 	MaxSteps, Steps              int
+	MaxRounds, MaxTokens         int
 	CreatedAt, UpdatedAt         time.Time
 }
 
@@ -61,16 +68,19 @@ type Node struct {
 	Version                           int64
 	LeaseOwner                        string
 	LeaseUntil                        *time.Time
+	PlanningRound                     int
 	CreatedAt, StartedAt, FinishedAt  time.Time
 }
 
 // PlanNode 是规划阶段产出的节点描述，尚未落库。
 // DependsOn 列出依赖节点 ID，构成 DAG 边。
+// PlanningRound 标识该节点属于第几轮规划（0 视为 1），用于多轮 Plan 的可观测性。
 type PlanNode struct {
 	ID, ParentNodeID string
 	Type             NodeType
 	Name, Input      string
 	DependsOn        []string
+	PlanningRound    int
 }
 
 // Plan 是一次规划的结果，包含全部待执行节点。

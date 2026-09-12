@@ -35,14 +35,14 @@ func (s *MySQL) Close() { _ = s.DB.Close() }
 
 // CreateRun 插入一条 Run 记录，初始状态为 PENDING。租户由 r.TenantID 携带。
 func (s *MySQL) CreateRun(ctx context.Context, r *model.Run) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO agent_run(run_id,tenant_id,agent_id,status,version,input,max_steps) VALUES(?,?,?,?,?,?,?)`, r.ID, r.TenantID, r.AgentID, r.Status, r.Version, r.Input, r.MaxSteps)
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO agent_run(run_id,tenant_id,agent_id,status,version,input,max_steps,max_rounds,max_tokens) VALUES(?,?,?,?,?,?,?,?,?)`, r.ID, r.TenantID, r.AgentID, r.Status, r.Version, r.Input, r.MaxSteps, r.MaxRounds, r.MaxTokens)
 	return err
 }
 
 // GetRun 按 tenant + run_id 读取 Run，租户不匹配则返回 sql.ErrNoRows。
 func (s *MySQL) GetRun(ctx context.Context, tenant, id string) (*model.Run, error) {
 	r := &model.Run{}
-	err := s.DB.QueryRowContext(ctx, `SELECT run_id,tenant_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,created_at,updated_at FROM agent_run WHERE run_id=? AND tenant_id=?`, id, tenant).Scan(&r.ID, &r.TenantID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.CreatedAt, &r.UpdatedAt)
+	err := s.DB.QueryRowContext(ctx, `SELECT run_id,tenant_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,max_rounds,max_tokens,created_at,updated_at FROM agent_run WHERE run_id=? AND tenant_id=?`, id, tenant).Scan(&r.ID, &r.TenantID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.MaxRounds, &r.MaxTokens, &r.CreatedAt, &r.UpdatedAt)
 	return r, err
 }
 
@@ -76,7 +76,7 @@ func (s *MySQL) InsertPlan(ctx context.Context, runID, tenant string, p model.Pl
 	}
 	defer tx.Rollback()
 	for _, n := range p.Nodes {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO agent_node(node_id,run_id,tenant_id,parent_node_id,type,name,input,status) VALUES(?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE node_id=node_id`, n.ID, runID, tenant, n.ParentNodeID, n.Type, n.Name, n.Input, model.NodePending); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO agent_node(node_id,run_id,tenant_id,parent_node_id,type,name,input,status,planning_round) VALUES(?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE node_id=node_id`, n.ID, runID, tenant, n.ParentNodeID, n.Type, n.Name, n.Input, model.NodePending, planningRoundOrDefault(n.PlanningRound)); err != nil {
 			return err
 		}
 	}
@@ -90,11 +90,19 @@ func (s *MySQL) InsertPlan(ctx context.Context, runID, tenant string, p model.Pl
 	return tx.Commit()
 }
 
+// planningRoundOrDefault 将 0 规范化为 1（默认第一轮）。
+func planningRoundOrDefault(r int) int {
+	if r <= 0 {
+		return 1
+	}
+	return r
+}
+
 // GetNode 按 tenant + node_id 读取节点，租户不匹配返回 sql.ErrNoRows。
 func (s *MySQL) GetNode(ctx context.Context, tenant, id string) (*model.Node, error) {
 	n := &model.Node{}
 	var lease, started, finished sql.NullTime
-	err := s.DB.QueryRowContext(ctx, `SELECT node_id,run_id,tenant_id,COALESCE(parent_node_id,''),type,name,COALESCE(input,''),COALESCE(output,''),status,attempt,version,COALESCE(lease_owner,''),lease_until,created_at,started_at,finished_at FROM agent_node WHERE node_id=? AND tenant_id=?`, id, tenant).Scan(&n.ID, &n.RunID, &n.TenantID, &n.ParentNodeID, &n.Type, &n.Name, &n.Input, &n.Output, &n.Status, &n.Attempt, &n.Version, &n.LeaseOwner, &lease, &n.CreatedAt, &started, &finished)
+	err := s.DB.QueryRowContext(ctx, `SELECT node_id,run_id,tenant_id,COALESCE(parent_node_id,''),type,name,COALESCE(input,''),COALESCE(output,''),status,attempt,version,COALESCE(lease_owner,''),lease_until,planning_round,created_at,started_at,finished_at FROM agent_node WHERE node_id=? AND tenant_id=?`, id, tenant).Scan(&n.ID, &n.RunID, &n.TenantID, &n.ParentNodeID, &n.Type, &n.Name, &n.Input, &n.Output, &n.Status, &n.Attempt, &n.Version, &n.LeaseOwner, &lease, &n.PlanningRound, &n.CreatedAt, &started, &finished)
 	if err != nil {
 		return nil, err
 	}
@@ -154,9 +162,13 @@ func (s *MySQL) RenewLease(ctx context.Context, tenant, id, owner string, versio
 	return n == 1, nil
 }
 
-// RecoverExpired 扫描 RUNNING 但租约已过期的节点，在事务内将其重置为 PENDING，
+// RecoverExpired 扫描 RUNNING 但租约已过期的节点，在事务内将其重置为 READY，
 // 配合 SELECT ... FOR UPDATE SKIP LOCKED 实现多实例安全的抢占式恢复。
 // 这是系统级扫描（不限定租户），返回的任务携带 tenant_id 以便恢复投递。
+//
+// 崩溃安全：直接置为 READY（而非 PENDING）并清除 ready_at，使 ReadyTasks 扫描
+// 能在下一周期补投递——即使恢复进程在事务提交后、入队前崩溃，节点也不会卡在
+// PENDING 状态无人处理。恢复流程自身因此可恢复。
 func (s *MySQL) RecoverExpired(ctx context.Context, limit int) ([]model.Task, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -180,7 +192,7 @@ func (s *MySQL) RecoverExpired(ctx context.Context, limit int) ([]model.Task, er
 		return nil, err
 	}
 	for _, t := range tasks {
-		if _, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,lease_owner=NULL,lease_until=NULL,version=version+1 WHERE node_id=? AND tenant_id=?`, model.NodePending, t.NodeID, t.TenantID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,lease_owner=NULL,lease_until=NULL,ready_at=NULL,version=version+1 WHERE node_id=? AND tenant_id=?`, model.NodeReady, t.NodeID, t.TenantID); err != nil {
 			return nil, err
 		}
 	}
@@ -222,10 +234,10 @@ func (s *MySQL) MarkReady(ctx context.Context, tenant, nodeID string) error {
 	return err
 }
 
-// RunComplete 检查指定租户的 Run 下是否所有节点均已终态。
+// RunComplete 检查指定租户的 Run 下是否所有节点均已终态（SUCCESS/FAILED/CANCELLED）。
 func (s *MySQL) RunComplete(ctx context.Context, tenant, runID string) (bool, error) {
 	var n int
-	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_node WHERE run_id=? AND tenant_id=? AND status NOT IN (?,?)`, runID, tenant, model.NodeSuccess, model.NodeFailed).Scan(&n)
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_node WHERE run_id=? AND tenant_id=? AND status NOT IN (?,?,?)`, runID, tenant, model.NodeSuccess, model.NodeFailed, model.NodeCancelled).Scan(&n)
 	return n == 0, err
 }
 
@@ -234,6 +246,50 @@ func (s *MySQL) RunHasFailure(ctx context.Context, tenant, runID string) (bool, 
 	var n int
 	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_node WHERE run_id=? AND tenant_id=? AND status=?`, runID, tenant, model.NodeFailed).Scan(&n)
 	return n > 0, err
+}
+
+// CountNodes 统计指定租户的 Run 下的节点总数（含所有轮次），用于多轮 Plan 死循环防护。
+func (s *MySQL) CountNodes(ctx context.Context, tenant, runID string) (int, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_node WHERE run_id=? AND tenant_id=?`, runID, tenant).Scan(&n)
+	return n, err
+}
+
+// RunTokenUsage 汇总指定租户的 Run 下所有 LLM 调用的累计 token 消耗，用于 token 预算防护。
+func (s *MySQL) RunTokenUsage(ctx context.Context, tenant, runID string) (int, error) {
+	var total int
+	err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(SUM(total_tokens),0) FROM llm_usage WHERE run_id=? AND tenant_id=?`, runID, tenant).Scan(&total)
+	return total, err
+}
+
+// CompletedNodes 返回指定 Run 下所有 SUCCESS 节点（按完成时间排序），供 Planner.Replan
+// 读取前序节点的 outputs 作为续规上下文。
+func (s *MySQL) CompletedNodes(ctx context.Context, tenant, runID string) ([]model.Node, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT node_id,run_id,tenant_id,COALESCE(parent_node_id,''),type,name,COALESCE(input,''),COALESCE(output,''),status,attempt,version,COALESCE(lease_owner,''),lease_until,planning_round,created_at,started_at,finished_at FROM agent_node WHERE run_id=? AND tenant_id=? AND status=? ORDER BY finished_at`, runID, tenant, model.NodeSuccess)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Node
+	for rows.Next() {
+		var n model.Node
+		var lease, started, finished sql.NullTime
+		if err := rows.Scan(&n.ID, &n.RunID, &n.TenantID, &n.ParentNodeID, &n.Type, &n.Name, &n.Input, &n.Output, &n.Status, &n.Attempt, &n.Version, &n.LeaseOwner, &lease, &n.PlanningRound, &n.CreatedAt, &started, &finished); err != nil {
+			return nil, err
+		}
+		if lease.Valid {
+			t := lease.Time
+			n.LeaseUntil = &t
+		}
+		if started.Valid {
+			n.StartedAt = started.Time
+		}
+		if finished.Valid {
+			n.FinishedAt = finished.Time
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
 }
 
 func (s *MySQL) SaveCheckpoint(ctx context.Context, runID string, version int64, nodeID string, state any) error {
@@ -427,6 +483,13 @@ func (s *MySQL) FailToolCall(ctx context.Context, tenant, callID string) error {
 	return err
 }
 
+// MarkToolCallUnknown 标记调用为歧义失败（UNKNOWN），仅当当前为 RUNNING 时生效。
+// 用于超时/网络中断等远端可能已执行但响应丢失的场景，阻止盲目重试产生重复副作用。
+func (s *MySQL) MarkToolCallUnknown(ctx context.Context, tenant, callID string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE tool_call SET status='UNKNOWN' WHERE call_id=? AND tenant_id=? AND status='RUNNING'`, callID, tenant)
+	return err
+}
+
 // InboxSeen 查询事件是否已被该租户消费过（消费端幂等 Inbox 的查表步骤）。
 // 采用"处理前查表、处理后写表"的标记后模式：崩溃在处理中途不会误标完成，重投递可幂等重放。
 func (s *MySQL) InboxSeen(ctx context.Context, tenant, eventID string) (bool, error) {
@@ -454,6 +517,40 @@ func (s *MySQL) RecordLLMUsage(ctx context.Context, u model.LLMUsage) error {
 		`INSERT INTO llm_usage(usage_id,run_id,node_id,tenant_id,model,prompt_tokens,completion_tokens,total_tokens,cost) VALUES(?,?,?,?,?,?,?,?,?,?)`,
 		u.ID, u.RunID, u.NodeID, u.TenantID, u.Model, u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.Cost)
 	return err
+}
+
+// SaveDecision 持久化 Planner 决策（Plan JSON），以 (run,trigger_node,round) 为唯一键。
+// 事件重投时 GetDecision 命中已有记录即可复用原决策，避免重复调用非确定性 LLM。
+// ON DUPLICATE KEY UPDATE 保证幂等：同一决策重复保存不影响结果。
+func (s *MySQL) SaveDecision(ctx context.Context, runID, tenant, triggerNodeID string, round int, plan model.Plan) error {
+	b, err := json.Marshal(plan)
+	if err != nil {
+		return fmt.Errorf("marshal plan: %w", err)
+	}
+	decisionID := fmt.Sprintf("%s:%s:%d", runID, triggerNodeID, round)
+	_, err = s.DB.ExecContext(ctx,
+		`INSERT INTO planner_decision(decision_id,run_id,tenant_id,trigger_node_id,planning_round,plan_json) VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE plan_json=VALUES(plan_json)`,
+		decisionID, runID, tenant, triggerNodeID, round, b)
+	return err
+}
+
+// GetDecision 按 (run,trigger_node,round) 读取已持久化的 Planner 决策。
+// 返回 (plan, true, nil) 表示命中；(_, false, nil) 表示无记录（首次调用）。
+func (s *MySQL) GetDecision(ctx context.Context, runID, tenant, triggerNodeID string, round int) (model.Plan, bool, error) {
+	decisionID := fmt.Sprintf("%s:%s:%d", runID, triggerNodeID, round)
+	var planJSON []byte
+	err := s.DB.QueryRowContext(ctx, `SELECT plan_json FROM planner_decision WHERE decision_id=? AND tenant_id=?`, decisionID, tenant).Scan(&planJSON)
+	if err == sql.ErrNoRows {
+		return model.Plan{}, false, nil
+	}
+	if err != nil {
+		return model.Plan{}, false, err
+	}
+	var plan model.Plan
+	if err := json.Unmarshal(planJSON, &plan); err != nil {
+		return model.Plan{}, false, fmt.Errorf("unmarshal plan: %w", err)
+	}
+	return plan, true, nil
 }
 
 var ErrNotFound = errors.New("not found")
@@ -506,4 +603,71 @@ func (s *MySQL) ResumeRun(ctx context.Context, tenant, runID, decision string, v
 		return false, err
 	}
 	return true, nil
+}
+
+// CancelRun 在单事务中将 Run 从 RUNNING 切换到 CANCEL_REQUESTED，同时把该 Run 下
+// 所有 PENDING/READY 节点置为 CANCELLED，防止 worker 在取消后继续认领新节点。
+// RUNNING 节点不被触及：它们要么自然完成（Resumer 据此收敛），要么租约过期后被
+// recovery 的取消扫描处理。CAS 失败（version 不匹配或状态非 RUNNING）返回 false。
+func (s *MySQL) CancelRun(ctx context.Context, tenant, runID, reason string, version int64) (bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE agent_run SET status=?,output=NULLIF(?,''),version=version+1,updated_at=NOW(6) WHERE run_id=? AND tenant_id=? AND version=? AND status=?`, model.RunCancelRequested, reason, runID, tenant, version, model.RunRunning)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,finished_at=NOW(6) WHERE run_id=? AND tenant_id=? AND status IN (?,?)`, model.NodeCancelled, runID, tenant, model.NodePending, model.NodeReady); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// CancelRequestedRuns 扫描处于 CANCEL_REQUESTED 状态的 Run，供 recovery 周期性
+// 收敛：取消遗留的 PENDING/READY 节点，并在全部节点终态时 CAS 到 CANCELLED。
+// 系统级扫描（不限定租户），返回的 Run 携带 tenant_id 以便后续操作做租户隔离。
+func (s *MySQL) CancelRequestedRuns(ctx context.Context, limit int) ([]model.Run, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT run_id,tenant_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,max_rounds,max_tokens,created_at,updated_at FROM agent_run WHERE status=? LIMIT ?`, model.RunCancelRequested, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Run
+	for rows.Next() {
+		var r model.Run
+		if err := rows.Scan(&r.ID, &r.TenantID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.MaxRounds, &r.MaxTokens, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// CancelRunNodes 将指定 Run 下所有 PENDING/READY 节点置为 CANCELLED。
+// 用于 recovery 的取消扫描：覆盖 CancelRun 之后因租约过期被 RecoverExpired
+// 重置回 READY 的节点（worker 的 Run 状态检查是最终防线，防止此类节点被执行）。
+func (s *MySQL) CancelRunNodes(ctx context.Context, tenant, runID string) (int64, error) {
+	res, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,finished_at=NOW(6) WHERE run_id=? AND tenant_id=? AND status IN (?,?)`, model.NodeCancelled, runID, tenant, model.NodePending, model.NodeReady)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// CancelNode 在 worker 侧做单节点取消：仅当节点仍为 PENDING/READY 时 CAS 到 CANCELLED。
+// 用于 worker 发现 Run 已非 RUNNING 时，阻止该节点被执行。
+func (s *MySQL) CancelNode(ctx context.Context, tenant, id string, version int64) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=? AND status IN (?,?)`, model.NodeCancelled, id, tenant, version, model.NodePending, model.NodeReady)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
 }

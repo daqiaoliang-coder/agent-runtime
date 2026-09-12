@@ -6,6 +6,7 @@ import (
 	"agent-runtime/internal/trace"
 	"context"
 	"fmt"
+	"log"
 
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -13,9 +14,19 @@ import (
 // Resumer 是事件驱动的 DAG 推进器。
 // 它消费 RocketMQ 中的节点完成/失败事件，激活后继节点并在全部完成时收敛 Run。
 // Store/Queue 为接口类型，便于单元测试注入 fake。
+// Planner 用于多轮 Plan：ReplanRequested 事件触发时调用 Planner.Replan 续规划。
 type Resumer struct {
-	Store Store
-	Queue Queue
+	Store   Store
+	Queue   Queue
+	Planner Planner
+}
+
+// DecisionStore 持久化 Planner 决策，使 ReplanRequested 事件重投时复用原决策，
+// 避免重复调用非确定性 LLM 生成不同计划。*store.MySQL 天然满足该接口。
+// 与 CancelStore 同理：以独立接口暴露，fakeStore 可按需实现。
+type DecisionStore interface {
+	SaveDecision(ctx context.Context, runID, tenant, triggerNodeID string, round int, plan model.Plan) error
+	GetDecision(ctx context.Context, runID, tenant, triggerNodeID string, round int) (model.Plan, bool, error)
 }
 
 // Handle 处理单个领域事件：
@@ -36,7 +47,7 @@ func (r *Resumer) Handle(ctx context.Context, e model.Event) error {
 		attribute.String("node.id", e.NodeID),
 		attribute.String("tenant.id", e.TenantID),
 	)
-	if e.Type != "AgentStepCompleted" && e.Type != "AgentStepFailed" {
+	if e.Type != "AgentStepCompleted" && e.Type != "AgentStepFailed" && e.Type != "ReplanRequested" {
 		return nil
 	}
 	// 消费端幂等 Inbox：处理前查表，已处理过的事件直接跳过，去重 RocketMQ 至少一次投递的重复消息。
@@ -60,12 +71,29 @@ func (r *Resumer) Handle(ctx context.Context, e model.Event) error {
 
 // process 执行事件推进逻辑（原 Handle 主体）。返回 error 时不写 Inbox，触发重投递。
 func (r *Resumer) process(ctx context.Context, e model.Event) error {
-	if e.Type == "AgentStepFailed" {
-		// 修复 Bug2：必须先拿到 Run 当前 version，再用 CAS 标记失败，否则 WHERE version=0 永不匹配。
+	// ReplanRequested：REFLECT 节点决定续规，调 Planner.Replan 追加新节点到 DAG。
+	if e.Type == "ReplanRequested" {
 		run, err := r.Store.GetRun(ctx, e.TenantID, e.RunID)
 		if err != nil {
-			return fmt.Errorf("load run for failure: %w", err)
+			return fmt.Errorf("load run for replan: %w", err)
 		}
+		if run.Status == model.RunCancelRequested {
+			return nil // 已取消，不续规
+		}
+		return r.handleReplan(ctx, e, run)
+	}
+	// 先获取 Run：Failed 与 Completed 两条路径都需要 version 做 CAS，且需要检查取消。
+	run, err := r.Store.GetRun(ctx, e.TenantID, e.RunID)
+	if err != nil {
+		return fmt.Errorf("load run: %w", err)
+	}
+	// 取消优先：Run 处于 CANCEL_REQUESTED 时，不推进 DAG 也不标 FAILED，
+	// 仅检查是否所有节点终态（含 CANCELLED）以收敛到 CANCELLED。
+	if run.Status == model.RunCancelRequested {
+		return r.tryConvergeCancelled(ctx, e, run)
+	}
+	if e.Type == "AgentStepFailed" {
+		// Bug2 修复保持：run.Version 来自上方 GetRun，CAS 标记 FAILED。
 		_, err = r.Store.UpdateRunCAS(ctx, e.TenantID, e.RunID, run.Version, model.RunFailed, "", e.Error)
 		return err
 	}
@@ -97,14 +125,10 @@ func (r *Resumer) process(ctx context.Context, e model.Event) error {
 	if !complete {
 		return nil
 	}
-	// 修复 Bug3：不再用 _ 吞掉错误，DB 失败时显式返回，避免后续 run 为 nil 触发 panic。
+	// Bug3 修复保持：不再用 _ 吞掉错误，DB 失败时显式返回。
 	failed, err := r.Store.RunHasFailure(ctx, e.TenantID, e.RunID)
 	if err != nil {
 		return fmt.Errorf("check run failure: %w", err)
-	}
-	run, err := r.Store.GetRun(ctx, e.TenantID, e.RunID)
-	if err != nil {
-		return fmt.Errorf("load run for completion: %w", err)
 	}
 	status := model.RunSuccess
 	out := "completed"
@@ -120,6 +144,168 @@ func (r *Resumer) process(ctx context.Context, e model.Event) error {
 		// 版本冲突意味着并发已推进，非致命错误，返回 nil 避免事件无意义重试。
 		return nil
 	}
+	// 关键日志：Run 收敛到终态，标志 DAG 全部节点结束，是 Runtime 最重要的一次状态跃迁。
+	log.Printf("run settled run=%s tenant=%s status=%s trigger_node=%s", e.RunID, e.TenantID, status, e.NodeID)
+	return nil
+}
+
+// tryConvergeCancelled 在 Run 处于 CANCEL_REQUESTED 时尝试收敛到 CANCELLED。
+// 不推进 DAG（子节点要么已被 CancelRun 取消，要么已在终态）；仅当所有节点
+// 均为终态（SUCCESS/FAILED/CANCELLED）时才 CAS 到 CANCELLED。
+// RUNNING 节点完成后会再次投递事件触发本路径，直到可收敛。
+func (r *Resumer) tryConvergeCancelled(ctx context.Context, e model.Event, run *model.Run) error {
+	complete, err := r.Store.RunComplete(ctx, e.TenantID, e.RunID)
+	if err != nil {
+		return fmt.Errorf("check run complete for cancel: %w", err)
+	}
+	if !complete {
+		return nil
+	}
+	ok, err := r.Store.UpdateRunCAS(ctx, e.TenantID, e.RunID, run.Version, model.RunCancelled, e.NodeID, "cancelled by user")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// 版本冲突意味着并发已推进（或 Run 已偏离 CANCEL_REQUESTED），返回 nil 避免事件重试。
+		return nil
+	}
+	log.Printf("run cancelled run=%s tenant=%s trigger_node=%s", e.RunID, e.TenantID, e.NodeID)
+	return nil
+}
+
+// handleReplan 执行多轮 Plan 的续规流程：
+// 1. 检查死循环防护（PlanningRound 上限、节点总数上限、token 预算上限）；
+// 2. 查询已完成节点（含 outputs）作为 Planner 的上下文；
+// 3. 调用 Planner.Replan 产出新一轮节点；
+// 4. 将新节点无 DependsOn 的根链接到触发续规的 REFLECT 节点（e.NodeID）；
+// 5. InsertPlan 追加节点 + 边到同一 Run 的 DAG；
+// 6. 激活依赖已就绪的新节点（REFLECT 已 SUCCESS，直接挂接的根节点可立即执行）。
+//
+// 防护命中时：不追加新节点，直接 CAS 将 Run 收敛到 FAILED，避免 Planner 持续
+// 输出 replan 决策导致无限续规。
+func (r *Resumer) handleReplan(ctx context.Context, e model.Event, run *model.Run) error {
+	if r.Planner == nil {
+		return fmt.Errorf("replan requested but planner not configured")
+	}
+	completed, err := r.Store.CompletedNodes(ctx, e.TenantID, e.RunID)
+	if err != nil {
+		return fmt.Errorf("load completed nodes for replan: %w", err)
+	}
+	// 死循环防护：检查续规轮次、节点总数、token 预算是否超限。
+	if reason := r.checkReplanLimits(ctx, e, run, completed); reason != "" {
+		return r.convergeOnLimit(ctx, e, run, reason)
+	}
+	// 决策复用：以 (run,trigger_node,round) 为唯一键。事件重投或插入计划后崩溃时，
+	// 命中已有决策即复用原 Plan，避免重复调用非确定性 LLM 生成不同计划。
+	round := nextRound(completed)
+	plan, err := r.loadOrReplan(ctx, e, run, completed, round)
+	if err != nil {
+		return err
+	}
+	// 链接：新节点中 DependsOn 为空的根节点挂接到触发续规的 REFLECT 节点。
+	for i, n := range plan.Nodes {
+		if len(n.DependsOn) == 0 {
+			plan.Nodes[i].DependsOn = []string{e.NodeID}
+		}
+		if plan.Nodes[i].ParentNodeID == "" {
+			plan.Nodes[i].ParentNodeID = e.NodeID
+		}
+	}
+	if err := r.Store.InsertPlan(ctx, e.RunID, e.TenantID, plan); err != nil {
+		return fmt.Errorf("insert replan nodes: %w", err)
+	}
+	// 激活依赖已就绪的新节点：REFLECT 节点已 SUCCESS，直接挂接的根节点立即可执行。
+	for _, n := range plan.Nodes {
+		ready, err := r.Store.DependenciesReady(ctx, e.TenantID, n.ID)
+		if err != nil {
+			return fmt.Errorf("check deps for replan node %s: %w", n.ID, err)
+		}
+		if !ready {
+			continue
+		}
+		if err := r.Store.MarkReady(ctx, e.TenantID, n.ID); err != nil {
+			return fmt.Errorf("mark ready replan node %s: %w", n.ID, err)
+		}
+		if err := r.Queue.Enqueue(ctx, model.Task{RunID: e.RunID, NodeID: n.ID, TenantID: e.TenantID}); err != nil {
+			return fmt.Errorf("enqueue replan node %s: %w", n.ID, err)
+		}
+	}
+	log.Printf("run replanned run=%s tenant=%s trigger_node=%s round=%d new_nodes=%d", e.RunID, e.TenantID, e.NodeID, round, len(plan.Nodes))
+	return nil
+}
+
+// loadOrReplan 实现决策持久化与复用：
+//   - 首次处理 ReplanRequested：调用 Planner.Replan 生成新计划，并 SaveDecision 持久化；
+//   - 事件重投或插入计划后崩溃重放：GetDecision 命中即复用原计划，跳过 LLM 调用。
+//
+// 若 Store 未实现 DecisionStore（如部分 fakeStore），退化为每次调用 Planner.Replan，
+// 并打印告警提示生产环境应启用决策持久化以避免重复 LLM 调用。
+func (r *Resumer) loadOrReplan(ctx context.Context, e model.Event, run *model.Run, completed []model.Node, round int) (model.Plan, error) {
+	ds, ok := r.Store.(DecisionStore)
+	if !ok {
+		log.Printf("warn: store does not implement DecisionStore; replan decisions will not be persisted run=%s", e.RunID)
+		return r.Planner.Replan(ctx, run, completed)
+	}
+	// 复用检查：命中已有决策直接返回，保证幂等重放不会触发第二次 LLM 调用。
+	if plan, exists, err := ds.GetDecision(ctx, e.RunID, e.TenantID, e.NodeID, round); err != nil {
+		return model.Plan{}, fmt.Errorf("get decision: %w", err)
+	} else if exists {
+		log.Printf("replan decision reused run=%s tenant=%s trigger_node=%s round=%d", e.RunID, e.TenantID, e.NodeID, round)
+		return plan, nil
+	}
+	// 首次调用：生成新决策并持久化。保存失败即返回错误，事件重投后会重新进入本路径。
+	plan, err := r.Planner.Replan(ctx, run, completed)
+	if err != nil {
+		return model.Plan{}, fmt.Errorf("planner replan: %w", err)
+	}
+	if err := ds.SaveDecision(ctx, e.RunID, e.TenantID, e.NodeID, round, plan); err != nil {
+		return model.Plan{}, fmt.Errorf("save decision: %w", err)
+	}
+	return plan, nil
+}
+
+// checkReplanLimits 检查多轮 Plan 的三道防线：续规轮次、节点总数、token 预算。
+// 返回非空 reason 表示防线命中，调用方应拒绝续规并收敛 Run。
+func (r *Resumer) checkReplanLimits(ctx context.Context, e model.Event, run *model.Run, completed []model.Node) string {
+	// 防线 1：续规轮次上限。
+	next := nextRound(completed)
+	if run.MaxRounds > 0 && next > run.MaxRounds {
+		return fmt.Sprintf("max rounds exceeded: next round %d > limit %d", next, run.MaxRounds)
+	}
+	// 防线 2：节点总数上限（复用 MaxSteps，含所有轮次的节点）。
+	if run.MaxSteps > 0 {
+		count, err := r.Store.CountNodes(ctx, e.TenantID, e.RunID)
+		if err != nil {
+			log.Printf("warn: count nodes for replan limits: %v", err)
+		} else if count >= run.MaxSteps {
+			return fmt.Sprintf("max steps exceeded: nodes %d >= limit %d", count, run.MaxSteps)
+		}
+	}
+	// 防线 3：token 预算上限。
+	if run.MaxTokens > 0 {
+		used, err := r.Store.RunTokenUsage(ctx, e.TenantID, e.RunID)
+		if err != nil {
+			log.Printf("warn: token usage for replan limits: %v", err)
+		} else if used >= run.MaxTokens {
+			return fmt.Sprintf("token budget exhausted: used %d >= limit %d", used, run.MaxTokens)
+		}
+	}
+	return ""
+}
+
+// convergeOnLimit 在防线命中时将 Run 直接 CAS 到 FAILED。
+// REFLECT 节点已完成（触发 ReplanRequested），不追加新节点则所有节点均终态，
+// 无需等待后续事件驱动收敛。
+func (r *Resumer) convergeOnLimit(ctx context.Context, e model.Event, run *model.Run, reason string) error {
+	ok, err := r.Store.UpdateRunCAS(ctx, e.TenantID, e.RunID, run.Version, model.RunFailed, e.NodeID, reason)
+	if err != nil {
+		return fmt.Errorf("converge on limit: %w", err)
+	}
+	if !ok {
+		// 版本冲突：并发已推进，返回 nil 避免事件无意义重试。
+		return nil
+	}
+	log.Printf("run failed on limit run=%s tenant=%s trigger_node=%s reason=%q", e.RunID, e.TenantID, e.NodeID, reason)
 	return nil
 }
 

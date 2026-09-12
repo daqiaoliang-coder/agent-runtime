@@ -38,6 +38,15 @@ func (s *hitlFakeStore) RunComplete(context.Context, string, string) (bool, erro
 func (s *hitlFakeStore) RunHasFailure(context.Context, string, string) (bool, error) {
 	return false, nil
 }
+func (s *hitlFakeStore) CompletedNodes(context.Context, string, string) ([]model.Node, error) {
+	return nil, nil
+}
+func (s *hitlFakeStore) CountNodes(context.Context, string, string) (int, error) {
+	return 0, nil
+}
+func (s *hitlFakeStore) RunTokenUsage(context.Context, string, string) (int, error) {
+	return 0, nil
+}
 func (s *hitlFakeStore) InboxSeen(context.Context, string, string) (bool, error) { return false, nil }
 func (s *hitlFakeStore) MarkInbox(context.Context, string, string) error         { return nil }
 func (s *hitlFakeStore) InterruptRun(_ context.Context, _, _, _, _ string, version int64) (bool, error) {
@@ -60,17 +69,20 @@ func (s *hitlFakeStore) ResumeRun(_ context.Context, _, _, decision string, vers
 	return true, nil
 }
 
-type fakeQueue struct{}
+type hitlFakeQueue struct{}
 
-func (fakeQueue) Enqueue(context.Context, model.Task) error { return nil }
+func (hitlFakeQueue) Enqueue(context.Context, model.Task) error { return nil }
 
 type noopPlanner struct{}
 
 func (noopPlanner) Plan(context.Context, *model.Run) (model.Plan, error) { return model.Plan{}, nil }
+func (noopPlanner) Replan(context.Context, *model.Run, []model.Node) (model.Plan, error) {
+	return model.Plan{}, nil
+}
 
 func TestRuntime_HITLInterruptAndResume(t *testing.T) {
 	s := &hitlFakeStore{run: &model.Run{ID: "r1", TenantID: "t1", Status: model.RunRunning, Version: 0, UpdatedAt: time.Now()}}
-	r := &Runtime{Store: s, Queue: fakeQueue{}, Planner: noopPlanner{}}
+	r := &Runtime{Store: s, Queue: hitlFakeQueue{}, Planner: noopPlanner{}}
 	if err := r.Interrupt(context.Background(), "t1", "r1", "n1", "approve deployment"); err != nil {
 		t.Fatal(err)
 	}

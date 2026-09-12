@@ -10,6 +10,7 @@ import (
 
 // fakeStore 实现 runtime.Store 接口，记录每次调用的租户参数并返回可配置结果，
 // 用于在无需真实 MySQL 的情况下单元测试 Resumer.Handle 的行为。
+// 同时实现 CancelStore 接口，供 Cancel 测试使用。
 type fakeStore struct {
 	// 可配置返回值
 	getRun           *model.Run
@@ -27,14 +28,38 @@ type fakeStore struct {
 	runHasFailure    bool
 	runHasFailureErr error
 
+	// Cancel 模拟
+	cancelRunOK  bool
+	cancelRunErr error
+
+	// CompletedNodes 模拟
+	completedNodes    []model.Node
+	completedNodesErr error
+
+	// CountNodes / RunTokenUsage 模拟（用于多轮 Plan 死循环防护）
+	countNodes        int
+	countNodesErr     error
+	runTokenUsage     int
+	runTokenUsageErr  error
+
+	// DecisionStore 模拟（用于决策持久化与复用）
+	decisionExists bool
+	decisionPlan   model.Plan
+	getDecisionErr error
+	saveDecisionErr error
+	getDecisionCalls []decisionCall
+	saveDecisionCalls []decisionCall
+
 	// 调用记录（仅记录 tenant 参数，用于断言租户透传）
 	getRunCalls        []getRunCall
 	updateCASCalls     []casCall
 	childrenCalls      []string
 	depsReadyCalls     []string
-	markReadyCalls     []string
+	markReadyCalls     []markReadyCall
 	runCompleteCalls   []string
 	runHasFailureCalls []string
+	cancelRunCalls     []cancelRunCall
+	insertPlanCalls    []insertPlanCall
 
 	// Inbox 模拟：已处理事件集合。InboxSeen 查表、MarkInbox 写表。
 	inbox map[string]bool
@@ -45,6 +70,17 @@ type casCall struct {
 	tenant, id string
 	version    int64
 	status     model.RunStatus
+}
+type cancelRunCall struct {
+	tenant, runID, reason string
+	version                int64
+}
+type insertPlanCall struct{ plan model.Plan }
+type markReadyCall struct{ tenant, nodeID string }
+type decisionCall struct {
+	runID, tenant, triggerNodeID string
+	round                        int
+	plan                         model.Plan
 }
 
 func (f *fakeStore) CreateRun(context.Context, *model.Run) error { return nil }
@@ -59,9 +95,12 @@ func (f *fakeStore) UpdateRunCAS(_ context.Context, tenant, id string, version i
 	f.updateCASCalls = append(f.updateCASCalls, casCall{tenant, id, version, status})
 	return f.casOK, f.casErr
 }
-func (f *fakeStore) InsertPlan(context.Context, string, string, model.Plan) error { return nil }
-func (f *fakeStore) MarkReady(_ context.Context, tenant, _ string) error {
-	f.markReadyCalls = append(f.markReadyCalls, tenant)
+func (f *fakeStore) InsertPlan(_ context.Context, _, _ string, plan model.Plan) error {
+	f.insertPlanCalls = append(f.insertPlanCalls, insertPlanCall{plan: plan})
+	return nil
+}
+func (f *fakeStore) MarkReady(_ context.Context, tenant, nodeID string) error {
+	f.markReadyCalls = append(f.markReadyCalls, markReadyCall{tenant, nodeID})
 	return f.markReadyErr
 }
 func (f *fakeStore) Children(_ context.Context, tenant, _ string) ([]model.Task, error) {
@@ -92,6 +131,30 @@ func (f *fakeStore) MarkInbox(_ context.Context, _, eventID string) error {
 	}
 	f.inbox[eventID] = true
 	return nil
+}
+func (f *fakeStore) CancelRun(_ context.Context, tenant, runID, reason string, version int64) (bool, error) {
+	f.cancelRunCalls = append(f.cancelRunCalls, cancelRunCall{tenant, runID, reason, version})
+	return f.cancelRunOK, f.cancelRunErr
+}
+func (f *fakeStore) CompletedNodes(_ context.Context, _, _ string) ([]model.Node, error) {
+	return f.completedNodes, f.completedNodesErr
+}
+func (f *fakeStore) CountNodes(_ context.Context, _, _ string) (int, error) {
+	return f.countNodes, f.countNodesErr
+}
+func (f *fakeStore) RunTokenUsage(_ context.Context, _, _ string) (int, error) {
+	return f.runTokenUsage, f.runTokenUsageErr
+}
+func (f *fakeStore) GetDecision(_ context.Context, runID, tenant, triggerNodeID string, round int) (model.Plan, bool, error) {
+	f.getDecisionCalls = append(f.getDecisionCalls, decisionCall{runID, tenant, triggerNodeID, round, f.decisionPlan})
+	if f.getDecisionErr != nil {
+		return model.Plan{}, false, f.getDecisionErr
+	}
+	return f.decisionPlan, f.decisionExists, nil
+}
+func (f *fakeStore) SaveDecision(_ context.Context, runID, tenant, triggerNodeID string, round int, plan model.Plan) error {
+	f.saveDecisionCalls = append(f.saveDecisionCalls, decisionCall{runID, tenant, triggerNodeID, round, plan})
+	return f.saveDecisionErr
 }
 
 // fakeQueue 记录入队任务，用于断言子节点被正确投递且携带租户。
@@ -200,7 +263,7 @@ func TestResumer_StepFailed_GetRunError_Propagates(t *testing.T) {
 // 收敛路径 RunHasFailure 错误此前被 _ 吞掉。
 func TestResumer_Completion_RunHasFailureError_Propagates(t *testing.T) {
 	want := errors.New("has-failure query failed")
-	fs := &fakeStore{runComplete: true, runHasFailureErr: want}
+	fs := &fakeStore{runComplete: true, runHasFailureErr: want, getRun: &model.Run{ID: "run-1", Version: 5, Status: model.RunRunning}}
 	r := &Resumer{Store: fs, Queue: &fakeQueue{}}
 	err := r.Handle(context.Background(), completedEvent())
 	if err == nil || !errors.Is(err, want) {
@@ -251,9 +314,13 @@ func TestResumer_PropagatesTenant(t *testing.T) {
 	}
 	assertTenant("Children", fs.childrenCalls)
 	assertTenant("DependenciesReady", fs.depsReadyCalls)
-	assertTenant("MarkReady", fs.markReadyCalls)
 	assertTenant("RunComplete", fs.runCompleteCalls)
 	assertTenant("RunHasFailure", fs.runHasFailureCalls)
+	for i, c := range fs.markReadyCalls {
+		if c.tenant != "tenant-A" {
+			t.Errorf("MarkReady call %d: tenant=%q, want tenant-A", i, c.tenant)
+		}
+	}
 	if len(fs.getRunCalls) == 0 || fs.getRunCalls[0].tenant != "tenant-A" {
 		t.Errorf("GetRun tenant not propagated: %+v", fs.getRunCalls)
 	}
@@ -307,6 +374,7 @@ func TestResumer_OnlyActivatesReadyChildren(t *testing.T) {
 		children:    []model.Task{ready, blocked},
 		depsReadyFn: func(nodeID string) (bool, error) { return nodeID == "ready-child", nil },
 		runComplete: false, // 不进入收敛分支，聚焦子节点激活
+		getRun:      &model.Run{ID: "run-1", Version: 5, Status: model.RunRunning},
 	}
 	q := &fakeQueue{}
 	r := &Resumer{Store: fs, Queue: q}

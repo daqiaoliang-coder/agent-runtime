@@ -7,14 +7,13 @@ services:
       MYSQL_DATABASE: agent_runtime
       MYSQL_USER: agent
       MYSQL_PASSWORD: agent
-    ports: ["3306:3306"]
-    command: ["mysqld", "--default-authentication-plugin=mysql_native_password"]
+    ports: ["3308:3306"]
     volumes: ["mysql_data:/var/lib/mysql"]
 
   redis:
     image: redis:7
     container_name: agent-runtime-redis
-    ports: ["6379:6379"]
+    ports: ["6380:6379"]
     volumes: ["redis_data:/data"]
 
   namesrv:

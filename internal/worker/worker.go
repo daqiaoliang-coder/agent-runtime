@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -62,6 +63,26 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	if err != nil {
 		return err
 	}
+	// 状态机检查：明确区分取消、终态与可恢复暂停状态。
+	//   - CANCEL_REQUESTED / 终态（SUCCESS/FAILED/CANCELLED）：取消尚未执行的节点，阻止其被认领。
+	//     这是用户取消的最终防线：CancelRun 已取消 PENDING/READY 节点，但 RecoverExpired
+	//     可能在此之后把崩溃的 RUNNING 节点重置回 PENDING 并补投递，此时 worker 须拒绝执行。
+	//   - WAITING_HUMAN：不执行也不取消，等待人工审批恢复为 RUNNING 后重新调度。
+	//   - PENDING：Run 尚未完成初始化调度，不执行不取消，由恢复扫描补投递。
+	run, err := w.Store.GetRun(ctx, t.TenantID, t.RunID)
+	if err != nil {
+		return err
+	}
+	if run.Status != model.RunRunning {
+		switch run.Status {
+		case model.RunCancelRequested, model.RunSuccess, model.RunFailed, model.RunCancelled:
+			if n.Status == model.NodePending || n.Status == model.NodeReady {
+				_, _ = w.Store.CancelNode(ctx, t.TenantID, t.NodeID, n.Version)
+			}
+		}
+		log.Printf("worker=%s skip node run=%s node=%s run_status=%s", w.ID, t.RunID, t.NodeID, run.Status)
+		return nil
+	}
 	ok, err := w.Store.ClaimNode(ctx, n.TenantID, n.ID, n.Version, w.ID, 30*time.Second)
 	if err != nil {
 		return err
@@ -69,6 +90,8 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	if !ok {
 		return nil
 	}
+	// 关键日志：节点认领成功，标记执行入口，便于在普通日志中追踪 worker 调度边界。
+	log.Printf("worker=%s claimed node run=%s node=%s tenant=%s type=%s attempt=%d", w.ID, n.RunID, n.ID, n.TenantID, n.Type, n.Attempt)
 	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
 		ID: fmt.Sprintf("runtime-event-%s-start-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 		Type: contracts.EventNodeStarted, Timestamp: time.Now(), Data: map[string]any{"type": n.Type, "name": n.Name, "attempt": n.Attempt},
@@ -91,6 +114,30 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		}
 	}()
 
+	// Token 预算检查：LLM/REFLECT 节点执行前校验累计 token 是否超限。
+	// 超限时直接失败（不可重试），避免无意义的 LLM 调用与 token 浪费。
+	if run.MaxTokens > 0 && (n.Type == model.NodeLLM || n.Type == model.NodeReflect) {
+		used, terr := w.Store.RunTokenUsage(ctx, n.TenantID, n.RunID)
+		if terr != nil {
+			log.Printf("warn: token usage check failed run=%s node=%s err=%v", n.RunID, n.ID, terr)
+		} else if used >= run.MaxTokens {
+			budgetErr := fmt.Errorf("token budget exceeded: used %d >= limit %d", used, run.MaxTokens)
+			span.RecordError(budgetErr)
+			span.SetStatus(codes.Error, budgetErr.Error())
+			next := n.Attempt + 1
+			log.Printf("node dead-lettered (token budget) run=%s node=%s attempt=%d", n.RunID, n.ID, n.Attempt)
+			_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, budgetErr.Error(), next, "")
+			fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: budgetErr.Error(), Timestamp: time.Now()}
+			payload, _ := json.Marshal(fe)
+			_, _ = w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{ID: fe.ID, EventType: fe.Type, AggregateID: n.RunID, Payload: string(payload)})
+			w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
+				ID: fmt.Sprintf("runtime-event-%s-failed-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
+				Type: contracts.EventNodeFailed, Timestamp: time.Now(), Data: map[string]any{"error": budgetErr.Error(), "attempt": n.Attempt},
+			})
+			return nil
+		}
+	}
+
 	// 执行节点：替换原先的占位字符串拼接，真正发起 LLM 推理或工具调用。
 	output, execErr := w.Exec.Execute(ctx, n)
 	if execErr != nil {
@@ -110,9 +157,13 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 				// 版本/状态已变（可能被恢复抢占），不 ack，任务重投递由恢复机制收敛。
 				return fmt.Errorf("retry cas conflict for %s (exec err: %v)", n.ID, execErr)
 			}
+			// 关键日志：节点执行失败但仍在重试预算内，记录退避点，便于观察重试节流。
+			log.Printf("node retried run=%s node=%s attempt=%d->%d backoff_until=%s err=%v", n.RunID, n.ID, n.Attempt, next, readyAt.Format(time.RFC3339), execErr)
 			return nil
 		}
 		// 重试耗尽：入死信队列 + 失败事件，由 Resume 收敛 Run 为 FAILED。
+		// 关键日志：重试耗尽进入死信队列，标志该节点不可恢复，需人工介入或下游兜底。
+		log.Printf("node dead-lettered run=%s node=%s attempt=%d err=%v", n.RunID, n.ID, n.Attempt, execErr)
 		_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, execErr.Error(), next, output)
 		fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: execErr.Error(), Timestamp: time.Now()}
 		payload, _ := json.Marshal(fe)
@@ -126,15 +177,26 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		return nil
 	}
 
-	e := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepCompleted", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Output: output, Timestamp: time.Now()}
+	// REFLECT 节点：解析决策，若 "replan" 则发 ReplanRequested 事件代替 AgentStepCompleted。
+	// 节点仍标记 SUCCESS（决策本身执行成功），仅事件类型不同，驱动 Resumer 走续规路径。
+	eventType := "AgentStepCompleted"
+	if n.Type == model.NodeReflect {
+		var decision struct{ Action string `json:"action"` }
+		if jerr := json.Unmarshal([]byte(output), &decision); jerr == nil && decision.Action == "replan" {
+			eventType = "ReplanRequested"
+		}
+	}
+	e := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: eventType, RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Output: output, Timestamp: time.Now()}
 	payload, _ := json.Marshal(e)
-	// 累积检查点上下文（对话历史 + 节点输出），在节点完成前落盘，供崩溃恢复重建 Agent 上下文。
-	w.saveCheckpoint(ctx, n, output)
 	// 节点完成 + Outbox 事件在同一事务内提交，保证状态与事件一致。
+	// 上下文不再通过 checkpoint 累积（存在读改写竞态），改由 ContextLoader 从已提交的
+	// SUCCESS 节点派生，保证并行节点不会相互覆盖对话历史。
 	_, err = w.Store.CompleteNodeWithOutbox(ctx, n, output, model.OutboxMessage{ID: e.ID, EventType: e.Type, AggregateID: n.RunID, Payload: string(payload)})
 	if err != nil {
 		return err
 	}
+	// 关键日志：节点执行完成，标志一次成功的 LLM 推理或工具调用落地。
+	log.Printf("node completed run=%s node=%s tenant=%s attempt=%d output_bytes=%d", n.RunID, n.ID, n.TenantID, n.Attempt, len(output))
 	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
 		ID: fmt.Sprintf("runtime-event-%s-finished-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 		Type: contracts.EventNodeFinished, Timestamp: time.Now(), Data: map[string]any{"output": output, "attempt": n.Attempt},
@@ -146,24 +208,6 @@ func (w *Worker) emitRuntimeEvent(ctx context.Context, ev contracts.RuntimeEvent
 	if w.RuntimeEvents != nil {
 		_ = w.RuntimeEvents.Emit(ctx, ev)
 	}
-}
-
-// saveCheckpoint 累积更新 Run 检查点：追加本节点的输入/输出到对话历史与 NodeOutputs。
-// 最佳努力落盘（忽略错误）：节点状态由 CompleteNodeWithOutbox 事务保证，检查点为上下文缓存。
-func (w *Worker) saveCheckpoint(ctx context.Context, n *model.Node, output string) {
-	_, _, stateJSON, err := w.Store.LoadCheckpoint(ctx, n.RunID)
-	var rc model.RunContext
-	if err == nil && len(stateJSON) > 0 {
-		_ = json.Unmarshal(stateJSON, &rc)
-	}
-	if rc.NodeOutputs == nil {
-		rc.NodeOutputs = map[string]string{}
-	}
-	rc.NodeOutputs[n.Name] = output
-	rc.Messages = append(rc.Messages,
-		model.ChatTurn{Role: string(llm.RoleUser), Content: n.Input},
-		model.ChatTurn{Role: string(llm.RoleAssistant), Content: output})
-	_ = w.Store.SaveCheckpoint(ctx, n.RunID, n.Version, n.ID, rc)
 }
 
 // NewFromEnv 从环境变量 WORKER_ID 读取标识，缺省时按时间戳生成。
@@ -187,22 +231,23 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	// Retry=指数退避策略，失败可重试节点置回 READY 并按 ready_at 补投递，耗尽入 DLQ。
 	// UsageRecorder=s 使 LLM 节点的 token 用量与成本落 llm_usage 表，支撑成本分析。
 	disp := &executor.Dispatcher{LLM: client, Tools: tools, ModelProvider: llmadapter.New(client), ToolProvider: tooladapter.New(tools), ToolStore: s, UsageRecorder: s, Pricer: DefaultPricer}
-	// ContextLoader 从 checkpoint 重建对话历史，使崩溃恢复后的 LLM 节点保持上下文连续。
-	disp.ContextLoader = func(ctx context.Context, runID string) ([]llm.Message, error) {
-		_, _, stateJSON, err := s.LoadCheckpoint(ctx, runID)
+	// ContextLoader 从已提交的 SUCCESS 节点派生对话历史（按完成时间排序），
+	// 避免对 checkpoint 做读改写导致的并行节点竞态。上下文以已提交状态为事实，
+	// 无需额外的累积写入——崩溃恢复后也能从持久化的节点输出重建完整上下文。
+	disp.ContextLoader = func(ctx context.Context, tenant, runID string) ([]llm.Message, error) {
+		nodes, err := s.CompletedNodes(ctx, tenant, runID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return nil, nil // 无历史检查点（根节点首次执行），非错误
+				return nil, nil
 			}
 			return nil, err
 		}
-		var rc model.RunContext
-		if err := json.Unmarshal(stateJSON, &rc); err != nil {
-			return nil, err
-		}
-		msgs := make([]llm.Message, 0, len(rc.Messages))
-		for _, m := range rc.Messages {
-			msgs = append(msgs, llm.Message{Role: llm.Role(m.Role), Content: m.Content})
+		msgs := make([]llm.Message, 0, len(nodes)*2)
+		for _, n := range nodes {
+			msgs = append(msgs,
+				llm.Message{Role: llm.RoleUser, Content: n.Input},
+				llm.Message{Role: llm.RoleAssistant, Content: n.Output},
+			)
 		}
 		return msgs, nil
 	}

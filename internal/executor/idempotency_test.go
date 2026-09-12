@@ -57,6 +57,14 @@ func (f *fakeToolStore) FailToolCall(_ context.Context, tenant, callID string) e
 	tc.Status = "FAILED"
 	return nil
 }
+func (f *fakeToolStore) MarkToolCallUnknown(_ context.Context, _, callID string) error {
+	tc, ok := f.calls[callID]
+	if !ok || tc.Status != "RUNNING" {
+		return nil
+	}
+	tc.Status = "UNKNOWN"
+	return nil
+}
 
 // scriptedTool 按预设脚本返回结果，便于测试失败/成功序列与执行计数。
 type scriptedTool struct {
@@ -146,6 +154,37 @@ func TestExecutor_ToolIdempotent_StaleRunningRefuses(t *testing.T) {
 	}
 	if tl.calls != 0 {
 		t.Fatalf("tool must NOT execute on stale RUNNING, calls=%d", tl.calls)
+	}
+}
+
+// TestExecutor_ToolIdempotent_AmbiguousFailureMarksUnknown 超时类错误应标记为 UNKNOWN，
+// 后续执行命中 UNKNOWN 时拒绝盲目重执行（远端可能已执行副作用）。
+func TestExecutor_ToolIdempotent_AmbiguousFailureMarksUnknown(t *testing.T) {
+	store := newFakeToolStore()
+	tl := &scriptedTool{name: "search", outputs: []string{""}, errs: []error{context.DeadlineExceeded}}
+	d := &Dispatcher{Tools: mustReg(tl), ToolStore: store}
+	n := &model.Node{ID: "n-amb", RunID: "r1", TenantID: "t1", Type: model.NodeTool, Name: "search", Input: "q-amb", Attempt: 0}
+
+	// 第一次：超时 → 标记 UNKNOWN，返回错误。
+	_, err := d.Execute(context.Background(), n)
+	if err == nil {
+		t.Fatal("expected error on ambiguous failure")
+	}
+	if tl.calls != 1 {
+		t.Fatalf("expected 1 call, got %d", tl.calls)
+	}
+	key := idempotencyKey(n.RunID, n.ID, n.Name, n.Input)
+	if store.calls[key].Status != "UNKNOWN" {
+		t.Fatalf("expected UNKNOWN status, got %s", store.calls[key].Status)
+	}
+
+	// 第二次：命中 UNKNOWN → 拒绝盲目重执行。
+	_, err = d.Execute(context.Background(), n)
+	if err == nil || !strings.Contains(err.Error(), "UNKNOWN") {
+		t.Fatalf("expected UNKNOWN refusal, got %v", err)
+	}
+	if tl.calls != 1 {
+		t.Fatalf("tool must NOT re-execute on UNKNOWN, calls=%d", tl.calls)
 	}
 }
 

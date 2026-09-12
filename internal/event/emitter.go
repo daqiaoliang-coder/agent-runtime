@@ -38,6 +38,9 @@ func (e *ChannelEmitter) Emit(ctx context.Context, ev contracts.RuntimeEvent) er
 	}
 }
 
+// Events 返回只读通道，消费者从中读取事件以桥接到 SSE/WebSocket 等前端流。
+// 通道在 Close 后关闭，消费者应配合 for-range 处理。
 func (e *ChannelEmitter) Events() <-chan contracts.RuntimeEvent { return e.ch }
 
+// Close 关闭事件通道，幂等（多次调用安全）。关闭后消费者读取将读到零值并退出循环。
 func (e *ChannelEmitter) Close() { e.once.Do(func() { close(e.ch) }) }

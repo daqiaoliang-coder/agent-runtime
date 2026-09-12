@@ -25,7 +25,7 @@ func TestLLMPlanner_ParsesPlanJSON(t *testing.T) {
 	if p.Nodes[0].Type != model.NodeTool || p.Nodes[0].Name != "search" {
 		t.Errorf("node0 = %+v", p.Nodes[0])
 	}
-	if len(p.Nodes[1].DependsOn) != 1 || p.Nodes[1].DependsOn[0] != "n1" {
+	if len(p.Nodes[1].DependsOn) != 1 || p.Nodes[1].DependsOn[0] != "run-1:n1" {
 		t.Errorf("node1 deps = %+v", p.Nodes[1].DependsOn)
 	}
 }
@@ -38,7 +38,7 @@ func TestLLMPlanner_StripsMarkdownFence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	if len(p.Nodes) != 1 || p.Nodes[0].ID != "x" {
+	if len(p.Nodes) != 1 || p.Nodes[0].ID != "r:x" {
 		t.Errorf("unexpected plan: %+v", p)
 	}
 }
@@ -56,7 +56,7 @@ func TestLLMPlanner_InvalidJSON_ReturnsError(t *testing.T) {
 func TestLLMPlanner_EmptyPlan_ReturnsError(t *testing.T) {
 	stub := &llm.Stub{Responder: func(_ llm.Request) string { return `{"nodes":[]}` }}
 	_, err := (&LLMPlanner{LLM: stub}).Plan(context.Background(), &model.Run{ID: "r", Input: "g"})
-	if err == nil || !strings.Contains(err.Error(), "empty plan") {
+	if err == nil || !strings.Contains(err.Error(), "empty") {
 		t.Fatalf("expected empty-plan error, got %v", err)
 	}
 }
@@ -95,5 +95,58 @@ func TestLLMPlanner_LLMError_Propagates(t *testing.T) {
 	_, err := (&LLMPlanner{LLM: stub}).Plan(ctx, &model.Run{ID: "r", Input: "g"})
 	if err == nil {
 		t.Fatal("expected error from cancelled context")
+	}
+}
+
+// TestValidatePlan_Cycle 含环的 DAG 应报错。
+func TestValidatePlan_Cycle(t *testing.T) {
+	plan := model.Plan{Nodes: []model.PlanNode{
+		{ID: "a", Type: model.NodeLLM, DependsOn: []string{"b"}},
+		{ID: "b", Type: model.NodeLLM, DependsOn: []string{"a"}},
+	}}
+	if err := validatePlan(plan); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("expected cycle error, got %v", err)
+	}
+}
+
+// TestValidatePlan_DanglingDep 依赖不存在节点应报错。
+func TestValidatePlan_DanglingDep(t *testing.T) {
+	plan := model.Plan{Nodes: []model.PlanNode{
+		{ID: "a", Type: model.NodeLLM, DependsOn: []string{"missing"}},
+	}}
+	if err := validatePlan(plan); err == nil || !strings.Contains(err.Error(), "unknown node") {
+		t.Fatalf("expected dangling-dep error, got %v", err)
+	}
+}
+
+// TestValidatePlan_DuplicateID 重复 ID 应报错。
+func TestValidatePlan_DuplicateID(t *testing.T) {
+	plan := model.Plan{Nodes: []model.PlanNode{
+		{ID: "a", Type: model.NodeLLM},
+		{ID: "a", Type: model.NodeLLM},
+	}}
+	if err := validatePlan(plan); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("expected duplicate error, got %v", err)
+	}
+}
+
+// TestNamespacePlan_PrefixesAndUpdatesRefs 命名空间化应加前缀并更新引用。
+func TestNamespacePlan_PrefixesAndUpdatesRefs(t *testing.T) {
+	plan := model.Plan{Nodes: []model.PlanNode{
+		{ID: "n1", Type: model.NodeTool, DependsOn: nil},
+		{ID: "n2", Type: model.NodeLLM, DependsOn: []string{"n1"}, ParentNodeID: "n1"},
+	}}
+	namespacePlan(&plan, "run-1")
+	if plan.Nodes[0].ID != "run-1:n1" {
+		t.Errorf("node0 ID = %q, want run-1:n1", plan.Nodes[0].ID)
+	}
+	if plan.Nodes[1].ID != "run-1:n2" {
+		t.Errorf("node1 ID = %q, want run-1:n2", plan.Nodes[1].ID)
+	}
+	if plan.Nodes[1].DependsOn[0] != "run-1:n1" {
+		t.Errorf("dependsOn = %v, want [run-1:n1]", plan.Nodes[1].DependsOn)
+	}
+	if plan.Nodes[1].ParentNodeID != "run-1:n1" {
+		t.Errorf("parent = %q, want run-1:n1", plan.Nodes[1].ParentNodeID)
 	}
 }

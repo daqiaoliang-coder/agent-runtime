@@ -14,7 +14,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"net"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -35,6 +40,24 @@ type ToolCallStore interface {
 	ReclaimToolCall(ctx context.Context, tenant, callID string) (bool, error)
 	CompleteToolCall(ctx context.Context, tenant, callID, output string) error
 	FailToolCall(ctx context.Context, tenant, callID string) error
+	MarkToolCallUnknown(ctx context.Context, tenant, callID string) error
+}
+
+// isAmbiguousFailure 判断错误是否为"远端可能已执行但响应丢失"的歧义失败
+// （超时/取消/网络中断）。这类失败副作用状态未知，不应盲目标记 FAILED 后重试，
+// 需标记为 UNKNOWN 以阻止重复副作用，等待人工确认或下游幂等查询解决。
+func isAmbiguousFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return false
 }
 
 // UsageRecorder 持久化 LLM token 消耗与成本（*store.MySQL 天然实现）。
@@ -57,7 +80,7 @@ type Dispatcher struct {
 	Tools         *tool.Registry
 	ToolStore     ToolCallStore                                                  // 工具调用幂等存储；为 nil 时工具退化为直接执行（测试/无 DB 场景）
 	SubAgent      Executor                                                       // 子 Agent 执行器（递归运行子 Run），当前为占位实现
-	ContextLoader func(ctx context.Context, runID string) ([]llm.Message, error) // 从 checkpoint 重建对话历史
+	ContextLoader func(ctx context.Context, tenant, runID string) ([]llm.Message, error) // 从已提交节点重建对话历史
 	UsageRecorder UsageRecorder                                                  // LLM token/cost 持久化；为 nil 时不落库
 	Pricer        Pricer                                                         // 成本估算函数；为 nil 时 cost 记 0
 }
@@ -97,6 +120,13 @@ func (d *Dispatcher) Execute(ctx context.Context, n *model.Node) (string, error)
 			return d.SubAgent.Execute(ctx, n)
 		}
 		return "", fmt.Errorf("sub-agent executor not configured")
+	case model.NodeReflect:
+		out, err := d.executeReflect(ctx, n)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		return out, err
 	default:
 		return "", fmt.Errorf("unknown node type %q", n.Type)
 	}
@@ -108,7 +138,7 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 	// 从 checkpoint 重建对话历史：历史在前，当前 user prompt 在后，保证 Agent 上下文连续。
 	msgs := []llm.Message{{Role: llm.RoleUser, Content: n.Input}}
 	if d.ContextLoader != nil {
-		hist, err := d.ContextLoader(ctx, n.RunID)
+		hist, err := d.ContextLoader(ctx, n.TenantID, n.RunID)
 		if err != nil {
 			return "", fmt.Errorf("load context: %w", err)
 		}
@@ -135,10 +165,11 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 		if d.LLM == nil {
 			return "", fmt.Errorf("llm client not configured")
 		}
-		resp, err = d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs})
+		got, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs})
 		if err != nil {
 			return "", fmt.Errorf("llm: %w", err)
 		}
+		resp = got
 	}
 	// 将 token 用量与模型记入 span，便于在追踪系统中按 token 维度聚合分析。
 	span.SetAttributes(
@@ -170,6 +201,94 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 		})
 	}
 	return resp.Content, nil
+}
+
+// reflectDecision 是 REFLECT 节点输出的 JSON 结构。
+// Action="replan" 触发 Resumer 续规划；Action="finish" 走正常收敛。
+type reflectDecision struct {
+	Action string `json:"action"`
+	Reason string `json:"reason"`
+}
+
+const reflectSystemPrompt = `You are a reflection node in an agent runtime.
+Evaluate the progress so far and decide whether to continue (replan) or finish.
+Respond with ONLY a JSON object, no prose: {"action":"replan"|"finish","reason":"..."}`
+
+// executeReflect 执行反思节点：加载 checkpoint 上下文，调 LLM 评估进度，
+// 返回 JSON 决策 {"action":"replan"|"finish","reason":"..."}。
+// worker 据此决定发 ReplanRequested 还是 AgentStepCompleted 事件。
+func (d *Dispatcher) executeReflect(ctx context.Context, n *model.Node) (string, error) {
+	ctx, span := trace.StartSpan(ctx, "executor.reflect")
+	defer span.End()
+	// 从 checkpoint 重建对话历史作为评估上下文。
+	msgs := []llm.Message{
+		{Role: llm.RoleSystem, Content: reflectSystemPrompt},
+		{Role: llm.RoleUser, Content: n.Input},
+	}
+	if d.ContextLoader != nil {
+		hist, err := d.ContextLoader(ctx, n.TenantID, n.RunID)
+		if err != nil {
+			return "", fmt.Errorf("load context for reflect: %w", err)
+		}
+		if len(hist) > 0 {
+			// 历史在前，反思指令在后。
+			msgs = append(hist, msgs...)
+		}
+	}
+	var resp llm.Response
+	if d.ModelProvider != nil {
+		request := contracts.GenerateRequest{Model: modelForNode(n)}
+		for _, m := range msgs {
+			request.Messages = append(request.Messages, contracts.Message{Role: contracts.Role(m.Role), Content: m.Content})
+		}
+		generated, err := d.ModelProvider.Generate(ctx, request)
+		if err != nil {
+			return "", fmt.Errorf("reflect llm: %w", err)
+		}
+		resp = llm.Response{Content: generated.Message.Content, Model: generated.Model}
+	} else {
+		if d.LLM == nil {
+			return "", fmt.Errorf("llm client not configured for reflect")
+		}
+		got, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs})
+		if err != nil {
+			return "", fmt.Errorf("reflect llm: %w", err)
+		}
+		resp = got
+	}
+	// 解析 LLM 输出为 reflectDecision；解析失败时默认 finish（不阻断流程）。
+	var decision reflectDecision
+	raw := extractJSON(resp.Content)
+	if err := json.Unmarshal([]byte(raw), &decision); err != nil || (decision.Action != "replan" && decision.Action != "finish") {
+		// LLM 未返回有效 JSON 或 action 不合法：默认 finish，避免卡死。
+		decision = reflectDecision{Action: "finish", Reason: "reflect output unparseable, defaulting to finish"}
+	}
+	out, _ := json.Marshal(decision)
+	span.SetAttributes(
+		attribute.String("reflect.action", decision.Action),
+		attribute.String("llm.model", resp.Model),
+	)
+	return string(out), nil
+}
+
+// extractJSON 从可能含 Markdown 代码块或前后说明文本的响应中提取首个 JSON 对象。
+func extractJSON(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```") {
+		s = strings.TrimPrefix(s, "```json")
+		s = strings.TrimPrefix(s, "```")
+		s = strings.TrimSuffix(s, "```")
+		s = strings.TrimSpace(s)
+	}
+	start := strings.Index(s, "{")
+	if start < 0 {
+		return s
+	}
+	end := strings.LastIndex(s, "}")
+	if end < start {
+		return s
+	}
+	return s[start : end+1]
 }
 
 // executeTool 执行工具节点。配置了 ToolStore 时走幂等路径，否则退化为直接执行。
@@ -205,10 +324,11 @@ func (d *Dispatcher) executeTool(ctx context.Context, n *model.Node) (string, er
 }
 
 // executeToolIdempotent 实现工具调用的幂等：经 tool_call 表落库，
-//   - 新建调用：执行工具，成功落 SUCCESS、失败落 FAILED；
+//   - 新建调用：执行工具，成功落 SUCCESS、确定失败落 FAILED、歧义失败落 UNKNOWN；
 //   - 命中 SUCCESS：复用已持久化输出，不重复执行副作用；
 //   - 命中 FAILED：回收为 RUNNING 重试一次（失败通常发生在副作用之前）；
-//   - 命中 RUNNING（崩溃在途）：副作用状态未知，拒绝盲目重执行（非幂等工具安全优先）。
+//   - 命中 RUNNING（崩溃在途）：副作用状态未知，拒绝盲目重执行（非幂等工具安全优先）；
+//   - 命中 UNKNOWN（超时/网络中断）：远端可能已执行，拒绝盲目重执行。
 func (d *Dispatcher) executeToolProviderIdempotent(ctx context.Context, n *model.Node) (string, error) {
 	callID := idempotencyKey(n.RunID, n.ID, n.Name, n.Input)
 	isNew, err := d.ToolStore.ClaimToolCall(ctx, n.TenantID, callID, n.RunID, n.ID, n.Name, callID, n.Input, n.Attempt)
@@ -234,8 +354,11 @@ func (d *Dispatcher) executeToolProviderIdempotent(ctx context.Context, n *model
 			return "", fmt.Errorf("tool call %s not reclaimable", callID)
 		}
 		return d.runAndPersistToolProvider(ctx, n, callID)
-	case "RUNNING":
-		return "", fmt.Errorf("tool call %s stale RUNNING; refusing re-execution (non-idempotent safety)", callID)
+	case "RUNNING", "UNKNOWN":
+		// 关键日志：停滞的 RUNNING 或歧义 UNKNOWN 工具调用拒绝重执行，副作用状态未知，
+		// 是运维侧定位"卡死"/"歧义"工具调用的关键信号。
+		log.Printf("tool call refused re-execution call_id=%s run=%s node=%s tenant=%s (stale %s)", callID, n.RunID, n.ID, n.TenantID, rec.Status)
+		return "", fmt.Errorf("tool call %s stale %s; refusing re-execution (non-idempotent safety)", callID, rec.Status)
 	default:
 		return "", fmt.Errorf("tool call %s unknown status %q", callID, rec.Status)
 	}
@@ -243,11 +366,19 @@ func (d *Dispatcher) executeToolProviderIdempotent(ctx context.Context, n *model
 
 func (d *Dispatcher) runAndPersistToolProvider(ctx context.Context, n *model.Node, callID string) (string, error) {
 	result, err := d.ToolProvider.CallTool(ctx, contracts.ToolCallRequest{CallID: callID, Name: n.Name, Arguments: n.Input})
-	if err != nil || result.IsError {
-		_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
-		if err != nil {
-			return "", fmt.Errorf("tool %q: %w", n.Name, err)
+	if err != nil {
+		// 区分歧义失败与确定失败：超时/取消/网络中断时远端可能已执行副作用，
+		// 标记 UNKNOWN 阻止盲目重试；其他错误标记 FAILED 允许安全重试。
+		if isAmbiguousFailure(err) {
+			_ = d.ToolStore.MarkToolCallUnknown(ctx, n.TenantID, callID)
+		} else {
+			_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
 		}
+		return "", fmt.Errorf("tool %q: %w", n.Name, err)
+	}
+	if result.IsError {
+		// 工具返回了确定性错误结果（副作用未发生或工具自报错误），标记 FAILED 允许重试。
+		_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
 		return "", fmt.Errorf("tool %q returned error", n.Name)
 	}
 	if err := d.ToolStore.CompleteToolCall(ctx, n.TenantID, callID, result.Output); err != nil {
@@ -283,19 +414,25 @@ func (d *Dispatcher) executeToolIdempotent(ctx context.Context, n *model.Node, t
 			return "", fmt.Errorf("tool call %s not reclaimable", callID)
 		}
 		return d.runAndPersistTool(ctx, n, t, callID)
-	case "RUNNING":
-		// 停滞的进行中调用：副作用状态未知，为非幂等工具安全拒绝盲目重执行。
-		return "", fmt.Errorf("tool call %s stale RUNNING; refusing re-execution (non-idempotent safety)", callID)
+	case "RUNNING", "UNKNOWN":
+		// 停滞 RUNNING 或歧义 UNKNOWN：副作用状态未知，为非幂等工具安全拒绝盲目重执行。
+		log.Printf("tool call refused re-execution call_id=%s run=%s node=%s tenant=%s (stale %s)", callID, n.RunID, n.ID, n.TenantID, rec.Status)
+		return "", fmt.Errorf("tool call %s stale %s; refusing re-execution (non-idempotent safety)", callID, rec.Status)
 	default:
 		return "", fmt.Errorf("tool call %s unknown status %q", callID, rec.Status)
 	}
 }
 
 // runAndPersistTool 执行工具并按结果更新 tool_call 状态。
+// 歧义失败（超时/取消）标记为 UNKNOWN 以阻止盲目重试；确定失败标记为 FAILED 允许重试。
 func (d *Dispatcher) runAndPersistTool(ctx context.Context, n *model.Node, t tool.Tool, callID string) (string, error) {
 	out, err := t.Execute(ctx, n.Input)
 	if err != nil {
-		_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
+		if isAmbiguousFailure(err) {
+			_ = d.ToolStore.MarkToolCallUnknown(ctx, n.TenantID, callID)
+		} else {
+			_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
+		}
 		return "", fmt.Errorf("tool %q: %w", n.Name, err)
 	}
 	if err := d.ToolStore.CompleteToolCall(ctx, n.TenantID, callID, out); err != nil {
@@ -338,7 +475,7 @@ func (d *Dispatcher) StreamLLM(ctx context.Context, n *model.Node) (<-chan contr
 	if d.ModelProvider != nil {
 		msgs := []contracts.Message{{Role: contracts.RoleUser, Content: n.Input}}
 		if d.ContextLoader != nil {
-			hist, err := d.ContextLoader(ctx, n.RunID)
+			hist, err := d.ContextLoader(ctx, n.TenantID, n.RunID)
 			if err != nil {
 				return nil, fmt.Errorf("load context: %w", err)
 			}

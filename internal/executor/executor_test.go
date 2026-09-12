@@ -40,7 +40,7 @@ func TestDispatcher_LLM_PrependsContextHistory(t *testing.T) {
 		got = req.Messages
 		return "ok"
 	}}
-	d := &Dispatcher{LLM: stub, ContextLoader: func(_ context.Context, _ string) ([]llm.Message, error) {
+	d := &Dispatcher{LLM: stub, ContextLoader: func(_ context.Context, _, _ string) ([]llm.Message, error) {
 		return []llm.Message{{Role: llm.RoleAssistant, Content: "prior"}}, nil
 	}}
 	if _, err := d.Execute(context.Background(), &model.Node{Type: model.NodeLLM, Input: "next", RunID: "run-1"}); err != nil {
@@ -53,7 +53,7 @@ func TestDispatcher_LLM_PrependsContextHistory(t *testing.T) {
 
 // TestDispatcher_LLM_ContextLoaderError_Propagates ContextLoader 报错应传播，不静默吞掉。
 func TestDispatcher_LLM_ContextLoaderError_Propagates(t *testing.T) {
-	d := &Dispatcher{LLM: llm.Echo(), ContextLoader: func(_ context.Context, _ string) ([]llm.Message, error) {
+	d := &Dispatcher{LLM: llm.Echo(), ContextLoader: func(_ context.Context, _, _ string) ([]llm.Message, error) {
 		return nil, errors.New("db down")
 	}}
 	_, err := d.Execute(context.Background(), &model.Node{Type: model.NodeLLM, Input: "x", RunID: "r"})
