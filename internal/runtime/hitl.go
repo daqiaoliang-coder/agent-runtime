@@ -79,6 +79,10 @@ func (r *Runtime) Resume(ctx context.Context, tenant, runID, decision string) er
 		}
 	}
 	// 关键日志：Run 从 WAITING_HUMAN 恢复执行，标志人工决策回流到自动流程。
+	// 重新投递的 tasks 覆盖两类中断：护栏触发（节点已 Claim，挂起前为 RUNNING）
+	// 与 policy gateway 触发（ClaimNode 之前中断，节点为 READY）——
+	// InterruptRun 在同一事务内把两种状态的节点都置为 WAITING_HUMAN，
+	// ResumeRun 再统一重新武装，无需再按 run.CurrentNodeID 补一次 MarkReady。
 	log.Printf("run resumed run=%s tenant=%s decision=%q requeued=%d", runID, tenant, decision, len(tasks))
 	return nil
 }

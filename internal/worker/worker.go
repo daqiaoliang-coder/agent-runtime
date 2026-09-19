@@ -13,6 +13,7 @@ import (
 	"agent-runtime/internal/llm"
 	"agent-runtime/internal/middleware"
 	"agent-runtime/internal/model"
+	"agent-runtime/internal/policy"
 	"agent-runtime/internal/providers"
 	"agent-runtime/internal/queue"
 	"agent-runtime/internal/retry"
@@ -41,6 +42,8 @@ type Worker struct {
 	Events        *event.RocketMQ
 	RuntimeEvents event.Sink
 	Exec          executor.Executor
+	Policy        policy.Policy
+	Approval      ApprovalRequester
 	Retry         retry.Policy
 	ID            string
 	// EventChain 在事件离开 Runtime 前做变换（当前用于脱敏），为 nil 时原样发射。
@@ -48,6 +51,12 @@ type Worker struct {
 	// 这一层的必要性高于工具结果脱敏：同一份事件会进 SSE 推给前端、进日志、
 	// 进可观测系统，是敏感信息扩散面最大的地方。工具结果即便在 After 漏了，这里还有一道。
 	EventChain *middleware.EventChain
+}
+
+// ApprovalRequester is intentionally smaller than runtime.Runtime.
+// It keeps worker -> runtime dependency inverted and testable.
+type ApprovalRequester interface {
+	Interrupt(context.Context, string, string, string, string) error
 }
 
 // 人工闸门的归属：worker **不持有**挂起能力，而是由 Guard 在拦截时自行落库
@@ -58,6 +67,8 @@ type Worker struct {
 // 既没执行也没挂起，被 recovery 扫回 READY 重跑，护栏等于没拦住。
 // 先落库再报错，则崩溃后状态一定是 WAITING_HUMAN，语义闭合。
 // worker 侧只负责把这一事实转成 HITL_REQUESTED 事件呈现给人工。
+// （policy gateway 是另一条转人工路径：它在 ClaimNode 之前经 Approval 落库，
+// 节点保持 READY 被同事务挂起，放行后由 ResumeRun 统一重新武装。）
 
 // Handle 处理单个任务，流程：
 //  1. 以任务携带的租户身份读取节点并以租约方式 Claim（CAS），竞争失败则直接返回；
@@ -101,6 +112,51 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		log.Printf("worker=%s skip node run=%s node=%s run_status=%s", w.ID, t.RunID, t.NodeID, run.Status)
 		return nil
 	}
+
+	// Policy gate MUST run before ClaimNode. A step waiting for human approval
+	// therefore remains READY instead of becoming RUNNING and holding a lease.
+	if n.Type == model.NodeTool && w.Policy != nil {
+		decision, err := w.Policy.Evaluate(ctx, policy.Request{
+			TenantID: n.TenantID,
+			RunID:    n.RunID,
+			NodeID:   n.ID,
+			ToolName: n.Name,
+			Input:    n.Input,
+		})
+		if err != nil {
+			return fmt.Errorf("policy evaluate: %w", err)
+		}
+		switch decision.Decision {
+		case policy.Deny:
+			// Deny is a deterministic policy failure. Do not execute and do not
+			// retry it as an infrastructure failure.
+			if _, ferr := w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{
+				ID:          fmt.Sprintf("policy-deny-%s-%d", n.ID, time.Now().UnixNano()),
+				EventType:   "AgentPolicyDenied",
+				AggregateID: n.RunID,
+				Payload: fmt.Sprintf(`{"node_id":%q,"policy_id":%q,"reason":%q}`,
+					n.ID, decision.PolicyID, decision.Reason),
+			}); ferr != nil {
+				return fmt.Errorf("persist policy denial: %w", ferr)
+			}
+			return nil
+		case policy.RequireApproval:
+			if w.Approval == nil {
+				return fmt.Errorf("policy requires approval but approval requester is not configured")
+			}
+			// Durable HITL is a Run-level interrupt in the current runtime.
+			// Because the node has not been claimed yet, Resume can safely
+			// re-queue the same READY node after approval.
+			return w.Approval.Interrupt(
+				ctx,
+				n.TenantID,
+				n.RunID,
+				n.ID,
+				fmt.Sprintf("policy=%s risk=%s reason=%s", decision.PolicyID, decision.Risk, decision.Reason),
+			)
+		}
+	}
+
 	ok, err := w.Store.ClaimNode(ctx, n.TenantID, n.ID, n.Version, w.ID, 30*time.Second)
 	if err != nil {
 		return err
