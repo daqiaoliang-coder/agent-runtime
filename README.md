@@ -117,7 +117,8 @@ agent-runtime/
 │   ├── worker/           # 执行节点
 │   ├── resume/           # 消费完成事件并推进 Run
 │   ├── recovery/         # 租约恢复 / READY 补投递
-│   └── outbox/           # Outbox → RocketMQ
+│   ├── outbox/           # Outbox → RocketMQ
+│   └── memory-indexer/   # 已完成节点 → 向量记忆（写入路径）
 │
 ├── internal/
 │   ├── contracts/        # Runtime 稳定语义契约
@@ -125,7 +126,9 @@ agent-runtime/
 │   ├── adapters/         # 第三方 SDK → Provider
 │   │   ├── llm/
 │   │   ├── tool/
-│   │   └── mcp/
+│   │   ├── mcp/
+│   │   └── vector/       # 向量库（Qdrant）适配器 + 测试用内存实现
+│   ├── memory/           # 记忆写入路径：扫描 → embedding → 投影 → 进度标记
 │   ├── agent/
 │   │   └── react/        # Provider-agnostic ReAct
 │   ├── runtime/          # Run 生命周期 / DAG / Resume / HITL
@@ -147,10 +150,12 @@ agent-runtime/
 │   ├── 005_inbox.sql
 │   ├── 006_llm_usage.sql
 │   ├── 007_hitl.sql
-│   ├── 008_run_cancel.sql
-│   ├── 009_run_limits.sql
-│   ├── 010_run_steps.sql
-│   └── 011_planner_decision.sql
+│   ├── 008_cancel_state.sql
+│   ├── 009_replan.sql
+│   ├── 010_run_limits.sql
+│   ├── 011_planner_decision.sql
+│   ├── 012_run_thread.sql
+│   └── 013_memory_indexed.sql
 │
 └── docs/
     ├── design.md
@@ -266,9 +271,58 @@ Runtime 对外暴露稳定的 Provider Port，具体 SDK 通过 Adapter 接入�
 | `ToolProvider`    | Tool Discovery / Call     |
 | `MCPProvider`     | MCP Tool 接入               |
 | `MemoryProvider`  | Memory Load / Save        |
+| `MemorySearcher`  | 跨 Run 语义召回（可选扩展）     |
 | `PromptProvider`  | Prompt Resolve            |
 | `SkillProvider`   | Skill Discovery / Session |
 | `SandboxProvider` | Sandbox Session / Execute |
+
+### 长期记忆（向量检索）
+
+`MemoryProvider` 的 `Load/Save` 签名稳定但**无法表达相似度召回**（`Load` 不接受查询文本）。
+语义检索因此收敛到可选接口 `MemorySearcher`，调用方用类型断言探测
+（范式同 store 层的 `s.(CancelStore)`）：
+
+```text
+写入路径（cmd/memory-indexer，独立进程）
+  agent_node(SUCCESS) → Embedder → Qdrant
+        └─ memory_indexed 表记录投影进度（INSERT IGNORE 幂等）
+
+读取路径（worker 的 ContextLoader）
+  当前 Run 提问 → Embedder → Qdrant(按 tenant+thread 过滤) → 前置到对话历史
+```
+
+设计要点：
+
+- **向量库是派生索引，不是数据源**：权威内容在 `agent_node.output`，
+  清空 `qdrant_data` 卷 + `memory_indexed` 表即可全量重建。
+- **会话隔离维度是 `agent_run.thread_id`**：ThreadID 为空表示不隔离（存量数据兼容），
+  非空则严格匹配；召回时按 `run_id` 在源头排除当前 Run，避免上下文重复注入。
+- **记忆故障绝不阻断主链路**：embedding 网关或向量库不可用时，
+  读取路径降级为"仅用当前 Run 历史"，写入路径只记日志并退避重试。
+- **重放幂等**：point ID 由 `SHA256(tenant|thread|node|role)` 确定性派生，
+  崩溃重启、节点重试、全量重建都不会产生重复记忆。
+
+相关环境变量（未设置时记忆能力整体关闭，现有部署零感知）：
+
+| 变量                   | 默认值                  | 说明                                    |
+| :------------------- | :------------------- | :------------------------------------ |
+| `MEMORY_ENABLED`     | `false`              | 显式开启后才装配长期记忆                          |
+| `QDRANT_HOST`        | `localhost`          | 向量库地址                                 |
+| `QDRANT_PORT`        | `6334`               | gRPC 端口（**不是** REST 的 6333）           |
+| `QDRANT_COLLECTION`  | `agent_memory`       | 集合名                                   |
+| `QDRANT_API_KEY`     | 空（不鉴权）              | 向量库 API key，服务端开启鉴权时必填                |
+| `EMBEDDING_MODEL`    | `text-embedding-3-small` | 向量化模型，复用 `OPENAI_BASE_URL`/`API_KEY` |
+| `EMBEDDING_DIM`      | `1536`               | 向量维度，须与集合一致                           |
+| `MEMORY_TOP_K`       | `10`                 | 单次召回条数上限                              |
+| `MEMORY_MIN_SCORE`   | `0.7`                | 相似度阈值，0 表示不过滤                         |
+| `MEMORY_SEARCH_TIMEOUT` | `800ms`           | 读取路径单次召回预算                            |
+| `MEMORY_MAX_MESSAGES`   | `20`              | 拼接后交给 LLM 的消息条数上限                     |
+
+索引器额外支持 `MEMORY_SCAN_LIMIT`（默认 `100`，每轮扫描节点数）/ `MEMORY_BATCH_SIZE`
+（默认 `16`，每批节点数，每节点最多产出 2 条文本）/ `MEMORY_BATCH_DELAY`（默认 `500ms`，
+批间限速，保护与主链路共用的 embedding 网关配额）/ `MEMORY_POLL_INTERVAL`（默认 `5s`）/
+`MEMORY_MAX_TEXT_LEN`（默认 `4000`，单条记忆按**字符**截断，避免超长 output 浪费 token）
+（见 `cmd/memory-indexer`）。
 
 ### 为什么要 Provider + Adapter？
 
@@ -888,7 +942,16 @@ mysql -h127.0.0.1 -uagent -pagent < migrations/004_retry_dlq.sql
 mysql -h127.0.0.1 -uagent -pagent < migrations/005_inbox.sql
 mysql -h127.0.0.1 -uagent -pagent < migrations/006_llm_usage.sql
 mysql -h127.0.0.1 -uagent -pagent < migrations/007_hitl.sql
+mysql -h127.0.0.1 -uagent -pagent < migrations/008_cancel_state.sql
+mysql -h127.0.0.1 -uagent -pagent < migrations/009_replan.sql
+mysql -h127.0.0.1 -uagent -pagent < migrations/010_run_limits.sql
+mysql -h127.0.0.1 -uagent -pagent < migrations/011_planner_decision.sql
+mysql -h127.0.0.1 -uagent -pagent < migrations/012_run_thread.sql
+mysql -h127.0.0.1 -uagent -pagent < migrations/013_memory_indexed.sql
 ```
+
+> 012 为 `agent_run` 增加 `thread_id`（长期记忆的会话隔离维度），
+> 013 建立 `memory_indexed`（向量投影进度表）。二者缺失时记忆功能会静默失效。
 
 安装依赖：
 
@@ -906,6 +969,18 @@ go run ./cmd/resume
 go run ./cmd/recovery
 go run ./cmd/runtime
 ```
+
+启用长期记忆时，额外启动记忆索引器（写入路径），并为 worker 设置 `MEMORY_ENABLED=true`：
+
+```bash
+export OPENAI_BASE_URL=https://api.openai.com/v1   # embedding 复用同一网关
+export OPENAI_API_KEY=sk-...
+export MEMORY_ENABLED=true                          # worker 侧读取路径开关
+go run ./cmd/memory-indexer                         # 向量写入路径（独立进程）
+go run ./cmd/worker
+```
+
+未设置 `MEMORY_ENABLED` 时，worker 与索引器都不会触达向量库，行为与接入记忆前一致。
 
 完整数据流：
 
@@ -1011,9 +1086,37 @@ Runtime 的核心可靠性模型：
 
 ## 22. 测试
 
+### 单元测试（默认，不依赖外部服务）
+
 ```bash
 go test ./...
 ```
+
+### 集成测试（需要真实 MySQL / Redis）
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d
+go test -tags=integration ./internal/store/ ./internal/queue/ -v
+```
+
+集成测试使用 `//go:build integration` 标签隔离，不影响默认 `go test ./...`。覆盖关键可靠性不变量：
+
+| 测试 | 验证的不变量 |
+| :--- | :--- |
+| CreateRun + 租户隔离 | 列/参数匹配，跨租户不可读 |
+| UpdateRunCAS | 乐观锁：过期版本 CAS 失败 |
+| InsertPlan + DAG 查询 | 节点写入、依赖就绪检查、Children 查询 |
+| ClaimNode + Lease + RecoverExpired | 租约过期 → 恢复扫描 → ReadyTasks 闭环 |
+| CompleteNodeWithOutbox | 事务 Outbox 原子性（节点 + 事件同事务） |
+| CompleteNodeWithOutbox CAS 失败 | 过期版本提交时 Outbox 回滚 |
+| ToolCall 幂等 | 相同幂等键第二次认领返回 false，结果复用 |
+| ToolCall UNKNOWN | 模糊失败标记 UNKNOWN，不盲目重试 |
+| Inbox 去重 | 消费端幂等 |
+| Decision 持久化与复用 | ReplanRequested 重投不重调 LLM |
+| Run 收敛 | 所有节点终态时正确收敛 |
+| CancelRun 事务原子性 | Run + 节点同事务取消 |
+| Redis Enqueue/Consume | 至少一次投递 + XAck |
+| Redis PEL Reclaim | 失败不 Ack → XAutoClaim 回收 → 重新入队 |
 
 主要覆盖：
 

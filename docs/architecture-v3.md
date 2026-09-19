@@ -17,15 +17,23 @@ Runner
                                +--> Middleware
                                |
                                +--> Providers
-                                      |
-                                      +--> Adapters (Eino/OpenAI/MCP/...)
+                               |      |
+                               |      +--> Adapters (Eino/OpenAI/MCP/...)
+                               |      |
+                               |      +--> Memory --> Vector adapter --> Qdrant
+                               |                              (derived index, rebuildable)
                                |
                                +--> Durable Execution
                                       |
-                                      +--> MySQL
+                                      +--> MySQL   (authoritative: runs/nodes/memory_indexed)
                                       +--> Redis
                                       +--> RocketMQ
 ```
+
+Qdrant sits outside the durability boundary on purpose: it holds a **derived index** over
+content whose authoritative copy is `agent_node.output` in MySQL. It can be dropped and
+fully rebuilt from MySQL plus `memory_indexed`, so a vector-store outage degrades memory
+recall but never fails a run.
 
 ## Three boundaries
 
@@ -37,6 +45,13 @@ Runner
 
 `ModelProvider`, `ToolProvider`, `MemoryProvider`, `PromptProvider`, `MCPProvider`,
 `SkillProvider`, and `SandboxProvider` are stable ports. Concrete SDKs are adapters.
+
+`MemoryProvider` (Load/Save) is complemented by an optional `MemorySearcher` port for
+semantic recall. Callers probe it with a type assertion (`m.(providers.MemorySearcher)`),
+the same pattern used for `CancelStore`/`HITLStore` in the runtime, so the stable
+`MemoryProvider` signature never changes. Vector-backed memory lives in
+`internal/adapters/vector` (Qdrant via `github.com/qdrant/go-client`), with writes
+projected by the standalone `cmd/memory-indexer` process.
 
 ## RuntimeEvent
 

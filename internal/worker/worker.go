@@ -3,20 +3,23 @@
 package worker
 
 import (
+	"agent-runtime/internal/adapters/credential"
 	"agent-runtime/internal/adapters/llm"
 	tooladapter "agent-runtime/internal/adapters/tool"
+	"agent-runtime/internal/adapters/vector"
 	"agent-runtime/internal/contracts"
 	"agent-runtime/internal/event"
 	"agent-runtime/internal/executor"
 	"agent-runtime/internal/llm"
+	"agent-runtime/internal/middleware"
 	"agent-runtime/internal/model"
+	"agent-runtime/internal/providers"
 	"agent-runtime/internal/queue"
 	"agent-runtime/internal/retry"
 	"agent-runtime/internal/store"
 	"agent-runtime/internal/tool"
 	"agent-runtime/internal/trace"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +29,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // Worker 是单个任务执行器实例。
@@ -39,7 +43,21 @@ type Worker struct {
 	Exec          executor.Executor
 	Retry         retry.Policy
 	ID            string
+	// EventChain 在事件离开 Runtime 前做变换（当前用于脱敏），为 nil 时原样发射。
+	//
+	// 这一层的必要性高于工具结果脱敏：同一份事件会进 SSE 推给前端、进日志、
+	// 进可观测系统，是敏感信息扩散面最大的地方。工具结果即便在 After 漏了，这里还有一道。
+	EventChain *middleware.EventChain
 }
+
+// 人工闸门的归属：worker **不持有**挂起能力，而是由 Guard 在拦截时自行落库
+// （装配见 security.go 的 newGuard），随后才向 worker 抛出 ErrAwaitingApproval。
+//
+// 这个顺序是刻意的。若反过来 —— Guard 只报错、由 worker 去挂起 ——
+// 那么"检测到中危"与"Run 已冻结"之间存在一个窗口：窗口内崩溃会让节点
+// 既没执行也没挂起，被 recovery 扫回 READY 重跑，护栏等于没拦住。
+// 先落库再报错，则崩溃后状态一定是 WAITING_HUMAN，语义闭合。
+// worker 侧只负责把这一事实转成 HITL_REQUESTED 事件呈现给人工。
 
 // Handle 处理单个任务，流程：
 //  1. 以任务携带的租户身份读取节点并以租约方式 Claim（CAS），竞争失败则直接返回；
@@ -138,14 +156,46 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		}
 	}
 
+	// 注入执行上下文：Executor 接口只认节点不认身份，而防护链的每一次拦截
+	// 都需要租户维度做审计、需要节点标识做人工闸门锚点。走 ctx 传递而非改接口，
+	// 避免波及全部 Executor 实现（详见 contracts/context.go 的取舍说明）。
+	// UserID 目前只能为空：agent_run / agent_node 均未持久化发起者用户，
+	// 该字段要等接入认证层（Lifecycle.OnRunStart 校验凭证）后才有可靠来源。
+	ctx = contracts.WithExecutionContext(ctx, contracts.ExecutionContext{
+		TenantID: n.TenantID,
+		ThreadID: run.ThreadID,
+		RunID:    n.RunID,
+		NodeID:   n.ID,
+		TraceID:  oteltrace.SpanContextFromContext(ctx).TraceID().String(),
+	})
+
 	// 执行节点：替换原先的占位字符串拼接，真正发起 LLM 推理或工具调用。
 	output, execErr := w.Exec.Execute(ctx, n)
 	if execErr != nil {
+		// 护栏转人工：Approver 已在拦截时把 Run 与节点一并挂起（WAITING_HUMAN），
+		// 此处**不得**再动节点状态 —— 任何 Fail/Retry/Complete 都会覆盖挂起态，
+		// 要么让节点被重试策略反复重跑（审批形同虚设），要么把等待人工变成终态失败。
+		// 直接 ack 任务：Run 已冻结，人工放行后由 ResumeRun 重新投递该节点。
+		if errors.Is(execErr, middleware.ErrAwaitingApproval) {
+			log.Printf("node awaiting human approval run=%s node=%s tenant=%s tool=%s", n.RunID, n.ID, n.TenantID, n.Name)
+			w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
+				ID: fmt.Sprintf("runtime-event-%s-hitl-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
+				Type: contracts.EventHITLRequested, Timestamp: time.Now(),
+				// 只放原因不放工具入参：入参可能正是攻击载荷，
+				// 事件会进 SSE 与日志，抄进去等于二次扩散。
+				Data: map[string]any{"reason": execErr.Error(), "tool": n.Name, "attempt": n.Attempt},
+			})
+			return nil
+		}
 		// 在 span 上记录执行错误，便于在追踪系统中按错误维度检索失败轨迹。
 		span.RecordError(execErr)
 		span.SetStatus(codes.Error, execErr.Error())
 		next := n.Attempt + 1
-		if w.Retry.ShouldRetry(next) {
+		// 护栏拒绝（高危载荷，或中危但未装配人工闸门而 fail-closed）不可重试。
+		// 重试同样的入参只会命中同样的规则：既浪费重试预算，
+		// 又让 DLQ 里堆满重复的安全告警，淹没真正需要关注的故障。
+		blocked := errors.Is(execErr, middleware.ErrBlocked)
+		if !blocked && w.Retry.ShouldRetry(next) {
 			// 仍可重试：指数退避，置回 READY 并安排 ready_at，ack 任务。
 			// recovery 的 ReadyTasks 扫描会在 ready_at 到期后补投递，实现真正的退避重试。
 			readyAt := time.Now().Add(w.Retry.Backoff(next))
@@ -181,7 +231,9 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	// 节点仍标记 SUCCESS（决策本身执行成功），仅事件类型不同，驱动 Resumer 走续规路径。
 	eventType := "AgentStepCompleted"
 	if n.Type == model.NodeReflect {
-		var decision struct{ Action string `json:"action"` }
+		var decision struct {
+			Action string `json:"action"`
+		}
 		if jerr := json.Unmarshal([]byte(output), &decision); jerr == nil && decision.Action == "replan" {
 			eventType = "ReplanRequested"
 		}
@@ -204,10 +256,29 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	return nil
 }
 
+// emitRuntimeEvent 发射运行时事件，发射前经 EventChain 变换（当前为脱敏）。
+//
+// 这是敏感信息扩散面最大的一道出口：同一份事件会进 SSE 推给前端、进日志、
+// 进可观测系统。工具结果即便在 Tool.After 漏了脱敏，这里还有一道兜底，
+// 因此两层叠加要求 Redact 幂等（其占位符不满足任何规则的结构约束，正是为此设计）。
+//
+// 变换失败时**仍然发射原事件**而不是丢弃：事件流是 Run 的可观测主干，
+// 因为脱敏环节出错就丢弃全部事件，会让整个 Run 变成黑盒 ——
+// 排障能力丢失的代价远大于单点泄露风险。降级行为记日志以便发现。
 func (w *Worker) emitRuntimeEvent(ctx context.Context, ev contracts.RuntimeEvent) {
-	if w.RuntimeEvents != nil {
-		_ = w.RuntimeEvents.Emit(ctx, ev)
+	if w.RuntimeEvents == nil {
+		return
 	}
+	if w.EventChain != nil {
+		transformed, terr := w.EventChain.Transform(ctx, ev)
+		if terr != nil {
+			log.Printf("warn: event transform failed run=%s node=%s type=%s: %v (emitting untransformed)",
+				ev.RunID, ev.NodeID, ev.Type, terr)
+		} else {
+			ev = transformed
+		}
+	}
+	_ = w.RuntimeEvents.Emit(ctx, ev)
 }
 
 // NewFromEnv 从环境变量 WORKER_ID 读取标识，缺省时按时间戳生成。
@@ -221,10 +292,19 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	tools := tool.NewRegistry()
 	tools.Register(tool.Search{})
 	tools.Register(tool.Calculator{})
+	// 密钥一律经托管层获取，不再直接 os.Getenv 后塞进结构体字段。
+	// 这是"透明替换"的落地点：上层只持有 CredentialProvider，
+	// 换成 FileProvider（Vault/KMS sidecar 周期性覆写文件）时 worker 一行都不用改，
+	// 轮转由托管设施驱动、进程无需重启。为何不包缓存见 credentials.go 的取舍说明。
+	creds := newCredentialsFromEnv()
 	var client llm.Client = llm.Echo()
 	if base := os.Getenv("OPENAI_BASE_URL"); base != "" {
-		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
-			client = llm.NewOpenAIClient(base, key)
+		// 托管层取不到凭证时降级为 Stub：此时发起真实请求只会换来网关 401，
+		// 把排查方向从"密钥没配"误导到"密钥无效"。降级则行为与未配置网关时一致。
+		if _, cerr := creds.Credential(context.Background(), contracts.CredentialPurposeChat); cerr == nil {
+			client = llm.NewOpenAIClientWithCredentials(base, creds, contracts.CredentialPurposeChat)
+		} else {
+			log.Printf("worker: no chat credential available, falling back to stub LLM: %v", cerr)
 		}
 	}
 	// ToolStore=s 使 TOOL 节点经 tool_call 表保证幂等（SUCCESS 复用、崩溃在途拒绝重执行）。
@@ -234,24 +314,78 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	// ContextLoader 从已提交的 SUCCESS 节点派生对话历史（按完成时间排序），
 	// 避免对 checkpoint 做读改写导致的并行节点竞态。上下文以已提交状态为事实，
 	// 无需额外的累积写入——崩溃恢复后也能从持久化的节点输出重建完整上下文。
-	disp.ContextLoader = func(ctx context.Context, tenant, runID string) ([]llm.Message, error) {
-		nodes, err := s.CompletedNodes(ctx, tenant, runID)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, nil
-			}
-			return nil, err
-		}
-		msgs := make([]llm.Message, 0, len(nodes)*2)
-		for _, n := range nodes {
-			msgs = append(msgs,
-				llm.Message{Role: llm.RoleUser, Content: n.Input},
-				llm.Message{Role: llm.RoleAssistant, Content: n.Output},
-			)
-		}
-		return msgs, nil
+	//
+	// 在此之上追加**跨 Run 语义记忆**：同一 ThreadID 下的历史 Run 内容会被召回并前置，
+	// 使 Agent 跨 Run 保持连续。记忆未启用或检索失败时，行为与接入前完全一致
+	// （只用当前 Run 历史）——记忆是增强项，绝不阻断节点执行。详见 memory.go。
+	disp.ContextLoader = newContextLoader(s, newMemoryOptionsFromEnv(creds))
+
+	// 安全中间件装配：不可信输入防护挂在工具调用前，数据脱敏同时挂在
+	// 工具结果回传与事件出域两处。人工闸门的落库能力在 newSecurityBundle 内部
+	// 已交给护栏持有，worker 侧不需要再拿一份。
+	sec := newSecurityBundle(s, q, creds)
+	disp.ToolChain = sec.ToolChain
+	return &Worker{Store: s, Queue: q, Events: r, ID: id, Retry: retry.Default(), Exec: disp, EventChain: sec.EventChain}
+}
+
+// newMemoryOptionsFromEnv 按环境变量装配读取路径的记忆能力。
+//
+// 装配条件是"三者齐备"：MEMORY_ENABLED 显式开启、向量库地址可达配置、
+// 托管层能取到 embedding 凭证。任一缺失即返回 Memory=nil，
+// 使 ContextLoader 退化为接入前的行为——**现有部署与测试零感知**。
+//
+// 刻意不在此处 log.Fatal：记忆是可选增强，配置不全时应当降级运行，
+// 而不是让整个 worker 起不来。
+func newMemoryOptionsFromEnv(creds contracts.CredentialProvider) MemoryOptions {
+	if !envBool("MEMORY_ENABLED", false) {
+		return MemoryOptions{}
 	}
-	return &Worker{Store: s, Queue: q, Events: r, ID: id, Retry: retry.Default(), Exec: disp}
+	// 探测 embedding 凭证是否可用。这里只看"取不取得到"，不取明文 ——
+	// 明文由 embedder 在每次请求时经 port 现取，密钥不进本函数的任何变量。
+	if _, err := creds.Credential(context.Background(), contracts.CredentialPurposeEmbedding); err != nil {
+		// 没有 embedding 能力就无法做语义召回。此处静默降级：
+		// 主链路的对话补全可能走 Stub，但记忆需要真实向量，二者要求不同。
+		log.Printf("worker: MEMORY_ENABLED but no embedding credential; long-term memory disabled: %v", err)
+		return MemoryOptions{}
+	}
+	// embedding 复用与对话推理相同的网关配置，仅模型名与超时独立可调。
+	// 走 WithCredentials 构造，密钥不进入结构体字段。
+	embedder := llm.NewOpenAIEmbedderWithCredentials(
+		envString("OPENAI_BASE_URL", ""),
+		envString("EMBEDDING_MODEL", "text-embedding-3-small"),
+		creds,
+		contracts.CredentialPurposeEmbedding,
+	)
+	// 向量库 SDK 只接受 string 型 apiKey，无法接 port，因此走托管层的降级出口：
+	// 明文短暂存在于局部变量，但不再由 os.Getenv 散落各处，
+	// 换托管设施（文件 / Vault）时此处一行都不用改。
+	// 这是 credential.Value 文档中说明的唯一正当用法。
+	vs, err := vector.NewQdrant(
+		envString("QDRANT_HOST", "localhost"),
+		envInt("QDRANT_PORT", 6334),
+		credential.Value(context.Background(), creds, contracts.CredentialPurposeVectorDB),
+	)
+	if err != nil {
+		// 连接失败只降级、不致命：向量库可能稍后才就绪，
+		// 而 worker 必须能起来处理节点（记忆缺失只是少了增强）。
+		log.Printf("worker: qdrant unavailable, long-term memory disabled: %v", err)
+		return MemoryOptions{}
+	}
+
+	m := &providers.VectorMemory{
+		Embedder:   embedder,
+		Store:      vs,
+		Collection: envString("QDRANT_COLLECTION", providers.DefaultMemoryCollection),
+		TopK:       envInt("MEMORY_TOP_K", providers.DefaultMemoryTopK),
+		MinScore:   envFloat32("MEMORY_MIN_SCORE", providers.DefaultMemoryMinScore),
+	}
+	log.Printf("worker: long-term memory enabled collection=%s top_k=%d min_score=%.2f timeout=%s",
+		m.Collection, m.TopK, m.MinScore, envDuration("MEMORY_SEARCH_TIMEOUT", DefaultMemorySearchTimeout))
+	return MemoryOptions{
+		Memory:        m,
+		SearchTimeout: envDuration("MEMORY_SEARCH_TIMEOUT", DefaultMemorySearchTimeout),
+		MaxMessages:   envInt("MEMORY_MAX_MESSAGES", DefaultMaxMemoryMessages),
+	}
 }
 
 // modelPrices 按模型名记录每百万 token 的单价（美元），prompt 在前、completion 在后。

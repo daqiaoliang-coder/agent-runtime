@@ -33,16 +33,17 @@ func New(ctx context.Context, dsn string) (*MySQL, error) {
 }
 func (s *MySQL) Close() { _ = s.DB.Close() }
 
-// CreateRun 插入一条 Run 记录，初始状态为 PENDING。租户由 r.TenantID 携带。
+// CreateRun 插入一条 Run 记录，初始状态为 PENDING。租户由 r.TenantID 携带，
+// 会话维度由 r.ThreadID 携带（空串表示无会话隔离）。
 func (s *MySQL) CreateRun(ctx context.Context, r *model.Run) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO agent_run(run_id,tenant_id,agent_id,status,version,input,max_steps,max_rounds,max_tokens) VALUES(?,?,?,?,?,?,?,?,?)`, r.ID, r.TenantID, r.AgentID, r.Status, r.Version, r.Input, r.MaxSteps, r.MaxRounds, r.MaxTokens)
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO agent_run(run_id,tenant_id,thread_id,agent_id,status,version,input,max_steps,max_rounds,max_tokens) VALUES(?,?,?,?,?,?,?,?,?,?)`, r.ID, r.TenantID, r.ThreadID, r.AgentID, r.Status, r.Version, r.Input, r.MaxSteps, r.MaxRounds, r.MaxTokens)
 	return err
 }
 
 // GetRun 按 tenant + run_id 读取 Run，租户不匹配则返回 sql.ErrNoRows。
 func (s *MySQL) GetRun(ctx context.Context, tenant, id string) (*model.Run, error) {
 	r := &model.Run{}
-	err := s.DB.QueryRowContext(ctx, `SELECT run_id,tenant_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,max_rounds,max_tokens,created_at,updated_at FROM agent_run WHERE run_id=? AND tenant_id=?`, id, tenant).Scan(&r.ID, &r.TenantID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.MaxRounds, &r.MaxTokens, &r.CreatedAt, &r.UpdatedAt)
+	err := s.DB.QueryRowContext(ctx, `SELECT run_id,tenant_id,thread_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,max_rounds,max_tokens,created_at,updated_at FROM agent_run WHERE run_id=? AND tenant_id=?`, id, tenant).Scan(&r.ID, &r.TenantID, &r.ThreadID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.MaxRounds, &r.MaxTokens, &r.CreatedAt, &r.UpdatedAt)
 	return r, err
 }
 
@@ -555,8 +556,16 @@ func (s *MySQL) GetDecision(ctx context.Context, runID, tenant, triggerNodeID st
 
 var ErrNotFound = errors.New("not found")
 
-// InterruptRun atomically creates the human approval record and moves the Run into
-// WAITING_HUMAN. This is the durable equivalent of an in-memory blocking channel.
+// InterruptRun atomically creates the human approval record, moves the Run into
+// WAITING_HUMAN, and suspends the triggering node.
+// This is the durable equivalent of an in-memory blocking channel.
+//
+// 节点必须与 Run 在**同一事务**内挂起，这是护栏接入后的硬约束：
+// 只切 Run 不切节点的话，节点仍停在 RUNNING 且租约会过期，
+// recovery 的 RecoverExpired 会把它重置回 READY 重新投递 —— 于是"人工还没批，
+// 节点又被跑了一遍"，护栏形同虚设。置为 WAITING_HUMAN 后，
+// ClaimNode 的 status IN (PENDING,READY) 与 RecoverExpired 的 status=RUNNING
+// 都捞不到它，节点被真正冻住直到人工放行。
 func (s *MySQL) InterruptRun(ctx context.Context, tenant, runID, nodeID, reason string, version int64) (bool, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -575,34 +584,106 @@ func (s *MySQL) InterruptRun(ctx context.Context, tenant, runID, nodeID, reason 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO run_interrupt(interrupt_id,run_id,tenant_id,node_id,reason,status) VALUES(?,?,?,?,?,'WAITING')`, id, runID, tenant, nodeID, reason); err != nil {
 		return false, err
 	}
+	// 挂起触发节点并释放租约。nodeID 为空时跳过：Run 级中断（非护栏触发）
+	// 没有具体节点可挂，此时行为与改动前一致。
+	// 不校验受影响行数：节点可能已处于终态（如并发失败），此时挂起无意义，
+	// 但 Run 已进入 WAITING_HUMAN，人工放行后由状态机自行收敛，不该让整个中断失败。
+	if nodeID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,lease_owner=NULL,lease_until=NULL,version=version+1 WHERE node_id=? AND tenant_id=? AND status IN (?,?)`,
+			model.NodeWaitingHuman, nodeID, tenant, model.NodeRunning, model.NodeReady); err != nil {
+			return false, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-// ResumeRun atomically resolves the interrupt and moves the Run back to RUNNING.
-func (s *MySQL) ResumeRun(ctx context.Context, tenant, runID, decision string, version int64) (bool, error) {
+// ResumeRun atomically resolves the interrupt, moves the Run back to RUNNING,
+// and re-arms the suspended node for dispatch.
+//
+// 返回值多了 tasks：调用方需要把重新就绪的节点投递到队列。
+// 重新调度必须与状态切换同事务，否则存在一个致命窗口 ——
+// Run 已 RUNNING 但节点仍 WAITING_HUMAN，此时进程崩溃，
+// ReadyTasks 只捞 READY、RecoverExpired 只捞 RUNNING，两边都捞不到它，
+// 该 Run 永久卡死且无任何告警。同事务提交后，即使入队失败，
+// recovery 的 ReadyTasks 扫描也会补投递，链路仍然收敛。
+func (s *MySQL) ResumeRun(ctx context.Context, tenant, runID, decision string, version int64) (bool, []model.Task, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	defer tx.Rollback()
+	// 先读出待恢复的节点：必须在 UPDATE run_interrupt 之前查，
+	// 否则状态被改成 RESOLVED 后就再也定位不到该恢复哪个节点了。
+	rows, err := tx.QueryContext(ctx, `SELECT node_id FROM run_interrupt WHERE run_id=? AND tenant_id=? AND status='WAITING' AND node_id IS NOT NULL AND node_id<>''`, runID, tenant)
+	if err != nil {
+		return false, nil, err
+	}
+	var nodeIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return false, nil, err
+		}
+		nodeIDs = append(nodeIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return false, nil, err
+	}
+	rows.Close()
+
 	res, err := tx.ExecContext(ctx, `UPDATE agent_run SET status=?,output=?,version=version+1,updated_at=NOW(6) WHERE run_id=? AND tenant_id=? AND version=? AND status=?`, model.RunRunning, decision, runID, tenant, version, model.RunWaitingHuman)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	n, err := res.RowsAffected()
 	if err != nil || n != 1 {
-		return false, err
+		return false, nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE run_interrupt SET status='RESOLVED',decision=?,resolved_at=NOW(6) WHERE run_id=? AND tenant_id=? AND status='WAITING'`, decision, runID, tenant); err != nil {
-		return false, err
+		return false, nil, err
+	}
+
+	// 把挂起节点重新武装为 READY 并清空 ready_at，使其立即可被 ReadyTasks 捞取。
+	// attempt 不自增：这是"人工放行后的首次执行"，不是失败重试，
+	// 自增会白白吃掉一次重试预算，而护栏拦截恰恰是需要人看完再决定的场景。
+	var tasks []model.Task
+	for _, id := range nodeIDs {
+		r, uerr := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,ready_at=NULL,lease_owner=NULL,lease_until=NULL,version=version+1 WHERE node_id=? AND tenant_id=? AND status=?`,
+			model.NodeReady, id, tenant, model.NodeWaitingHuman)
+		if uerr != nil {
+			return false, nil, uerr
+		}
+		if aff, aerr := r.RowsAffected(); aerr == nil && aff == 1 {
+			tasks = append(tasks, model.Task{RunID: runID, NodeID: id, TenantID: tenant})
+		}
 	}
 	if err := tx.Commit(); err != nil {
+		return false, nil, err
+	}
+	return true, tasks, nil
+}
+
+// HasResolvedApproval 报告某节点是否已获人工放行（存在 RESOLVED 的审批记录）。
+//
+// 供护栏的 Bypass 判定使用：人工放行后节点被重新调度，
+// 若不查这个状态，同样的入参会再次命中同一条规则并再次转人工，
+// 审批永远收敛不了。判定收窄到 (tenant, run, node) 三元组，
+// 不做跨节点或跨 Run 的豁免 —— 一次放行只解一次锁。
+func (s *MySQL) HasResolvedApproval(ctx context.Context, tenant, runID, nodeID string) (bool, error) {
+	if nodeID == "" {
+		return false, nil
+	}
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_interrupt WHERE tenant_id=? AND run_id=? AND node_id=? AND status='RESOLVED'`, tenant, runID, nodeID).Scan(&n)
+	if err != nil {
 		return false, err
 	}
-	return true, nil
+	return n > 0, nil
 }
 
 // CancelRun 在单事务中将 Run 从 RUNNING 切换到 CANCEL_REQUESTED，同时把该 Run 下
@@ -633,7 +714,7 @@ func (s *MySQL) CancelRun(ctx context.Context, tenant, runID, reason string, ver
 // 收敛：取消遗留的 PENDING/READY 节点，并在全部节点终态时 CAS 到 CANCELLED。
 // 系统级扫描（不限定租户），返回的 Run 携带 tenant_id 以便后续操作做租户隔离。
 func (s *MySQL) CancelRequestedRuns(ctx context.Context, limit int) ([]model.Run, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT run_id,tenant_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,max_rounds,max_tokens,created_at,updated_at FROM agent_run WHERE status=? LIMIT ?`, model.RunCancelRequested, limit)
+	rows, err := s.DB.QueryContext(ctx, `SELECT run_id,tenant_id,thread_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,max_rounds,max_tokens,created_at,updated_at FROM agent_run WHERE status=? LIMIT ?`, model.RunCancelRequested, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -641,7 +722,7 @@ func (s *MySQL) CancelRequestedRuns(ctx context.Context, limit int) ([]model.Run
 	var out []model.Run
 	for rows.Next() {
 		var r model.Run
-		if err := rows.Scan(&r.ID, &r.TenantID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.MaxRounds, &r.MaxTokens, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.TenantID, &r.ThreadID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.MaxRounds, &r.MaxTokens, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -670,4 +751,67 @@ func (s *MySQL) CancelNode(ctx context.Context, tenant, id string, version int64
 	}
 	n, _ := res.RowsAffected()
 	return n == 1, nil
+}
+
+// UnindexedSuccessNodes 扫描已成功完成但尚未投影为记忆的节点，供 cmd/memory-indexer 增量处理。
+//
+// 只取 LLM 节点：
+//   - TOOL 节点的 output 是工具原始返回（体积大、噪声多、常含结构化 JSON），
+//     向量化后既占空间又会在召回时污染对话上下文；
+//   - REFLECT 节点的 output 是机器决策 JSON（{"action":"replan","reason":...}），
+//     面向调度器而非对话，同样不适合作为记忆内容。
+//
+// thread_id 通过 JOIN agent_run 取得——它是 Run 级属性，节点继承所属 Run 的会话身份，
+// 因此不必在最热的 agent_node 表上加列。
+//
+// 未使用 FOR UPDATE SKIP LOCKED（区别于 ClaimOutbox）：投影是**幂等**的
+// （确定性 point ID + 下方 MarkMemoryIndexed 的 INSERT IGNORE），
+// 多实例重复处理只是浪费 embedding 调用，不会产生错误或重复数据。
+// P0 按单实例部署；若需多实例并行提速，可在此加行锁，但需同时评估 embedding 网关限流。
+//
+// 按 finished_at 正序：先完成先投影，使记忆的时间顺序与真实对话顺序一致。
+func (s *MySQL) UnindexedSuccessNodes(ctx context.Context, limit int) ([]model.MemoryNode, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT n.node_id, n.tenant_id, COALESCE(r.thread_id,''), n.run_id, n.type, n.name,
+		       COALESCE(n.input,''), COALESCE(n.output,''), COALESCE(n.finished_at, n.created_at)
+		FROM agent_node n
+		JOIN agent_run r ON r.run_id = n.run_id AND r.tenant_id = n.tenant_id
+		LEFT JOIN memory_indexed mi ON mi.node_id = n.node_id
+		WHERE n.status = ? AND n.type = ? AND mi.node_id IS NULL
+		ORDER BY n.finished_at, n.node_id
+		LIMIT ?`,
+		model.NodeSuccess, model.NodeLLM, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.MemoryNode
+	for rows.Next() {
+		var m model.MemoryNode
+		if err := rows.Scan(&m.NodeID, &m.TenantID, &m.ThreadID, &m.RunID, &m.Type, &m.Name, &m.Input, &m.Output, &m.FinishedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// MarkMemoryIndexed 记录某节点已完成向量投影。INSERT IGNORE 保证幂等：
+// 重复标记（崩溃重启后重扫同一批节点）不会报错也不会产生重复行。
+//
+// 必须在向量**确认写入之后**才调用：若顺序颠倒，崩溃会让进度表领先于实际数据，
+// 该节点此后永远不会被重新扫描，记忆静默丢失。
+func (s *MySQL) MarkMemoryIndexed(ctx context.Context, tenant, nodeID, threadID, runID string) error {
+	_, err := s.DB.ExecContext(ctx,
+		`INSERT IGNORE INTO memory_indexed(node_id,tenant_id,thread_id,run_id) VALUES(?,?,?,?)`,
+		nodeID, tenant, threadID, runID)
+	return err
+}
+
+// CountMemoryIndexed 统计已投影的节点数，用于运维核对
+// "向量库点数 vs 进度表行数"是否一致（幂等性验证）。
+func (s *MySQL) CountMemoryIndexed(ctx context.Context) (int, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM memory_indexed`).Scan(&n)
+	return n, err
 }

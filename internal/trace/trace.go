@@ -18,7 +18,12 @@ import (
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	// semconv 版本必须与 otel/sdk 的 resource.Default() 一致（当前 v1.43.0）。
+	// 二者不一致时 resource.Merge 会因 Schema URL 冲突而失败，
+	// 于是所有调用 trace.Init 的进程都会静默退化为 no-op 追踪——
+	// 现象是启动日志出现 "trace init skipped: ... conflicting Schema URL"，
+	// 且全链路 span 一个都不上报。升级 otel/sdk 时需同步升级此导入。
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 )
 

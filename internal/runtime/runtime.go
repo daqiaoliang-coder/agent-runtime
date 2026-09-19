@@ -30,10 +30,13 @@ type Runtime struct {
 //  3. 将无依赖的根节点标记为 READY 并投递到 Redis 队列；
 //  4. 通过 CAS 将 Run 状态从 PENDING 切换为 RUNNING，保证并发安全。
 //
+// threadID 标识会话维度：同一 Thread 下的多个 Run 共享长期记忆（见 providers.MemorySearcher）。
+// 传空串表示无会话隔离，记忆检索将跳过 thread_id 过滤。
+//
 // 所有落库与入队操作均携带租户身份（run.TenantID），保证后续跨进程链路可做租户隔离。
-func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input string) (*model.Run, error) {
+func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input, threadID string) (*model.Run, error) {
 	id := fmt.Sprintf("run-%d", time.Now().UnixNano())
-	run := &model.Run{ID: id, TenantID: tenant, AgentID: agent, Status: model.RunPending, Input: input, MaxSteps: 50, MaxRounds: 10, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	run := &model.Run{ID: id, TenantID: tenant, ThreadID: threadID, AgentID: agent, Status: model.RunPending, Input: input, MaxSteps: 50, MaxRounds: 10, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	if err := r.Store.CreateRun(ctx, run); err != nil {
 		return nil, err
 	}

@@ -43,17 +43,19 @@ const (
 
 // Run 是一次完整的 Agent 运行记录，对应 agent_run 表。
 // Version 用于乐观锁（CAS），避免并发更新覆盖。
+// ThreadID 标识会话维度：同一 Thread 下的多个 Run 共享长期记忆，
+// 空串表示无会话隔离（存量数据默认值），检索时跳过 thread_id 过滤。
 // MaxSteps 限制 DAG 节点总数（含多轮 Plan 追加的节点），防止 Planner 死循环。
 // MaxRounds 限制多轮 Plan 的续规轮次上限，0 表示不限制。
 // MaxTokens 限制 Run 累计 LLM token 消耗上限，0 表示不限制。
 type Run struct {
-	ID, TenantID, AgentID        string
-	Status                       RunStatus
-	Version                      int64
-	Input, Output, CurrentNodeID string
-	MaxSteps, Steps              int
-	MaxRounds, MaxTokens         int
-	CreatedAt, UpdatedAt         time.Time
+	ID, TenantID, ThreadID, AgentID string
+	Status                          RunStatus
+	Version                         int64
+	Input, Output, CurrentNodeID    string
+	MaxSteps, Steps                 int
+	MaxRounds, MaxTokens            int
+	CreatedAt, UpdatedAt            time.Time
 }
 
 // Node 是 DAG 中的一个执行节点，对应 agent_node 表。
@@ -138,4 +140,23 @@ type LLMUsage struct {
 	PromptTokens, CompletionTokens     int
 	TotalTokens                        int
 	Cost                               float64
+}
+
+// MemoryNode 是记忆索引器的投影候选：一个已成功完成、尚未投影为向量的节点。
+//
+// ThreadID 来自 agent_run（通过 JOIN 取得）而非 agent_node——ThreadID 是 Run 级属性，
+// 节点继承所属 Run 的会话身份，因此无需在最热的 agent_node 表上加列。
+//
+// Input/Output 是待向量化的文本来源；Type 用于决定把哪一段作为记忆内容
+// （见 cmd/memory-indexer 的取值策略）。
+type MemoryNode struct {
+	NodeID     string
+	TenantID   string
+	ThreadID   string
+	RunID      string
+	Type       NodeType
+	Name       string
+	Input      string
+	Output     string
+	FinishedAt time.Time
 }

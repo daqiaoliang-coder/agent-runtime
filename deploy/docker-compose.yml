@@ -31,6 +31,26 @@ services:
     command: sh mqbroker -n namesrv:9876 -c /home/rocketmq/rocketmq-5.3.3/conf/broker.conf
     ports: ["10909:10909", "10911:10911"]
 
+  # 长期记忆的向量索引存储。仅承载派生数据（权威内容在 MySQL 的 agent_node.output），
+  # 因此清空 qdrant_data 卷 + memory_indexed 表即可触发全量重建，不存在数据丢失风险。
+  #
+  # 版本说明：服务端用 v1.19.1（qdrant/qdrant 的发布版本），
+  # 与 go.mod 中的客户端 github.com/qdrant/go-client v1.19.2 属于同一 1.19.x 兼容线——
+  # 两者的补丁号**并不同步**，不要照抄客户端版本号，否则镜像拉取会失败。
+  #
+  # 端口约定：6333 是 REST/Web UI（浏览器打开 http://localhost:6333/dashboard 可查看集合），
+  # 6334 是 gRPC——Go 客户端走的是 gRPC，QDRANT_PORT 必须填 6334，
+  # 填成 6333 会得到难以理解的连接错误。
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    container_name: agent-runtime-qdrant
+    environment:
+      # 显式绑定 gRPC 端口，避免依赖镜像默认值随版本变化。
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    ports: ["6333:6333", "6334:6334"]
+    volumes: ["qdrant_data:/qdrant/storage"]
+
 volumes:
   mysql_data:
   redis_data:
+  qdrant_data:

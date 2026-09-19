@@ -9,9 +9,14 @@ import (
 
 // HITLStore keeps the interrupt record and Run state transition in one transaction.
 // This prevents a crash from leaving WAITING_HUMAN without a durable interrupt record.
+//
+// ResumeRun 返回被重新武装为 READY 的节点，调用方必须投递到队列。
+// 少这一步的后果是 Run 回到 RUNNING 但没有任何节点在跑：
+// ReadyTasks 会捞到它们，但要等下一次 recovery 扫描周期，
+// 期间整个 Run 表现为"恢复了却没动"，是最难排查的一类卡死。
 type HITLStore interface {
 	InterruptRun(context.Context, string, string, string, string, int64) (bool, error)
-	ResumeRun(context.Context, string, string, string, int64) (bool, error)
+	ResumeRun(context.Context, string, string, string, int64) (bool, []model.Task, error)
 }
 
 // Interrupt 在指定节点处中断运行中的 Run：通过 CAS 把 Run 状态从 RUNNING 切到
@@ -55,14 +60,25 @@ func (r *Runtime) Resume(ctx context.Context, tenant, runID, decision string) er
 	if run.Status != model.RunWaitingHuman {
 		return fmt.Errorf("run %s is not waiting for human: %s", runID, run.Status)
 	}
-	ok, err = h.ResumeRun(ctx, tenant, runID, decision, run.Version)
+	ok, tasks, err := h.ResumeRun(ctx, tenant, runID, decision, run.Version)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return fmt.Errorf("run %s changed while resuming", runID)
 	}
+	// 把重新就绪的节点投递出去，否则 Run 回到 RUNNING 却没有节点在跑。
+	// 入队失败不视为致命：节点状态已是 READY，recovery 的 ReadyTasks 扫描
+	// 会在下一周期补投递，链路仍能收敛 —— 而把整个 Resume 判失败会让
+	// 人工决策看起来"没生效"，运维会反复点确认，反而制造重复恢复。
+	for _, t := range tasks {
+		if r.Queue != nil {
+			if qerr := r.Queue.Enqueue(ctx, t); qerr != nil {
+				log.Printf("warn: re-enqueue after resume failed run=%s node=%s: %v (recovery scan will retry)", runID, t.NodeID, qerr)
+			}
+		}
+	}
 	// 关键日志：Run 从 WAITING_HUMAN 恢复执行，标志人工决策回流到自动流程。
-	log.Printf("run resumed run=%s tenant=%s decision=%q", runID, tenant, decision)
+	log.Printf("run resumed run=%s tenant=%s decision=%q requeued=%d", runID, tenant, decision, len(tasks))
 	return nil
 }

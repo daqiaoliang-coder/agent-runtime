@@ -92,11 +92,19 @@ type ToolResult struct {
 
 // ExecutionContext 贯穿一次 Run 的执行上下文，携带多租户与追踪维度，
 // 供 middleware / provider / 事件发射器统一读取身份信息。
+//
+// NodeID 为当前执行的节点标识，仅在节点级执行路径上有值（Run 级操作为空）。
+// 加这个字段的必要性来自人工闸门：护栏检测到中危要转人工时，
+// 审批记录必须落到具体节点，否则人工放行后无法知道该重跑哪一步——
+// Run 级的 current_node_id 会被并行节点相互覆盖，不能作为审批锚点。
+// UserID 可能为空：agent_run / agent_node 表均未持久化发起者用户标识，
+// 该字段只有在接入认证层（Lifecycle.OnRunStart 校验凭证）后才可靠，详见 auth.go 的说明。
 type ExecutionContext struct {
 	TenantID string
 	UserID   string
 	ThreadID string
 	RunID    string
+	NodeID   string
 	TraceID  string
 }
 
@@ -104,22 +112,22 @@ type ExecutionContext struct {
 type RuntimeEventType string
 
 const (
-	EventRunStarted    RuntimeEventType = "RUN_STARTED"
-	EventRunFinished   RuntimeEventType = "RUN_FINISHED"
-	EventRunFailed     RuntimeEventType = "RUN_FAILED"
-	EventRunCancelled   RuntimeEventType = "RUN_CANCELLED"
+	EventRunStarted      RuntimeEventType = "RUN_STARTED"
+	EventRunFinished     RuntimeEventType = "RUN_FINISHED"
+	EventRunFailed       RuntimeEventType = "RUN_FAILED"
+	EventRunCancelled    RuntimeEventType = "RUN_CANCELLED"
 	EventReplanRequested RuntimeEventType = "REPLAN_REQUESTED"
-	EventNodeStarted   RuntimeEventType = "NODE_STARTED"
-	EventNodeFinished  RuntimeEventType = "NODE_FINISHED"
-	EventNodeFailed    RuntimeEventType = "NODE_FAILED"
-	EventTextStart     RuntimeEventType = "TEXT_START"
-	EventTextDelta     RuntimeEventType = "TEXT_DELTA"
-	EventTextEnd       RuntimeEventType = "TEXT_END"
-	EventToolCall      RuntimeEventType = "TOOL_CALL"
-	EventToolResult    RuntimeEventType = "TOOL_RESULT"
-	EventReasoning     RuntimeEventType = "REASONING"
-	EventHITLRequested RuntimeEventType = "HITL_REQUESTED"
-	EventHITLResumed   RuntimeEventType = "HITL_RESUMED"
+	EventNodeStarted     RuntimeEventType = "NODE_STARTED"
+	EventNodeFinished    RuntimeEventType = "NODE_FINISHED"
+	EventNodeFailed      RuntimeEventType = "NODE_FAILED"
+	EventTextStart       RuntimeEventType = "TEXT_START"
+	EventTextDelta       RuntimeEventType = "TEXT_DELTA"
+	EventTextEnd         RuntimeEventType = "TEXT_END"
+	EventToolCall        RuntimeEventType = "TOOL_CALL"
+	EventToolResult      RuntimeEventType = "TOOL_RESULT"
+	EventReasoning       RuntimeEventType = "REASONING"
+	EventHITLRequested   RuntimeEventType = "HITL_REQUESTED"
+	EventHITLResumed     RuntimeEventType = "HITL_RESUMED"
 )
 
 // RuntimeEvent 是运行时对外发布的事件，跨进程边界传递 Run/Node 进度与流式数据。

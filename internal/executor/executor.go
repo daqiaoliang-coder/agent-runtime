@@ -7,6 +7,7 @@ import (
 	tooladapter "agent-runtime/internal/adapters/tool"
 	"agent-runtime/internal/contracts"
 	"agent-runtime/internal/llm"
+	"agent-runtime/internal/middleware"
 	"agent-runtime/internal/model"
 	"agent-runtime/internal/providers"
 	"agent-runtime/internal/tool"
@@ -78,11 +79,68 @@ type Dispatcher struct {
 	ToolProvider  providers.ToolProvider
 	LLM           llm.Client
 	Tools         *tool.Registry
-	ToolStore     ToolCallStore                                                  // 工具调用幂等存储；为 nil 时工具退化为直接执行（测试/无 DB 场景）
-	SubAgent      Executor                                                       // 子 Agent 执行器（递归运行子 Run），当前为占位实现
+	ToolStore     ToolCallStore                                                          // 工具调用幂等存储；为 nil 时工具退化为直接执行（测试/无 DB 场景）
+	SubAgent      Executor                                                               // 子 Agent 执行器（递归运行子 Run），当前为占位实现
 	ContextLoader func(ctx context.Context, tenant, runID string) ([]llm.Message, error) // 从已提交节点重建对话历史
-	UsageRecorder UsageRecorder                                                  // LLM token/cost 持久化；为 nil 时不落库
-	Pricer        Pricer                                                         // 成本估算函数；为 nil 时 cost 记 0
+	UsageRecorder UsageRecorder                                                          // LLM token/cost 持久化；为 nil 时不落库
+	Pricer        Pricer                                                                 // 成本估算函数；为 nil 时 cost 记 0
+	// ToolChain 是工具调用的横切链（不可信输入防护 + 数据脱敏），为 nil 时不拦截。
+	//
+	// 挂在 Dispatcher 而非只挂在 react.Engine 的理由：生产路径上工具是由 DAG 的
+	// TOOL 节点直接执行的，不经过 ReAct 循环。只接 Engine 会让真实部署完全绕过防护，
+	// 那正是"代码写好了但链路是断的"——挂载点存在却不生效，等于没有。
+	ToolChain *middleware.ToolChain
+}
+
+// executionContext 组装本次工具调用的执行身份。
+//
+// 优先取 ctx 中由 worker 注入的完整上下文（含 ThreadID / TraceID），
+// 缺失时用节点自身字段兜底，保证未接线的调用方（测试、直接调用）也能拿到租户维度。
+// NodeID 一律以当前节点覆写：人工闸门要靠它定位到具体审批锚点。
+func (d *Dispatcher) executionContext(ctx context.Context, n *model.Node) contracts.ExecutionContext {
+	ec, ok := contracts.ExecutionContextFrom(ctx)
+	if !ok {
+		ec = contracts.ExecutionContext{}
+	}
+	if ec.TenantID == "" {
+		ec.TenantID = n.TenantID
+	}
+	if ec.RunID == "" {
+		ec.RunID = n.RunID
+	}
+	ec.NodeID = n.ID
+	return ec
+}
+
+// beforeTool 在**任何副作用与幂等认领之前**跑横切链的 Before。
+//
+// 顺序是这里最关键的设计决定。若在 ClaimToolCall 之后才拦截，被拦下的调用
+// 已经写入一条 RUNNING 的 tool_call 记录；人工放行后重新调度时，
+// 幂等逻辑读到 RUNNING 会判定"崩溃在途、拒绝盲目重执行"——
+// 于是一次安全拦截把该节点永久锁死，审批放行了也跑不动。
+// 拦截必须先于认领，才能保证"被拦下的调用不产生任何持久化痕迹"。
+//
+// 返回改写后的请求（当前内置中间件不改写，但链上任何一环都可以）与执行上下文。
+func (d *Dispatcher) beforeTool(ctx context.Context, n *model.Node, callID string) (contracts.ExecutionContext, contracts.ToolCallRequest, error) {
+	ec := d.executionContext(ctx, n)
+	req := contracts.ToolCallRequest{CallID: callID, Name: n.Name, Arguments: n.Input}
+	if d.ToolChain == nil {
+		return ec, req, nil
+	}
+	// Before 的错误语义必须原样上抛，不可包装成普通失败：
+	// ErrAwaitingApproval 要路由到人工挂起，ErrBlocked 要路由到不可重试终态。
+	// 一旦在这里被包成 fmt.Errorf 而不保留 %w，上层 errors.Is 就判不出来，
+	// 等待人工的节点会被重试策略反复重跑——这是护栏最典型的失效方式。
+	req, err := d.ToolChain.Before(ctx, ec, req)
+	return ec, req, err
+}
+
+// afterTool 跑横切链的 After（工具结果脱敏）。ToolChain 为 nil 时原样返回。
+func (d *Dispatcher) afterTool(ctx context.Context, ec contracts.ExecutionContext, req contracts.ToolCallRequest, result contracts.ToolResult) (contracts.ToolResult, error) {
+	if d.ToolChain == nil {
+		return result, nil
+	}
+	return d.ToolChain.After(ctx, ec, req, result)
 }
 
 // Execute 根据 node.Type 分发：
@@ -291,110 +349,102 @@ func extractJSON(s string) string {
 	return s[start : end+1]
 }
 
-// executeTool 执行工具节点。配置了 ToolStore 时走幂等路径，否则退化为直接执行。
+// executeTool 执行工具节点。这是防护链在生产路径上的**唯一生效点**：
+// Before（不可信输入检测）→ 幂等认领 → 真实调用 → After（结果脱敏）。
+//
+// 三条顺序约束，每一条都对应一个真实故障模式：
+//  1. Before 必须先于幂等认领，否则被拦下的调用会留下 RUNNING 记录，
+//     人工放行后重跑会被幂等逻辑判为"崩溃在途"而永久拒绝（节点锁死）。
+//  2. Before 的错误必须原样上抛，worker 依赖 errors.Is 区分
+//     "等待人工"与"真失败"，包成普通错误会让审批节点被重试策略反复重跑。
+//  3. 幂等键必须基于 Before **改写后**的入参计算，否则中间件改写参数后
+//     会出现"同一逻辑调用两个键"或"不同调用同一个键"的错配。
 func (d *Dispatcher) executeTool(ctx context.Context, n *model.Node) (string, error) {
 	ctx, span := trace.StartSpan(ctx, "executor.tool")
 	defer span.End()
 	span.SetAttributes(attribute.String("tool.name", n.Name))
-	if d.ToolProvider != nil {
-		if d.ToolStore == nil {
-			result, err := d.ToolProvider.CallTool(ctx, contracts.ToolCallRequest{Name: n.Name, Arguments: n.Input})
-			if err != nil {
-				return "", fmt.Errorf("tool %q: %w", n.Name, err)
-			}
-			return result.Output, nil
-		}
-		return d.executeToolProviderIdempotent(ctx, n)
-	}
-	if d.Tools == nil {
-		return "", fmt.Errorf("tool registry not configured")
-	}
-	t, err := d.Tools.Get(n.Name)
+
+	// 第一步：横切链 Before。此处不生成 callID——幂等键要等入参确定后才算。
+	ec, req, err := d.beforeTool(ctx, n, "")
 	if err != nil {
+		// 原样上抛，保留 ErrAwaitingApproval / ErrBlocked 的哨兵语义。
 		return "", err
 	}
+
+	var run func(context.Context, contracts.ToolCallRequest) (contracts.ToolResult, error)
+	switch {
+	case d.ToolProvider != nil:
+		run = d.ToolProvider.CallTool
+	case d.Tools != nil:
+		t, terr := d.Tools.Get(req.Name)
+		if terr != nil {
+			return "", terr
+		}
+		run = registryCall(t)
+	default:
+		return "", fmt.Errorf("tool registry not configured")
+	}
+
+	// 把 After（脱敏）包进调用闭包，而不是在函数返回后再做。
+	// 这样落库的输出已经是脱敏后的：tool_call.output 是持久化数据，
+	// 先落库再脱敏等于把敏感原文长期留在数据库里，比事件泄露更难回收。
+	// 同时保证幂等 SUCCESS 命中复用的也是脱敏后的输出，不会因路径不同而泄露。
+	redactedRun := func(ctx context.Context, r contracts.ToolCallRequest) (contracts.ToolResult, error) {
+		res, rerr := run(ctx, r)
+		if rerr != nil {
+			return res, rerr
+		}
+		return d.afterTool(ctx, ec, r, res)
+	}
+
 	if d.ToolStore == nil {
-		out, err := t.Execute(ctx, n.Input)
+		// 无幂等存储（测试 / 无 DB 场景）：直接执行，防护与脱敏照常生效。
+		result, err := redactedRun(ctx, req)
 		if err != nil {
 			return "", fmt.Errorf("tool %q: %w", n.Name, err)
 		}
-		return out, nil
+		return result.Output, nil
 	}
-	return d.executeToolIdempotent(ctx, n, t)
+	req.CallID = idempotencyKey(n.RunID, n.ID, req.Name, req.Arguments)
+	return d.executeToolIdempotent(ctx, n, req, redactedRun)
+}
+
+// registryCall 把 tool.Tool 适配成与 ToolProvider 同形的调用闭包，
+// 使 Registry 与 Provider 两条路径共用同一个防护收口点。
+func registryCall(t tool.Tool) func(context.Context, contracts.ToolCallRequest) (contracts.ToolResult, error) {
+	return func(ctx context.Context, req contracts.ToolCallRequest) (contracts.ToolResult, error) {
+		out, err := t.Execute(ctx, req.Arguments)
+		if err != nil {
+			return contracts.ToolResult{CallID: req.CallID, IsError: true}, err
+		}
+		return contracts.ToolResult{CallID: req.CallID, Output: out}, nil
+	}
 }
 
 // executeToolIdempotent 实现工具调用的幂等：经 tool_call 表落库，
-//   - 新建调用：执行工具，成功落 SUCCESS、确定失败落 FAILED、歧义失败落 UNKNOWN；
+//   - 新建调用：执行 run，成功落 SUCCESS、确定失败落 FAILED、歧义失败落 UNKNOWN；
 //   - 命中 SUCCESS：复用已持久化输出，不重复执行副作用；
 //   - 命中 FAILED：回收为 RUNNING 重试一次（失败通常发生在副作用之前）；
 //   - 命中 RUNNING（崩溃在途）：副作用状态未知，拒绝盲目重执行（非幂等工具安全优先）；
 //   - 命中 UNKNOWN（超时/网络中断）：远端可能已执行，拒绝盲目重执行。
-func (d *Dispatcher) executeToolProviderIdempotent(ctx context.Context, n *model.Node) (string, error) {
-	callID := idempotencyKey(n.RunID, n.ID, n.Name, n.Input)
-	isNew, err := d.ToolStore.ClaimToolCall(ctx, n.TenantID, callID, n.RunID, n.ID, n.Name, callID, n.Input, n.Attempt)
+//
+// run 是"真实调用 + 结果脱敏"的合成闭包（由 executeTool 构造）。把脱敏放在闭包内
+// 而不是本函数返回后，是为了让**落库的输出已经是脱敏后的**——tool_call.output 是
+// 持久化数据，先落库再脱敏等于把敏感原文长期留在数据库里，比事件泄露更难回收。
+// 代价是 SUCCESS 幂等命中时复用的是脱敏后的输出，这要求 Redact 幂等
+// （其占位符不满足任何规则的结构约束，正是为此设计）。
+//
+// 合并 Provider 与 Registry 两条幂等实现的理由：此前二者是逐字重复的两份代码，
+// 任何一处修复（如 CAS 语义、歧义失败判定）都极易只改一份，
+// 而防护链一旦只接在其中一条上，另一条就是绕过入口。
+func (d *Dispatcher) executeToolIdempotent(ctx context.Context, n *model.Node, req contracts.ToolCallRequest, run func(context.Context, contracts.ToolCallRequest) (contracts.ToolResult, error)) (string, error) {
+	callID := req.CallID
+	isNew, err := d.ToolStore.ClaimToolCall(ctx, n.TenantID, callID, n.RunID, n.ID, req.Name, callID, req.Arguments, n.Attempt)
 	if err != nil {
 		return "", fmt.Errorf("claim tool call: %w", err)
 	}
 	if isNew {
-		return d.runAndPersistToolProvider(ctx, n, callID)
-	}
-	rec, err := d.ToolStore.GetToolCall(ctx, n.TenantID, callID)
-	if err != nil {
-		return "", fmt.Errorf("load tool call: %w", err)
-	}
-	switch rec.Status {
-	case "SUCCESS":
-		return rec.Output, nil
-	case "FAILED":
-		reclaimed, err := d.ToolStore.ReclaimToolCall(ctx, n.TenantID, callID)
-		if err != nil {
-			return "", fmt.Errorf("reclaim tool call: %w", err)
-		}
-		if !reclaimed {
-			return "", fmt.Errorf("tool call %s not reclaimable", callID)
-		}
-		return d.runAndPersistToolProvider(ctx, n, callID)
-	case "RUNNING", "UNKNOWN":
-		// 关键日志：停滞的 RUNNING 或歧义 UNKNOWN 工具调用拒绝重执行，副作用状态未知，
-		// 是运维侧定位"卡死"/"歧义"工具调用的关键信号。
-		log.Printf("tool call refused re-execution call_id=%s run=%s node=%s tenant=%s (stale %s)", callID, n.RunID, n.ID, n.TenantID, rec.Status)
-		return "", fmt.Errorf("tool call %s stale %s; refusing re-execution (non-idempotent safety)", callID, rec.Status)
-	default:
-		return "", fmt.Errorf("tool call %s unknown status %q", callID, rec.Status)
-	}
-}
-
-func (d *Dispatcher) runAndPersistToolProvider(ctx context.Context, n *model.Node, callID string) (string, error) {
-	result, err := d.ToolProvider.CallTool(ctx, contracts.ToolCallRequest{CallID: callID, Name: n.Name, Arguments: n.Input})
-	if err != nil {
-		// 区分歧义失败与确定失败：超时/取消/网络中断时远端可能已执行副作用，
-		// 标记 UNKNOWN 阻止盲目重试；其他错误标记 FAILED 允许安全重试。
-		if isAmbiguousFailure(err) {
-			_ = d.ToolStore.MarkToolCallUnknown(ctx, n.TenantID, callID)
-		} else {
-			_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
-		}
-		return "", fmt.Errorf("tool %q: %w", n.Name, err)
-	}
-	if result.IsError {
-		// 工具返回了确定性错误结果（副作用未发生或工具自报错误），标记 FAILED 允许重试。
-		_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
-		return "", fmt.Errorf("tool %q returned error", n.Name)
-	}
-	if err := d.ToolStore.CompleteToolCall(ctx, n.TenantID, callID, result.Output); err != nil {
-		return "", fmt.Errorf("complete tool call: %w", err)
-	}
-	return result.Output, nil
-}
-
-func (d *Dispatcher) executeToolIdempotent(ctx context.Context, n *model.Node, t tool.Tool) (string, error) {
-	callID := idempotencyKey(n.RunID, n.ID, n.Name, n.Input)
-	isNew, err := d.ToolStore.ClaimToolCall(ctx, n.TenantID, callID, n.RunID, n.ID, n.Name, callID, n.Input, n.Attempt)
-	if err != nil {
-		return "", fmt.Errorf("claim tool call: %w", err)
-	}
-	if isNew {
-		return d.runAndPersistTool(ctx, n, t, callID)
+		return d.runAndPersistTool(ctx, n, req, run)
 	}
 	rec, err := d.ToolStore.GetToolCall(ctx, n.TenantID, callID)
 	if err != nil {
@@ -413,9 +463,10 @@ func (d *Dispatcher) executeToolIdempotent(ctx context.Context, n *model.Node, t
 		if !reclaimed {
 			return "", fmt.Errorf("tool call %s not reclaimable", callID)
 		}
-		return d.runAndPersistTool(ctx, n, t, callID)
+		return d.runAndPersistTool(ctx, n, req, run)
 	case "RUNNING", "UNKNOWN":
-		// 停滞 RUNNING 或歧义 UNKNOWN：副作用状态未知，为非幂等工具安全拒绝盲目重执行。
+		// 关键日志：停滞的 RUNNING 或歧义 UNKNOWN 工具调用拒绝重执行，副作用状态未知，
+		// 是运维侧定位"卡死"/"歧义"工具调用的关键信号。
 		log.Printf("tool call refused re-execution call_id=%s run=%s node=%s tenant=%s (stale %s)", callID, n.RunID, n.ID, n.TenantID, rec.Status)
 		return "", fmt.Errorf("tool call %s stale %s; refusing re-execution (non-idempotent safety)", callID, rec.Status)
 	default:
@@ -425,20 +476,25 @@ func (d *Dispatcher) executeToolIdempotent(ctx context.Context, n *model.Node, t
 
 // runAndPersistTool 执行工具并按结果更新 tool_call 状态。
 // 歧义失败（超时/取消）标记为 UNKNOWN 以阻止盲目重试；确定失败标记为 FAILED 允许重试。
-func (d *Dispatcher) runAndPersistTool(ctx context.Context, n *model.Node, t tool.Tool, callID string) (string, error) {
-	out, err := t.Execute(ctx, n.Input)
+func (d *Dispatcher) runAndPersistTool(ctx context.Context, n *model.Node, req contracts.ToolCallRequest, run func(context.Context, contracts.ToolCallRequest) (contracts.ToolResult, error)) (string, error) {
+	result, err := run(ctx, req)
 	if err != nil {
 		if isAmbiguousFailure(err) {
-			_ = d.ToolStore.MarkToolCallUnknown(ctx, n.TenantID, callID)
+			_ = d.ToolStore.MarkToolCallUnknown(ctx, n.TenantID, req.CallID)
 		} else {
-			_ = d.ToolStore.FailToolCall(ctx, n.TenantID, callID)
+			_ = d.ToolStore.FailToolCall(ctx, n.TenantID, req.CallID)
 		}
-		return "", fmt.Errorf("tool %q: %w", n.Name, err)
+		return "", fmt.Errorf("tool %q: %w", req.Name, err)
 	}
-	if err := d.ToolStore.CompleteToolCall(ctx, n.TenantID, callID, out); err != nil {
+	if result.IsError {
+		// 工具返回了确定性错误结果（副作用未发生或工具自报错误），标记 FAILED 允许重试。
+		_ = d.ToolStore.FailToolCall(ctx, n.TenantID, req.CallID)
+		return "", fmt.Errorf("tool %q returned error", req.Name)
+	}
+	if err := d.ToolStore.CompleteToolCall(ctx, n.TenantID, req.CallID, result.Output); err != nil {
 		return "", fmt.Errorf("complete tool call: %w", err)
 	}
-	return out, nil
+	return result.Output, nil
 }
 
 // idempotencyKey 由 (run,node,tool,input) 派生，跨重试稳定，同时用作 call_id 与 idempotency_key。

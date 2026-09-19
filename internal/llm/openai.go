@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"agent-runtime/internal/contracts"
 	"agent-runtime/internal/trace"
 	"bytes"
 	"context"
@@ -17,15 +18,46 @@ import (
 // OpenAIClient 是 OpenAI Chat Completions 兼容的 HTTP 实现。
 // 任何兼容 /v1/chat/completions 的网关（OpenAI、Azure OpenAI、vLLM、本地 ollama 等）均可使用。
 // 这是一个"真实"实现：生产中可替换 Stub，让节点执行真正发起 LLM 推理。
+//
+// 密钥有两条互斥来源，Credentials 优先：
+//   - Credentials 非 nil：每次请求前经 CredentialProvider 取凭证，密钥生命周期由托管层负责，
+//     轮转对本客户端透明，明文不落在结构体字段上；
+//   - Credentials 为 nil：回退读取 APIKey 字段（兼容既有部署与测试）。
+//
+// 保留 APIKey 字段而不是直接删掉，是为了避免一次 flag day 迁移：
+// 既有调用方与测试全部按 NewOpenAIClient(base, key) 构造，强行改签名会波及全仓库。
+// 新代码应走 NewOpenAIClientWithCredentials。
 type OpenAIClient struct {
 	BaseURL string // 如 https://api.openai.com/v1 ，不要带末尾斜杠
-	APIKey  string
+	APIKey  string // 兼容路径；Credentials 非 nil 时被忽略
 	HTTP    *http.Client
+	// Credentials 为密钥托管 port；非 nil 时取代 APIKey 成为鉴权来源。
+	Credentials contracts.CredentialProvider
+	// Purpose 指定凭证用途，空值按 CredentialPurposeChat 处理。
+	// 分用途是为了让托管层能按最小权限签发（推理 Key 不该兼作向量化 Key）。
+	Purpose contracts.CredentialPurpose
 }
 
-// NewOpenAIClient 创建默认超时 60s 的客户端。
+// NewOpenAIClient 创建默认超时 60s 的客户端，密钥取自 apiKey 明文。
 func NewOpenAIClient(baseURL, apiKey string) *OpenAIClient {
 	return &OpenAIClient{BaseURL: baseURL, APIKey: apiKey, HTTP: &http.Client{Timeout: 60 * time.Second}}
+}
+
+// NewOpenAIClientWithCredentials 创建走密钥托管的客户端，密钥不进入结构体字段。
+// creds 为 nil 时等价于 NewOpenAIClient(baseURL, "")，即未配置密钥。
+func NewOpenAIClientWithCredentials(baseURL string, creds contracts.CredentialProvider, purpose contracts.CredentialPurpose) *OpenAIClient {
+	if purpose == "" {
+		purpose = contracts.CredentialPurposeChat
+	}
+	return &OpenAIClient{BaseURL: baseURL, HTTP: &http.Client{Timeout: 60 * time.Second}, Credentials: creds, Purpose: purpose}
+}
+
+// resolveAuth 统一两条密钥来源，返回可直接写入 Authorization 头的值。
+//
+// 未配置密钥时返回明确错误而非发起匿名请求：匿名请求会得到网关的 401，
+// 排查方向被误导到"Key 无效"而不是"Key 没配"，这是两类完全不同的故障。
+func (c *OpenAIClient) resolveAuth(ctx context.Context) (string, error) {
+	return resolveAuthorization(ctx, c.Credentials, c.Purpose, contracts.CredentialPurposeChat, c.APIKey)
 }
 
 type chatRequest struct {
@@ -66,8 +98,10 @@ func (c *OpenAIClient) Complete(ctx context.Context, req Request) (_ Response, e
 		attribute.String("llm.request_model", req.Model),
 		attribute.Int("llm.message_count", len(req.Messages)),
 	)
-	if c.APIKey == "" {
-		return Response{}, fmt.Errorf("llm: openai api key not configured")
+	// 密钥未配置（既无托管层也无明文）时立即失败，不发起匿名请求。
+	auth, err := c.resolveAuth(ctx)
+	if err != nil {
+		return Response{}, err
 	}
 	body := chatRequest{Model: req.Model, Messages: make([]chatMessage, len(req.Messages))}
 	for i, m := range req.Messages {
@@ -82,7 +116,7 @@ func (c *OpenAIClient) Complete(ctx context.Context, req Request) (_ Response, e
 		return Response{}, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
+	httpReq.Header.Set("Authorization", auth)
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {
 		return Response{}, err
@@ -90,6 +124,11 @@ func (c *OpenAIClient) Complete(ctx context.Context, req Request) (_ Response, e
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		rb, _ := io.ReadAll(resp.Body)
+		// 401/403 极可能是凭证已被轮转或吊销。主动失效缓存，让下一次调用回源取新凭证，
+		// 否则缓存会一直复用到自然过期，故障恢复时间被拉长到分钟级。
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			invalidateCredential(c.Credentials, c.Purpose)
+		}
 		return Response{}, fmt.Errorf("llm: http %d: %s", resp.StatusCode, string(rb))
 	}
 	var cr chatResponse
