@@ -30,7 +30,11 @@ const (
 	DefaultMemorySearchTimeout = 800 * time.Millisecond
 	// DefaultMaxMemoryMessages 拼接后交给 LLM 的消息条数上限。
 	// 这是上下文膨胀与 token 预算的闸门：记忆召回越多，每次推理越贵。
+	// P1 后 MaxContextTokens 作为主要预算闸门，MaxMessages 退为条数硬上限（向后兼容）。
 	DefaultMaxMemoryMessages = 20
+	// DefaultMaxContextTokens 上下文消息列表的 token 预算上限（启发式估算）。
+	// 先保证当前 Run 历史，再用剩余预算从最新向前吸收跨 Run 记忆。
+	DefaultMaxContextTokens = 32000
 )
 
 // MemoryOptions 描述读取路径的记忆装配。
@@ -41,6 +45,9 @@ type MemoryOptions struct {
 	Memory        providers.MemoryProvider
 	SearchTimeout time.Duration
 	MaxMessages   int
+	// MaxContextTokens 为上下文消息列表的 token 预算上限（0=用默认）。
+	// mergeMessages 先保证当前 Run 历史的完整性，再用剩余预算从最新向前吸收记忆。
+	MaxContextTokens int
 }
 
 // searchTimeout 返回生效的召回超时，未配置或非法值回退到默认值。
@@ -57,6 +64,41 @@ func (o MemoryOptions) maxMessages() int {
 		return DefaultMaxMemoryMessages
 	}
 	return o.MaxMessages
+}
+
+// maxContextTokens 返回生效的 token 预算上限。
+func (o MemoryOptions) maxContextTokens() int {
+	if o.MaxContextTokens <= 0 {
+		return DefaultMaxContextTokens
+	}
+	return o.MaxContextTokens
+}
+
+// estimateTokens 启发式估算字符串的 token 数。
+// ASCII ~3 字符/token，CJK ~2 字符/token，+1 消息开销。
+// 精度约 ±30%，作为软预算闸门足够；精确计数需 tokenizer，会耦合到具体模型族。
+func estimateTokens(s string) int {
+	if len(s) == 0 {
+		return 0
+	}
+	ascii, cjk := 0, 0
+	for _, r := range s {
+		switch {
+		case r >= 0x4E00 && r <= 0x9FFF, r >= 0x3400 && r <= 0x4DBF:
+			cjk++
+		default:
+			ascii++
+		}
+	}
+	return (ascii+2)/3 + cjk/2 + 1
+}
+
+func estimateMessagesTokens(msgs []llm.Message) int {
+	total := 0
+	for _, m := range msgs {
+		total += estimateTokens(m.Content)
+	}
+	return total
 }
 
 // ContextLoader 的组装与上下文塑形（祖先作用域、工具结果遮蔽）见 context.go；
@@ -123,30 +165,69 @@ func recallMemory(ctx context.Context, s contextStore, opt MemoryOptions, tenant
 	return out
 }
 
-// mergeMessages 拼接记忆与当前 Run 历史，并施加条数上限。
+// mergeMessages 拼接记忆与当前 Run 历史，施加 token 预算与条数上限。
 //
-// 截断策略：**优先保证当前 Run 历史的完整性**，超限时从最老的跨 Run 记忆开始丢弃。
-// 理由是当前 Run 的历史直接决定本轮推理的连贯性，而跨 Run 记忆是锦上添花；
-// 丢弃最老的记忆也符合"越近的上下文越相关"。
+// 预算策略（双层闸门）：
+//  1. Token 预算（MaxContextTokens）：先算 current 的 token 量；若超预算，
+//     从最新向前保留到预算耗尽。否则用剩余预算从最新向前吸收 memory。
+//  2. 条数上限（MaxMessages）：>0 时仍作硬上限，向后兼容旧配置。
 //
-// 总是返回新分配的切片：调用方（executor）会对返回值做 append，
-// 若返回内部子切片，append 可能写入共享底层数组，造成难以定位的数据串改。
-func mergeMessages(memory, current []llm.Message, max int) []llm.Message {
-	if max <= 0 {
-		max = DefaultMaxMemoryMessages
+// 优先保证当前 Run 历史的完整性：超限时从最老的跨 Run 记忆开始丢弃。
+// 总是返回新分配的切片，避免共享底层数组。
+func mergeMessages(memory, current []llm.Message, opt MemoryOptions) []llm.Message {
+	maxTokens := opt.maxContextTokens()
+	maxMsgs := opt.maxMessages()
+
+	// Step 1: 条数上限先于 token 计算（向后兼容）。
+	if maxMsgs > 0 && len(current) >= maxMsgs {
+		current = current[len(current)-maxMsgs:]
 	}
-	if len(current) >= max {
-		out := make([]llm.Message, max)
-		copy(out, current[len(current)-max:])
-		return out
+	if maxMsgs > 0 && len(memory)+len(current) > maxMsgs {
+		budget := maxMsgs - len(current)
+		if budget <= 0 {
+			memory = nil
+		} else if len(memory) > budget {
+			memory = memory[len(memory)-budget:]
+		}
 	}
-	budget := max - len(current)
-	if len(memory) > budget {
-		memory = memory[len(memory)-budget:]
+
+	// Step 2: token 预算——current 优先，超限从最新向前保留。
+	currentTokens := estimateMessagesTokens(current)
+	if currentTokens > maxTokens {
+		return trimToTokenBudget(current, maxTokens)
 	}
-	out := make([]llm.Message, 0, len(memory)+len(current))
-	out = append(out, memory...)
+
+	// Step 3: 用剩余 token 预算从最新向前吸收 memory。
+	remaining := maxTokens - currentTokens
+	kept := make([]llm.Message, 0, len(memory))
+	used := 0
+	for i := len(memory) - 1; i >= 0; i-- {
+		cost := estimateTokens(memory[i].Content)
+		if used+cost > remaining {
+			break
+		}
+		kept = append([]llm.Message{memory[i]}, kept...)
+		used += cost
+	}
+
+	out := make([]llm.Message, 0, len(kept)+len(current))
+	out = append(out, kept...)
 	out = append(out, current...)
+	return out
+}
+
+// trimToTokenBudget 从最新消息向前保留，跳过单条超预算的消息，直到预算耗尽。
+func trimToTokenBudget(msgs []llm.Message, maxTokens int) []llm.Message {
+	out := make([]llm.Message, 0, len(msgs))
+	used := 0
+	for i := len(msgs) - 1; i >= 0; i-- {
+		cost := estimateTokens(msgs[i].Content)
+		if used+cost > maxTokens {
+			continue // 单条超预算时跳过，保留更老的较小消息
+		}
+		out = append([]llm.Message{msgs[i]}, out...)
+		used += cost
+	}
 	return out
 }
 

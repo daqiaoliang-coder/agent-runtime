@@ -102,7 +102,7 @@ func llmNode(id, in, out string) model.Node {
 // TestMergeMessages_NoMemory 无记忆时应原样返回当前 Run 历史。
 func TestMergeMessages_NoMemory(t *testing.T) {
 	cur := []llm.Message{{Role: llm.RoleUser, Content: "a"}, {Role: llm.RoleAssistant, Content: "b"}}
-	got := mergeMessages(nil, cur, 20)
+	got := mergeMessages(nil, cur, MemoryOptions{MaxMessages: 20})
 	if len(got) != 2 || got[0].Content != "a" || got[1].Content != "b" {
 		t.Fatalf("unexpected: %+v", got)
 	}
@@ -115,7 +115,7 @@ func TestMergeMessages_NoMemory(t *testing.T) {
 func TestMergeMessages_MemoryFirst(t *testing.T) {
 	mem := []llm.Message{{Role: llm.RoleAssistant, Content: "旧记忆"}}
 	cur := []llm.Message{{Role: llm.RoleUser, Content: "新问题"}}
-	got := mergeMessages(mem, cur, 20)
+	got := mergeMessages(mem, cur, MemoryOptions{MaxMessages: 20})
 	if len(got) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(got))
 	}
@@ -132,7 +132,7 @@ func TestMergeMessages_TrimsOldestMemory(t *testing.T) {
 	}
 	cur := []llm.Message{{Content: "当前1"}, {Content: "当前2"}}
 
-	got := mergeMessages(mem, cur, 4)
+	got := mergeMessages(mem, cur, MemoryOptions{MaxMessages: 4})
 	if len(got) != 4 {
 		t.Fatalf("expected 4 messages, got %d", len(got))
 	}
@@ -149,7 +149,7 @@ func TestMergeMessages_TrimsOldestMemory(t *testing.T) {
 // TestMergeMessages_CurrentExceedsMax 当前历史本身就超限时，保留**最新**的一段。
 func TestMergeMessages_CurrentExceedsMax(t *testing.T) {
 	cur := []llm.Message{{Content: "1"}, {Content: "2"}, {Content: "3"}, {Content: "4"}}
-	got := mergeMessages([]llm.Message{{Content: "记忆"}}, cur, 2)
+	got := mergeMessages([]llm.Message{{Content: "记忆"}}, cur, MemoryOptions{MaxMessages: 2})
 	if len(got) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(got))
 	}
@@ -167,7 +167,7 @@ func TestMergeMessages_NoAliasing(t *testing.T) {
 	mem := []llm.Message{{Content: "m1"}, {Content: "m2"}}
 	cur := []llm.Message{{Content: "c1"}}
 
-	got := mergeMessages(mem, cur, 20)
+	got := mergeMessages(mem, cur, MemoryOptions{MaxMessages: 20})
 	_ = append(got, llm.Message{Content: "追加"})
 
 	if mem[0].Content != "m1" || mem[1].Content != "m2" {
@@ -178,7 +178,7 @@ func TestMergeMessages_NoAliasing(t *testing.T) {
 	}
 	// 截断分支同样不得与入参共享底层数组。
 	cur2 := []llm.Message{{Content: "a"}, {Content: "b"}, {Content: "c"}}
-	got2 := mergeMessages(nil, cur2, 2)
+	got2 := mergeMessages(nil, cur2, MemoryOptions{MaxMessages: 2})
 	_ = append(got2, llm.Message{Content: "追加"})
 	if cur2[0].Content != "a" || cur2[1].Content != "b" || cur2[2].Content != "c" {
 		t.Errorf("truncation branch aliased input: %+v", cur2)
@@ -188,7 +188,7 @@ func TestMergeMessages_NoAliasing(t *testing.T) {
 // TestMergeMessages_NonPositiveMax max<=0 时回退默认值，而非返回空。
 func TestMergeMessages_NonPositiveMax(t *testing.T) {
 	cur := []llm.Message{{Content: "a"}}
-	if got := mergeMessages(nil, cur, 0); len(got) != 1 {
+	if got := mergeMessages(nil, cur, MemoryOptions{}); len(got) != 1 {
 		t.Errorf("expected fallback to default max, got %d messages", len(got))
 	}
 }
@@ -203,13 +203,89 @@ func TestMemoryOptions_Defaults(t *testing.T) {
 	if got := zero.maxMessages(); got != DefaultMaxMemoryMessages {
 		t.Errorf("maxMessages default: %d", got)
 	}
-	opt := MemoryOptions{SearchTimeout: time.Second, MaxMessages: 5}
-	if opt.searchTimeout() != time.Second || opt.maxMessages() != 5 {
+	if got := zero.maxContextTokens(); got != DefaultMaxContextTokens {
+		t.Errorf("maxContextTokens default: %d", got)
+	}
+	opt := MemoryOptions{SearchTimeout: time.Second, MaxMessages: 5, MaxContextTokens: 1000}
+	if opt.searchTimeout() != time.Second || opt.maxMessages() != 5 || opt.maxContextTokens() != 1000 {
 		t.Error("explicit values should be honored")
 	}
-	neg := MemoryOptions{SearchTimeout: -1, MaxMessages: -3}
-	if neg.searchTimeout() != DefaultMemorySearchTimeout || neg.maxMessages() != DefaultMaxMemoryMessages {
+	neg := MemoryOptions{SearchTimeout: -1, MaxMessages: -3, MaxContextTokens: -7}
+	if neg.searchTimeout() != DefaultMemorySearchTimeout || neg.maxMessages() != DefaultMaxMemoryMessages || neg.maxContextTokens() != DefaultMaxContextTokens {
 		t.Error("negative values should fall back to defaults")
+	}
+}
+
+// ==== Token 估算 ====
+
+func TestEstimateTokens_ASCII(t *testing.T) {
+	// "hello world" = 11 ASCII chars → (11+2)/3 + 0 + 1 = 5
+	got := estimateTokens("hello world")
+	if got != 5 {
+		t.Errorf("estimateTokens(\"hello world\") = %d, want 5", got)
+	}
+}
+
+func TestEstimateTokens_CJK(t *testing.T) {
+	// "你好世界" = 4 CJK chars → 0 + 4/2 + 1 = 3
+	got := estimateTokens("你好世界")
+	if got != 3 {
+		t.Errorf("estimateTokens(\"你好世界\") = %d, want 3", got)
+	}
+}
+
+func TestEstimateTokens_Empty(t *testing.T) {
+	if estimateTokens("") != 0 {
+		t.Error("empty string should be 0 tokens")
+	}
+}
+
+// ==== Token 预算 mergeMessages ====
+
+func TestMergeMessages_TokenBudget_TrimsOldestMemory(t *testing.T) {
+	// 每条 memory ~2 tokens，总预算 6 → 只能容纳 3 条 memory（current 很小）
+	mem := []llm.Message{
+		{Content: "老1"}, {Content: "老2"}, {Content: "新3"}, {Content: "新4"},
+	}
+	cur := []llm.Message{{Content: "当前"}}
+	got := mergeMessages(mem, cur, MemoryOptions{MaxContextTokens: 8, MaxMessages: 100})
+	// current ≈ 2 tokens → remaining ≈ 6 → 每条 memory ≈ 2 → 最多 3 条
+	if len(got) != 4 { // 3 memory + 1 current
+		t.Fatalf("expected 4 messages, got %d: %+v", len(got), got)
+	}
+	if got[0].Content != "老2" {
+		t.Errorf("oldest memory should be dropped first, got %+v", got)
+	}
+}
+
+func TestMergeMessages_TokenBudget_CurrentExceedsBudget(t *testing.T) {
+	// current 单条就超预算 → 只保留最新的
+	cur := []llm.Message{
+		{Content: "short1"},
+		{Content: strings.Repeat("x", 100)}, // ~34 tokens
+	}
+	got := mergeMessages(nil, cur, MemoryOptions{MaxContextTokens: 10, MaxMessages: 100})
+	if len(got) != 1 {
+		t.Fatalf("expected 1 message (budget exceeded), got %d", len(got))
+	}
+	if got[0].Content != "short1" {
+		// "short1" = 6 chars → ~3 tokens < 10, fits; "xxxxx..." = 34 tokens > 10, dropped
+		// Actually wait — trimToTokenBudget walks newest-first, so "xxx..." (34 tokens) > 10 → skip,
+		// then "short1" (3 tokens) < 10 → keep.
+		t.Errorf("expected the one that fits, got %q", got[0].Content)
+	}
+}
+
+func TestMergeMessages_TokenBudget_RespectsCountCap(t *testing.T) {
+	// MaxMessages=2 仍作硬上限，即使 token 预算充裕
+	mem := []llm.Message{{Content: "m1"}, {Content: "m2"}, {Content: "m3"}}
+	cur := []llm.Message{{Content: "c1"}}
+	got := mergeMessages(mem, cur, MemoryOptions{MaxContextTokens: 100000, MaxMessages: 2})
+	if len(got) != 2 {
+		t.Fatalf("count cap should win, got %d messages", len(got))
+	}
+	if got[0].Content != "m3" || got[1].Content != "c1" {
+		t.Errorf("expected [m3 c1], got %+v", got)
 	}
 }
 

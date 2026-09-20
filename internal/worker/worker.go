@@ -13,6 +13,7 @@ import (
 	"agent-runtime/internal/llm"
 	"agent-runtime/internal/middleware"
 	"agent-runtime/internal/model"
+	"agent-runtime/internal/obs"
 	"agent-runtime/internal/policy"
 	"agent-runtime/internal/providers"
 	"agent-runtime/internal/queue"
@@ -24,7 +25,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"time"
 
@@ -109,7 +109,8 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 				_, _ = w.Store.CancelNode(ctx, t.TenantID, t.NodeID, n.Version)
 			}
 		}
-		log.Printf("worker=%s skip node run=%s node=%s run_status=%s", w.ID, t.RunID, t.NodeID, run.Status)
+		obs.From(ctx).InfoContext(ctx, "worker skip node",
+			"worker_id", w.ID, "run_id", t.RunID, "node_id", t.NodeID, "run_status", run.Status)
 		return nil
 	}
 
@@ -165,7 +166,9 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		return nil
 	}
 	// 关键日志：节点认领成功，标记执行入口，便于在普通日志中追踪 worker 调度边界。
-	log.Printf("worker=%s claimed node run=%s node=%s tenant=%s type=%s attempt=%d", w.ID, n.RunID, n.ID, n.TenantID, n.Type, n.Attempt)
+	obs.From(ctx).InfoContext(ctx, "worker claimed node",
+		"worker_id", w.ID, "run_id", n.RunID, "node_id", n.ID, "tenant_id", n.TenantID,
+		"node_type", n.Type, "attempt", n.Attempt)
 	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
 		ID: fmt.Sprintf("runtime-event-%s-start-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 		Type: contracts.EventNodeStarted, Timestamp: time.Now(), Data: map[string]any{"type": n.Type, "name": n.Name, "attempt": n.Attempt},
@@ -193,13 +196,15 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	if run.MaxTokens > 0 && (n.Type == model.NodeLLM || n.Type == model.NodeReflect) {
 		used, terr := w.Store.RunTokenUsage(ctx, n.TenantID, n.RunID)
 		if terr != nil {
-			log.Printf("warn: token usage check failed run=%s node=%s err=%v", n.RunID, n.ID, terr)
+			obs.From(ctx).WarnContext(ctx, "token usage check failed",
+				"run_id", n.RunID, "node_id", n.ID, "error", terr)
 		} else if used >= run.MaxTokens {
 			budgetErr := fmt.Errorf("token budget exceeded: used %d >= limit %d", used, run.MaxTokens)
 			span.RecordError(budgetErr)
 			span.SetStatus(codes.Error, budgetErr.Error())
 			next := n.Attempt + 1
-			log.Printf("node dead-lettered (token budget) run=%s node=%s attempt=%d", n.RunID, n.ID, n.Attempt)
+			obs.From(ctx).WarnContext(ctx, "node dead-lettered (token budget)",
+				"run_id", n.RunID, "node_id", n.ID, "attempt", n.Attempt)
 			_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, budgetErr.Error(), next, "")
 			fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: budgetErr.Error(), Timestamp: time.Now()}
 			payload, _ := json.Marshal(fe)
@@ -233,7 +238,8 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		// 要么让节点被重试策略反复重跑（审批形同虚设），要么把等待人工变成终态失败。
 		// 直接 ack 任务：Run 已冻结，人工放行后由 ResumeRun 重新投递该节点。
 		if errors.Is(execErr, middleware.ErrAwaitingApproval) {
-			log.Printf("node awaiting human approval run=%s node=%s tenant=%s tool=%s", n.RunID, n.ID, n.TenantID, n.Name)
+			obs.From(ctx).InfoContext(ctx, "node awaiting human approval",
+				"run_id", n.RunID, "node_id", n.ID, "tenant_id", n.TenantID, "tool", n.Name)
 			w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
 				ID: fmt.Sprintf("runtime-event-%s-hitl-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 				Type: contracts.EventHITLRequested, Timestamp: time.Now(),
@@ -264,12 +270,15 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 				return fmt.Errorf("retry cas conflict for %s (exec err: %v)", n.ID, execErr)
 			}
 			// 关键日志：节点执行失败但仍在重试预算内，记录退避点，便于观察重试节流。
-			log.Printf("node retried run=%s node=%s attempt=%d->%d backoff_until=%s err=%v", n.RunID, n.ID, n.Attempt, next, readyAt.Format(time.RFC3339), execErr)
+			obs.From(ctx).WarnContext(ctx, "node retried",
+				"run_id", n.RunID, "node_id", n.ID, "attempt_from", n.Attempt,
+				"attempt_to", next, "backoff_until", readyAt.Format(time.RFC3339), "error", execErr)
 			return nil
 		}
 		// 重试耗尽：入死信队列 + 失败事件，由 Resume 收敛 Run 为 FAILED。
 		// 关键日志：重试耗尽进入死信队列，标志该节点不可恢复，需人工介入或下游兜底。
-		log.Printf("node dead-lettered run=%s node=%s attempt=%d err=%v", n.RunID, n.ID, n.Attempt, execErr)
+		obs.From(ctx).WarnContext(ctx, "node dead-lettered",
+			"run_id", n.RunID, "node_id", n.ID, "attempt", n.Attempt, "error", execErr)
 		_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, execErr.Error(), next, output)
 		fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: execErr.Error(), Timestamp: time.Now()}
 		payload, _ := json.Marshal(fe)
@@ -304,7 +313,9 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		return err
 	}
 	// 关键日志：节点执行完成，标志一次成功的 LLM 推理或工具调用落地。
-	log.Printf("node completed run=%s node=%s tenant=%s attempt=%d output_bytes=%d", n.RunID, n.ID, n.TenantID, n.Attempt, len(output))
+	obs.From(ctx).InfoContext(ctx, "node completed",
+		"run_id", n.RunID, "node_id", n.ID, "tenant_id", n.TenantID,
+		"attempt", n.Attempt, "output_bytes", len(output))
 	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
 		ID: fmt.Sprintf("runtime-event-%s-finished-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 		Type: contracts.EventNodeFinished, Timestamp: time.Now(), Data: map[string]any{"output": output, "attempt": n.Attempt},
@@ -328,8 +339,8 @@ func (w *Worker) emitRuntimeEvent(ctx context.Context, ev contracts.RuntimeEvent
 	if w.EventChain != nil {
 		transformed, terr := w.EventChain.Transform(ctx, ev)
 		if terr != nil {
-			log.Printf("warn: event transform failed run=%s node=%s type=%s: %v (emitting untransformed)",
-				ev.RunID, ev.NodeID, ev.Type, terr)
+			obs.From(ctx).WarnContext(ctx, "event transform failed; emitting untransformed",
+				"run_id", ev.RunID, "node_id", ev.NodeID, "event_type", ev.Type, "error", terr)
 		} else {
 			ev = transformed
 		}
@@ -348,6 +359,7 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	tools := tool.NewRegistry()
 	tools.Register(tool.Search{})
 	tools.Register(tool.Calculator{})
+	tools.Register(tool.FetchToolResult{Store: s})
 	// 密钥一律经托管层获取，不再直接 os.Getenv 后塞进结构体字段。
 	// 这是"透明替换"的落地点：上层只持有 CredentialProvider，
 	// 换成 FileProvider（Vault/KMS sidecar 周期性覆写文件）时 worker 一行都不用改，
@@ -360,7 +372,8 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 		if _, cerr := creds.Credential(context.Background(), contracts.CredentialPurposeChat); cerr == nil {
 			client = llm.NewOpenAIClientWithCredentials(base, creds, contracts.CredentialPurposeChat)
 		} else {
-			log.Printf("worker: no chat credential available, falling back to stub LLM: %v", cerr)
+			obs.From(context.Background()).WarnContext(context.Background(), "no chat credential available; falling back to stub LLM",
+				"error", cerr)
 		}
 	}
 	// ToolStore=s 使 TOOL 节点经 tool_call 表保证幂等（SUCCESS 复用、崩溃在途拒绝重执行）。
@@ -404,7 +417,8 @@ func newMemoryOptionsFromEnv(creds contracts.CredentialProvider) MemoryOptions {
 	if _, err := creds.Credential(context.Background(), contracts.CredentialPurposeEmbedding); err != nil {
 		// 没有 embedding 能力就无法做语义召回。此处静默降级：
 		// 主链路的对话补全可能走 Stub，但记忆需要真实向量，二者要求不同。
-		log.Printf("worker: MEMORY_ENABLED but no embedding credential; long-term memory disabled: %v", err)
+		obs.From(context.Background()).WarnContext(context.Background(), "MEMORY_ENABLED but no embedding credential; long-term memory disabled",
+			"error", err)
 		return MemoryOptions{}
 	}
 	// embedding 复用与对话推理相同的网关配置，仅模型名与超时独立可调。
@@ -427,7 +441,8 @@ func newMemoryOptionsFromEnv(creds contracts.CredentialProvider) MemoryOptions {
 	if err != nil {
 		// 连接失败只降级、不致命：向量库可能稍后才就绪，
 		// 而 worker 必须能起来处理节点（记忆缺失只是少了增强）。
-		log.Printf("worker: qdrant unavailable, long-term memory disabled: %v", err)
+		obs.From(context.Background()).WarnContext(context.Background(), "qdrant unavailable; long-term memory disabled",
+			"error", err)
 		return MemoryOptions{}
 	}
 
@@ -438,12 +453,14 @@ func newMemoryOptionsFromEnv(creds contracts.CredentialProvider) MemoryOptions {
 		TopK:       envInt("MEMORY_TOP_K", providers.DefaultMemoryTopK),
 		MinScore:   envFloat32("MEMORY_MIN_SCORE", providers.DefaultMemoryMinScore),
 	}
-	log.Printf("worker: long-term memory enabled collection=%s top_k=%d min_score=%.2f timeout=%s",
-		m.Collection, m.TopK, m.MinScore, envDuration("MEMORY_SEARCH_TIMEOUT", DefaultMemorySearchTimeout))
+	obs.From(context.Background()).InfoContext(context.Background(), "long-term memory enabled",
+		"collection", m.Collection, "top_k", m.TopK, "min_score", m.MinScore,
+		"timeout", envDuration("MEMORY_SEARCH_TIMEOUT", DefaultMemorySearchTimeout).String())
 	return MemoryOptions{
-		Memory:        m,
-		SearchTimeout: envDuration("MEMORY_SEARCH_TIMEOUT", DefaultMemorySearchTimeout),
-		MaxMessages:   envInt("MEMORY_MAX_MESSAGES", DefaultMaxMemoryMessages),
+		Memory:           m,
+		SearchTimeout:    envDuration("MEMORY_SEARCH_TIMEOUT", DefaultMemorySearchTimeout),
+		MaxMessages:      envInt("MEMORY_MAX_MESSAGES", DefaultMaxMemoryMessages),
+		MaxContextTokens: envInt("MEMORY_MAX_CONTEXT_TOKENS", DefaultMaxContextTokens),
 	}
 }
 

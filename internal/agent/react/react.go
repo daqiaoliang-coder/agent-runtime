@@ -6,11 +6,13 @@ package react
 import (
 	"agent-runtime/internal/contracts"
 	"agent-runtime/internal/event"
+	"agent-runtime/internal/llm"
 	"agent-runtime/internal/middleware"
 	"agent-runtime/internal/providers"
 	"context"
 	"fmt"
 	"time"
+	"unicode/utf8"
 )
 
 // StepRunner 解耦 ReAct 循环与具体执行：引擎只负责决策，LLM/工具调用由 Runner 承担。
@@ -40,7 +42,17 @@ type Engine struct {
 	ToolChain     *middleware.ToolChain
 	Events        event.Sink
 	MaxIterations int
+	// ContextLoader 可选：开启后 Run 在循环前加载 DAG 祖先历史并 prepend。
+	// nil 时完全保持旧行为（仅用 Input.Messages）。
+	ContextLoader func(ctx context.Context, tenant, runID, nodeID string) ([]llm.Message, error)
+	// ToolMasking 开启后对 ReAct 循环内的工具结果按 rune 截断到 ToolOutputMaxRunes。
+	ToolMasking bool
+	// ToolOutputMaxRunes 单条工具结果的字符上限；<=0 用默认 4000。
+	ToolOutputMaxRunes int
 }
+
+// reactDefaultToolMaxRunes 是 ReAct 循环中工具结果截断的默认上限。
+const reactDefaultToolMaxRunes = 4000
 
 // Input 是一次 ReAct 会话的输入，ExecutionContext 携带租户/追踪身份。
 type Input struct {
@@ -62,11 +74,30 @@ func (e *Engine) Run(ctx context.Context, in Input) (Result, error) {
 	if e.Runner == nil {
 		return Result{}, fmt.Errorf("react: step runner not configured")
 	}
+	// 注入 ExecutionContext 到 ctx，使 fetch_tool_result 等工具能拿到租户。
+	ctx = contracts.WithExecutionContext(ctx, in.ExecutionContext)
+
 	max := e.MaxIterations
 	if max <= 0 {
 		max = 8
 	}
 	messages := append([]contracts.Message(nil), in.Messages...)
+
+	// 加载 DAG 祖先历史并 prepend（与 executor.executeLLM 同构）。
+	if e.ContextLoader != nil && in.ExecutionContext.TenantID != "" && in.ExecutionContext.RunID != "" {
+		hist, err := e.ContextLoader(ctx, in.ExecutionContext.TenantID, in.ExecutionContext.RunID, in.ExecutionContext.NodeID)
+		if err != nil {
+			return Result{}, fmt.Errorf("react: load context: %w", err)
+		}
+		if len(hist) > 0 {
+			prefix := make([]contracts.Message, 0, len(hist))
+			for _, m := range hist {
+				prefix = append(prefix, contracts.Message{Role: contracts.Role(m.Role), Content: m.Content})
+			}
+			messages = append(prefix, messages...)
+		}
+	}
+
 	for i := 0; i < max; i++ {
 		resp, err := e.Runner.RunLLM(ctx, contracts.GenerateRequest{Messages: messages, Tools: in.Tools})
 		if err != nil {
@@ -101,11 +132,34 @@ func (e *Engine) Run(ctx context.Context, in Input) (Result, error) {
 					return Result{}, err
 				}
 			}
-			messages = append(messages, contracts.Message{Role: contracts.RoleTool, Content: result.Output})
+			content := result.Output
+			if e.ToolMasking {
+				content = capRunesForReact(content, req.CallID, e.toolOutputMaxRunes())
+			}
+			messages = append(messages, contracts.Message{Role: contracts.RoleTool, Content: content})
 			e.emit(ctx, contracts.RuntimeEvent{ID: fmt.Sprintf("react-tool-result-%d", time.Now().UnixNano()), RunID: in.ExecutionContext.RunID, TenantID: in.ExecutionContext.TenantID, Type: contracts.EventToolResult, Timestamp: time.Now(), Data: result})
 		}
 	}
 	return Result{}, fmt.Errorf("react: max iterations %d exceeded", max)
+}
+
+func (e *Engine) toolOutputMaxRunes() int {
+	if e.ToolOutputMaxRunes <= 0 {
+		return reactDefaultToolMaxRunes
+	}
+	return e.ToolOutputMaxRunes
+}
+
+// capRunesForReact 对 ReAct 循环内的工具结果做 rune 安全截断，附 call_id 指针。
+// ReAct 无 model.Node，用 CallID 替代 node_id 作为原文定位指针。
+func capRunesForReact(s, callID string, max int) string {
+	if max <= 0 || utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:max]) + fmt.Sprintf(
+		"\n\n[Truncated: result was %d characters; retrieve via fetch_tool_result tool with call_id=%q.]",
+		len(runes), callID)
 }
 
 func (e *Engine) emit(ctx context.Context, ev contracts.RuntimeEvent) {

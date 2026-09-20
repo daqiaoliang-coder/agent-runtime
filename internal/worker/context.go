@@ -103,7 +103,7 @@ func newContextLoader(s contextStore, opt ContextOptions) func(context.Context, 
 		}
 
 		recalled := recallMemory(ctx, s, opt.Memory, tenant, runID)
-		return mergeMessages(recalled, current, opt.Memory.maxMessages()), nil
+		return mergeMessages(recalled, current, opt.Memory), nil
 	}
 }
 
