@@ -1,0 +1,100 @@
+# OpenTelemetry Collector 配置（agent-runtime 本地可观测栈）
+#
+# 数据流向：
+#   agent-runtime 各进程 --OTLP gRPC :4317--> collector
+#     traces  --> Tempo   (http://tempo:3200 查询, OTLP 写入 :4317)
+#     metrics --> Prometheus (collector 暴露 :8889 供 Prometheus 抓取)
+#     logs    --> Loki    (http://loki:3100/loki/api/v1/push)
+#
+# 所有后端在 Grafana 中统一查询，trace_id 作为三支柱互跳的关联键。
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # 内存保护：超过阈值时拒绝接收，防止 Collector 被打挂。
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  # 批量合并，减少后端请求数。
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+  # 尾部采样：按整条 trace 决策，保证一个 Run 的所有节点同采同弃。
+  # P0 先采全量（100%），后续按需收紧：错误/高延迟全采，正常流量概率采样。
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 50000
+    expected_new_traces_per_sec: 1000
+    policies:
+      - name: errors-always
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: slow-traces
+        type: latency
+        latency: { threshold_ms: 5000 }
+      - name: probabilistic-fallback
+        type: probabilistic
+        probabilistic: { sampling_percentage: 100 }
+
+  # 资源属性处理：
+  #   1. 注入 cluster 标识，便于多环境区分；
+  #   2. 设置 loki.attribute.labels，告诉 loki exporter 哪些属性晋升为 Loki 索引 label
+  #      （contrib 0.110+ 已移除 exporter 内的 labels 配置块，改用此资源属性）。
+  # 直接复用 OTel 标准资源属性名（service.name 等）作为 Loki label，避免重命名引入额外复杂度。
+  resource:
+    attributes:
+      - key: cluster
+        value: local
+        action: upsert
+      - key: loki.attribute.labels
+        value: service.name, service.version, deployment.environment, cluster
+        action: upsert
+
+exporters:
+  # Trace 写入 Tempo（Tempo 原生支持 OTLP 接收）。
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  # Metrics 由 Prometheus 抓取（collector 作为 Prometheus target）。
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: agent_runtime
+    # 关闭 resource_to_telemetry_conversion，避免 service.name 等高基数
+    # 资源属性变成 label 撑爆 Prometheus；保留 exemplar 用于 trace 反链。
+    enable_open_metrics: true
+
+  # Logs 写入 Loki。
+  # 哪些属性晋升为 Loki label 由 resource 处理器设置的 loki.attribute.labels 决定，
+  # 避免高基数属性（run_id/node_id）进入索引。
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+
+  # 调试用：把接收到的 telemetry 打到 collector 日志，验证管道通畅后可删除。
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, tail_sampling, batch]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [loki]

@@ -1,0 +1,41 @@
+# Grafana 数据源自动 provisioning：启动时自动配置 Tempo/Prometheus/Loki，
+# 三者通过 trace_id 互相跳转（Loki 与 Prometheus 的 exemplar 均指向 Tempo）。
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        tags: [{ key: 'service.name', value: 'service.name' }]
+        spanStartTimeShift: '-1h'
+        spanEndTimeShift: '1h'
+        filterByTraceID: true
+      tracesToMetrics:
+        datasourceUid: prometheus
+        tags: [{ key: 'service.name', value: 'service_name' }]
+
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    jsonData:
+      exemplarTraceIdDestinations:
+        - datasourceUid: tempo
+          name: trace_id
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      derivedFields:
+        - datasourceUid: tempo
+          matcherRegex: 'trace_id["\s:=]+([a-f0-9]{32})'
+          name: TraceID
+          url: '${__value.raw}'

@@ -90,9 +90,15 @@ type Plan struct{ Nodes []PlanNode }
 
 // Task 是投递到 Redis 队列的最小工作单元，仅引用 Run/Node。
 // TenantID 跨越异步边界携带租户身份，确保 worker 侧仍可做租户隔离校验。
+//
+// TraceContext 承载 W3C traceparent（及可选 tracestate），实现跨进程链路串联：
+// 入队侧由 queue.Enqueue 从 ctx 注入，消费侧由 queue.Consume 提取并重建 ctx，
+// 使 runtime 创建 Run 的根 span 与 worker 执行节点的 span 落在同一条 Trace 上。
+// 为空表示无上游 trace（如 recovery 补投递场景），消费端会以新 trace 根处理。
 type Task struct {
 	RunID, NodeID, TenantID string
 	Attempt                 int
+	TraceContext            map[string]string `json:"trace_context,omitempty"`
 }
 
 // Event 是领域事件，通过 RocketMQ 在组件间传递。

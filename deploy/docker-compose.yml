@@ -50,7 +50,68 @@ services:
     ports: ["6333:6333", "6334:6334"]
     volumes: ["qdrant_data:/qdrant/storage"]
 
+  # ===== 可观测性栈（P0）=====
+  # 启动顺序：otel-collector 依赖 tempo/prometheus/loki，grafana 依赖全部后端。
+  # 各 agent-runtime 进程需设置 OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317
+  # 才能把数据发往 Collector（未设置时降级为 stdout，不影响本地开发）。
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.112.0
+    container_name: agent-runtime-otel-collector
+    depends_on: [tempo, loki]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus metrics endpoint
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+
+  tempo:
+    image: grafana/tempo:2.6.0
+    container_name: agent-runtime-tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    ports:
+      - "3200:3200"   # HTTP 查询
+      - "4317"        # OTLP gRPC（仅内部，collector 写入）
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: agent-runtime-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports: ["9090:9090"]
+
+  loki:
+    image: grafana/loki:3.2.0
+    container_name: agent-runtime-loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - loki_data:/loki
+    ports: ["3100:3100"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: agent-runtime-grafana
+    depends_on: [tempo, prometheus, loki]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - grafana_data:/var/lib/grafana
+    ports: ["3000:3000"]
+
 volumes:
   mysql_data:
   redis_data:
   qdrant_data:
+  tempo_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:

@@ -3,10 +3,14 @@ package runtime
 import (
 	"agent-runtime/internal/llm"
 	"agent-runtime/internal/model"
+	"agent-runtime/internal/trace"
 	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // Planner 负责将用户输入转化为可执行的 DAG 计划。
@@ -58,21 +62,99 @@ Node types: "LLM" (reasoning/generation), "TOOL" (tool call; "name" must be a re
 Respond with ONLY a JSON object, no prose, in this exact shape:
 {"nodes":[{"id":"n1","type":"TOOL","name":"search","input":"query","dependsOn":[]}]}`
 
+// maxPlanAttempts 是 Planner 在 JSON 解析/校验失败时的最大尝试次数（含首次）。
+const maxPlanAttempts = 3
+
+// correctivePlanPrompt 在模型上次输出无法作为计划时回填，要求其仅输出 JSON。
+const correctivePlanPrompt = `Your previous response could not be used as a plan: %s
+Respond with ONLY the required JSON object, no prose and no code fence.`
+
 func (p *LLMPlanner) Plan(ctx context.Context, run *model.Run) (model.Plan, error) {
+	ctx, span := trace.StartSpan(ctx, "planner.plan")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("run.id", run.ID),
+		attribute.String("tenant.id", run.TenantID),
+		attribute.Int("run.max_steps", run.MaxSteps),
+	)
 	if p.LLM == nil {
-		return model.Plan{}, fmt.Errorf("llm planner: client not configured")
+		err := fmt.Errorf("llm planner: client not configured")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return model.Plan{}, err
 	}
-	resp, err := p.LLM.Complete(ctx, llm.Request{Messages: []llm.Message{
+	msgs := []llm.Message{
 		{Role: llm.RoleSystem, Content: planSystemPrompt},
 		{Role: llm.RoleUser, Content: fmt.Sprintf("Goal: %s\nRunID: %s", run.Input, run.ID)},
-	}})
+	}
+	plan, err := p.completePlanWithRetry(ctx, msgs, run.ID, 0)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return model.Plan{}, fmt.Errorf("llm planner: %w", err)
 	}
-	raw := extractJSON(resp.Content)
+	span.SetAttributes(attribute.Int("plan.node_count", len(plan.Nodes)))
+	return plan, nil
+}
+
+// completePlanWithRetry 以 JSON 模式调用 LLM 并在解析/校验失败时有限重试：
+// 把上次无效输出与纠正指令回填，让模型自我修正。传输类错误立即上抛，不做重试。
+// namespace 为节点 ID 前缀；round>0 时标记到每个节点（Replan 场景）。
+func (p *LLMPlanner) completePlanWithRetry(ctx context.Context, msgs []llm.Message, namespace string, round int) (model.Plan, error) {
+	jsonMode := true
+	var lastErr error
+	for attempt := 0; attempt < maxPlanAttempts; attempt++ {
+		// 每次规划尝试一个子 span，便于在 trace 中看到"模型自我修正"的迭代过程。
+		_, span := trace.StartSpan(ctx, "planner.attempt")
+		span.SetAttributes(
+			attribute.Int("planner.attempt", attempt),
+			attribute.Bool("planner.json_mode", jsonMode),
+			attribute.Int("planner.round", round),
+		)
+		resp, err := p.LLM.Complete(ctx, llm.Request{Messages: msgs, JSONResponse: jsonMode})
+		if err != nil {
+			// 部分自建网关不识别 response_format，会以 HTTP 400 拒绝：
+			// 关闭该参数重试同一次请求，不消耗解析重试次数（jsonMode 只会关闭一次）。
+			if jsonMode && isUnsupportedResponseFormatErr(err) {
+				jsonMode = false
+				span.RecordError(err)
+				span.End()
+				continue
+			}
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			span.End()
+			return model.Plan{}, err
+		}
+		plan, perr := buildPlan(resp.Content, namespace, round)
+		if perr == nil {
+			span.SetAttributes(attribute.Int("plan.node_count", len(plan.Nodes)))
+			span.End()
+			return plan, nil
+		}
+		lastErr = perr
+		span.RecordError(perr)
+		span.End()
+		msgs = append(msgs,
+			llm.Message{Role: llm.RoleAssistant, Content: resp.Content},
+			llm.Message{Role: llm.RoleUser, Content: fmt.Sprintf(correctivePlanPrompt, perr)},
+		)
+	}
+	return model.Plan{}, fmt.Errorf("failed after %d attempts: %w", maxPlanAttempts, lastErr)
+}
+
+// isUnsupportedResponseFormatErr 判断错误是否为网关因不支持 response_format 返回的 400。
+func isUnsupportedResponseFormatErr(err error) bool {
+	return strings.Contains(err.Error(), "http 400")
+}
+
+// buildPlan 将一次 LLM 文本响应解析为命名空间化且校验通过的 Plan。
+// round>0 时把 PlanningRound 标记到每个节点（Replan 场景），首轮传 0。
+func buildPlan(content, namespace string, round int) (model.Plan, error) {
+	raw := extractJSON(content)
 	var pj planJSON
 	if err := json.Unmarshal([]byte(raw), &pj); err != nil {
-		return model.Plan{}, fmt.Errorf("llm planner: parse plan json: %w", err)
+		return model.Plan{}, fmt.Errorf("parse plan json: %w", err)
 	}
 	plan := model.Plan{Nodes: make([]model.PlanNode, 0, len(pj.Nodes))}
 	for _, n := range pj.Nodes {
@@ -80,15 +162,18 @@ func (p *LLMPlanner) Plan(ctx context.Context, run *model.Run) (model.Plan, erro
 		if n.ID == "" {
 			n.ID = fmt.Sprintf("n%d", len(plan.Nodes))
 		}
-		plan.Nodes = append(plan.Nodes, model.PlanNode{
+		node := model.PlanNode{
 			ID: n.ID, ParentNodeID: n.ParentNodeID, Type: model.NodeType(n.Type),
 			Name: n.Name, Input: n.Input, DependsOn: n.DependsOn,
-		})
+		}
+		if round > 0 {
+			node.PlanningRound = round
+		}
+		plan.Nodes = append(plan.Nodes, node)
 	}
-	// 服务端命名空间化：所有 node_id 加 run 前缀，防止跨 Run 撞全局主键。
-	namespacePlan(&plan, run.ID)
+	namespacePlan(&plan, namespace)
 	if err := validatePlan(plan); err != nil {
-		return model.Plan{}, fmt.Errorf("llm planner: invalid plan: %w", err)
+		return model.Plan{}, fmt.Errorf("invalid plan: %w", err)
 	}
 	return plan, nil
 }
@@ -124,41 +209,36 @@ Respond with ONLY a JSON object, no prose, in this exact shape:
 // Replan 通过 LLM 基于已完成节点的 outputs 动态续规划。
 // 将各已完成节点的 name/output 拼入 prompt，要求 LLM 产出新一轮节点。
 func (p *LLMPlanner) Replan(ctx context.Context, run *model.Run, completed []model.Node) (model.Plan, error) {
+	ctx, span := trace.StartSpan(ctx, "planner.replan")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("run.id", run.ID),
+		attribute.String("tenant.id", run.TenantID),
+		attribute.Int("planner.completed_count", len(completed)),
+	)
 	if p.LLM == nil {
-		return model.Plan{}, fmt.Errorf("llm planner: client not configured")
+		err := fmt.Errorf("llm planner: client not configured")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return model.Plan{}, err
 	}
 	var sb strings.Builder
 	for _, n := range completed {
 		fmt.Fprintf(&sb, "- %s (type=%s): %s\n", n.Name, n.Type, n.Output)
 	}
-	resp, err := p.LLM.Complete(ctx, llm.Request{Messages: []llm.Message{
+	round := nextRound(completed)
+	span.SetAttributes(attribute.Int("planner.round", round))
+	msgs := []llm.Message{
 		{Role: llm.RoleSystem, Content: replanSystemPrompt},
 		{Role: llm.RoleUser, Content: fmt.Sprintf("Goal: %s\nRunID: %s\nCompleted steps:\n%s", run.Input, run.ID, sb.String())},
-	}})
+	}
+	plan, err := p.completePlanWithRetry(ctx, msgs, fmt.Sprintf("%s:r%d", run.ID, round), round)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return model.Plan{}, fmt.Errorf("llm replan: %w", err)
 	}
-	raw := extractJSON(resp.Content)
-	var pj planJSON
-	if err := json.Unmarshal([]byte(raw), &pj); err != nil {
-		return model.Plan{}, fmt.Errorf("llm replan: parse plan json: %w", err)
-	}
-	round := nextRound(completed)
-	plan := model.Plan{Nodes: make([]model.PlanNode, 0, len(pj.Nodes))}
-	for _, n := range pj.Nodes {
-		if n.ID == "" {
-			n.ID = fmt.Sprintf("n%d", len(plan.Nodes))
-		}
-		plan.Nodes = append(plan.Nodes, model.PlanNode{
-			ID: n.ID, ParentNodeID: n.ParentNodeID, Type: model.NodeType(n.Type),
-			Name: n.Name, Input: n.Input, DependsOn: n.DependsOn, PlanningRound: round,
-		})
-	}
-	// 服务端命名空间化：续规节点 ID 加 run + 轮次前缀，防止跨 Run/跨轮次撞全局主键。
-	namespacePlan(&plan, fmt.Sprintf("%s:r%d", run.ID, round))
-	if err := validatePlan(plan); err != nil {
-		return model.Plan{}, fmt.Errorf("llm replan: invalid plan: %w", err)
-	}
+	span.SetAttributes(attribute.Int("plan.node_count", len(plan.Nodes)))
 	return plan, nil
 }
 

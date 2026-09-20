@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 	"time"
 )
 
@@ -32,7 +34,13 @@ func (q *RedisQueue) Init(ctx context.Context) error {
 }
 
 // Enqueue 将 Task 序列化后通过 XAdd 写入 Stream，等待消费者组读取。
+// 入队前把当前 ctx 中的 trace 上下文注入 Task.TraceContext，
+// 使消费端能重建同一条 Trace，避免 runtime→worker 跨进程断链。
 func (q *RedisQueue) Enqueue(ctx context.Context, t model.Task) error {
+	if t.TraceContext == nil {
+		t.TraceContext = map[string]string{}
+	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier(t.TraceContext))
 	b, _ := json.Marshal(t)
 	_, err := q.Client.XAdd(ctx, &redis.XAddArgs{Stream: q.Stream, Values: map[string]any{"task": string(b)}}).Result()
 	return err
@@ -59,7 +67,14 @@ func (q *RedisQueue) Consume(ctx context.Context, consumer string, handler func(
 				if err := json.Unmarshal([]byte(raw), &t); err != nil {
 					continue
 				}
-				if err := handler(ctx, t); err != nil {
+				// 从 Task 提取 trace 上下文，为每条消息重建独立 ctx（不复用循环变量，
+				// 避免上一条消息的 trace 泄漏到下一条）。无 TraceContext 时
+				// （如 recovery 补投递），沿用上层 ctx 作为新 trace 根。
+				msgCtx := ctx
+				if len(t.TraceContext) > 0 {
+					msgCtx = otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(t.TraceContext))
+				}
+				if err := handler(msgCtx, t); err != nil {
 					continue
 				}
 				// 仅在 handler 成功后确认，否则消息保留待重试。

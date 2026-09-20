@@ -3,10 +3,10 @@ package runtime
 import (
 	"agent-runtime/internal/event"
 	"agent-runtime/internal/model"
+	"agent-runtime/internal/obs"
 	"agent-runtime/internal/trace"
 	"context"
 	"fmt"
-	"log"
 
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -145,7 +145,8 @@ func (r *Resumer) process(ctx context.Context, e model.Event) error {
 		return nil
 	}
 	// 关键日志：Run 收敛到终态，标志 DAG 全部节点结束，是 Runtime 最重要的一次状态跃迁。
-	log.Printf("run settled run=%s tenant=%s status=%s trigger_node=%s", e.RunID, e.TenantID, status, e.NodeID)
+	obs.From(ctx).InfoContext(ctx, "run settled",
+		"run_id", e.RunID, "tenant_id", e.TenantID, "status", string(status), "trigger_node", e.NodeID)
 	return nil
 }
 
@@ -169,7 +170,8 @@ func (r *Resumer) tryConvergeCancelled(ctx context.Context, e model.Event, run *
 		// 版本冲突意味着并发已推进（或 Run 已偏离 CANCEL_REQUESTED），返回 nil 避免事件重试。
 		return nil
 	}
-	log.Printf("run cancelled run=%s tenant=%s trigger_node=%s", e.RunID, e.TenantID, e.NodeID)
+	obs.From(ctx).InfoContext(ctx, "run cancelled",
+		"run_id", e.RunID, "tenant_id", e.TenantID, "trigger_node", e.NodeID)
 	return nil
 }
 
@@ -230,7 +232,9 @@ func (r *Resumer) handleReplan(ctx context.Context, e model.Event, run *model.Ru
 			return fmt.Errorf("enqueue replan node %s: %w", n.ID, err)
 		}
 	}
-	log.Printf("run replanned run=%s tenant=%s trigger_node=%s round=%d new_nodes=%d", e.RunID, e.TenantID, e.NodeID, round, len(plan.Nodes))
+	obs.From(ctx).InfoContext(ctx, "run replanned",
+		"run_id", e.RunID, "tenant_id", e.TenantID, "trigger_node", e.NodeID,
+		"round", round, "new_nodes", len(plan.Nodes))
 	return nil
 }
 
@@ -243,14 +247,16 @@ func (r *Resumer) handleReplan(ctx context.Context, e model.Event, run *model.Ru
 func (r *Resumer) loadOrReplan(ctx context.Context, e model.Event, run *model.Run, completed []model.Node, round int) (model.Plan, error) {
 	ds, ok := r.Store.(DecisionStore)
 	if !ok {
-		log.Printf("warn: store does not implement DecisionStore; replan decisions will not be persisted run=%s", e.RunID)
+		obs.From(ctx).WarnContext(ctx, "store does not implement DecisionStore; replan decisions will not be persisted",
+			"run_id", e.RunID)
 		return r.Planner.Replan(ctx, run, completed)
 	}
 	// 复用检查：命中已有决策直接返回，保证幂等重放不会触发第二次 LLM 调用。
 	if plan, exists, err := ds.GetDecision(ctx, e.RunID, e.TenantID, e.NodeID, round); err != nil {
 		return model.Plan{}, fmt.Errorf("get decision: %w", err)
 	} else if exists {
-		log.Printf("replan decision reused run=%s tenant=%s trigger_node=%s round=%d", e.RunID, e.TenantID, e.NodeID, round)
+		obs.From(ctx).InfoContext(ctx, "replan decision reused",
+			"run_id", e.RunID, "tenant_id", e.TenantID, "trigger_node", e.NodeID, "round", round)
 		return plan, nil
 	}
 	// 首次调用：生成新决策并持久化。保存失败即返回错误，事件重投后会重新进入本路径。
@@ -276,7 +282,7 @@ func (r *Resumer) checkReplanLimits(ctx context.Context, e model.Event, run *mod
 	if run.MaxSteps > 0 {
 		count, err := r.Store.CountNodes(ctx, e.TenantID, e.RunID)
 		if err != nil {
-			log.Printf("warn: count nodes for replan limits: %v", err)
+			obs.From(ctx).WarnContext(ctx, "count nodes for replan limits failed", "error", err)
 		} else if count >= run.MaxSteps {
 			return fmt.Sprintf("max steps exceeded: nodes %d >= limit %d", count, run.MaxSteps)
 		}
@@ -285,7 +291,7 @@ func (r *Resumer) checkReplanLimits(ctx context.Context, e model.Event, run *mod
 	if run.MaxTokens > 0 {
 		used, err := r.Store.RunTokenUsage(ctx, e.TenantID, e.RunID)
 		if err != nil {
-			log.Printf("warn: token usage for replan limits: %v", err)
+			obs.From(ctx).WarnContext(ctx, "token usage for replan limits failed", "error", err)
 		} else if used >= run.MaxTokens {
 			return fmt.Sprintf("token budget exhausted: used %d >= limit %d", used, run.MaxTokens)
 		}
@@ -305,7 +311,8 @@ func (r *Resumer) convergeOnLimit(ctx context.Context, e model.Event, run *model
 		// 版本冲突：并发已推进，返回 nil 避免事件无意义重试。
 		return nil
 	}
-	log.Printf("run failed on limit run=%s tenant=%s trigger_node=%s reason=%q", e.RunID, e.TenantID, e.NodeID, reason)
+	obs.From(ctx).WarnContext(ctx, "run failed on limit",
+		"run_id", e.RunID, "tenant_id", e.TenantID, "trigger_node", e.NodeID, "reason", reason)
 	return nil
 }
 

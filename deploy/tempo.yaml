@@ -1,0 +1,25 @@
+# Tempo 最小配置：接收 OTLP gRPC trace，提供 HTTP 查询（3200）与 OTLP 写入（4317）。
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+ingester:
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 168h   # 本地开发保留 7 天
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal

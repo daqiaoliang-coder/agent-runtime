@@ -9,6 +9,7 @@ import (
 	"agent-runtime/internal/llm"
 	"agent-runtime/internal/middleware"
 	"agent-runtime/internal/model"
+	"agent-runtime/internal/obs"
 	"agent-runtime/internal/providers"
 	"agent-runtime/internal/tool"
 	"agent-runtime/internal/trace"
@@ -18,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"strings"
 	"time"
@@ -79,11 +79,11 @@ type Dispatcher struct {
 	ToolProvider  providers.ToolProvider
 	LLM           llm.Client
 	Tools         *tool.Registry
-	ToolStore     ToolCallStore                                                          // 工具调用幂等存储；为 nil 时工具退化为直接执行（测试/无 DB 场景）
-	SubAgent      Executor                                                               // 子 Agent 执行器（递归运行子 Run），当前为占位实现
+	ToolStore     ToolCallStore                                                                  // 工具调用幂等存储；为 nil 时工具退化为直接执行（测试/无 DB 场景）
+	SubAgent      Executor                                                                       // 子 Agent 执行器（递归运行子 Run），当前为占位实现
 	ContextLoader func(ctx context.Context, tenant, runID, nodeID string) ([]llm.Message, error) // 从已提交节点重建对话历史（nodeID 用于 DAG 祖先作用域）
-	UsageRecorder UsageRecorder                                                          // LLM token/cost 持久化；为 nil 时不落库
-	Pricer        Pricer                                                                 // 成本估算函数；为 nil 时 cost 记 0
+	UsageRecorder UsageRecorder                                                                  // LLM token/cost 持久化；为 nil 时不落库
+	Pricer        Pricer                                                                         // 成本估算函数；为 nil 时 cost 记 0
 	// PromptCache 开启后为每个 Run 的 LLM 请求生成稳定的 prompt_cache_key 并透传给网关，
 	// 使同一 Run 内 append-only 的历史前缀命中 KV 缓存。默认关闭（见 worker 装配）。
 	PromptCache bool
@@ -468,7 +468,9 @@ func (d *Dispatcher) executeToolIdempotent(ctx context.Context, n *model.Node, r
 	case "RUNNING", "UNKNOWN":
 		// 关键日志：停滞的 RUNNING 或歧义 UNKNOWN 工具调用拒绝重执行，副作用状态未知，
 		// 是运维侧定位"卡死"/"歧义"工具调用的关键信号。
-		log.Printf("tool call refused re-execution call_id=%s run=%s node=%s tenant=%s (stale %s)", callID, n.RunID, n.ID, n.TenantID, rec.Status)
+		obs.From(ctx).WarnContext(ctx, "tool call refused re-execution",
+			"call_id", callID, "run_id", n.RunID, "node_id", n.ID,
+			"tenant_id", n.TenantID, "status", rec.Status)
 		return "", fmt.Errorf("tool call %s stale %s; refusing re-execution (non-idempotent safety)", callID, rec.Status)
 	default:
 		return "", fmt.Errorf("tool call %s unknown status %q", callID, rec.Status)

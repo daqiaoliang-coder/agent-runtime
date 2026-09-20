@@ -37,17 +37,17 @@ type fakeStore struct {
 	completedNodesErr error
 
 	// CountNodes / RunTokenUsage 模拟（用于多轮 Plan 死循环防护）
-	countNodes        int
-	countNodesErr     error
-	runTokenUsage     int
-	runTokenUsageErr  error
+	countNodes       int
+	countNodesErr    error
+	runTokenUsage    int
+	runTokenUsageErr error
 
 	// DecisionStore 模拟（用于决策持久化与复用）
-	decisionExists bool
-	decisionPlan   model.Plan
-	getDecisionErr error
-	saveDecisionErr error
-	getDecisionCalls []decisionCall
+	decisionExists    bool
+	decisionPlan      model.Plan
+	getDecisionErr    error
+	saveDecisionErr   error
+	getDecisionCalls  []decisionCall
 	saveDecisionCalls []decisionCall
 
 	// 调用记录（仅记录 tenant 参数，用于断言租户透传）
@@ -73,7 +73,7 @@ type casCall struct {
 }
 type cancelRunCall struct {
 	tenant, runID, reason string
-	version                int64
+	version               int64
 }
 type insertPlanCall struct{ plan model.Plan }
 type markReadyCall struct{ tenant, nodeID string }

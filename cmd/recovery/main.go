@@ -7,12 +7,12 @@ package main
 
 import (
 	"agent-runtime/internal/model"
+	"agent-runtime/internal/obs"
 	"agent-runtime/internal/queue"
 	"agent-runtime/internal/store"
 	"agent-runtime/internal/trace"
 	"context"
 	_ "github.com/go-sql-driver/mysql"
-	"log"
 	"os"
 	"time"
 )
@@ -20,19 +20,21 @@ import (
 func main() {
 	ctx := context.Background()
 	if shutdown, err := trace.Init("agent-recovery"); err != nil {
-		log.Printf("trace init skipped: %v", err)
+		obs.From(ctx).ErrorContext(ctx, "trace init skipped", "error", err)
 	} else {
 		defer shutdown(ctx)
 	}
 	dsn := env("DATABASE_DSN", "agent:agent@tcp(localhost:3306)/agent_runtime?parseTime=true")
 	s, err := store.New(ctx, dsn)
 	if err != nil {
-		log.Fatal(err)
+		obs.From(ctx).ErrorContext(ctx, "failed to connect store", "error", err)
+		os.Exit(1)
 	}
 	defer s.Close()
 	q := queue.New(env("REDIS_ADDR", "localhost:6379"), env("REDIS_STREAM", "agent.tasks"), env("REDIS_GROUP", "agent-workers"))
 	if err := q.Init(ctx); err != nil {
-		log.Fatal(err)
+		obs.From(ctx).ErrorContext(ctx, "failed to init queue", "error", err)
+		os.Exit(1)
 	}
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -46,16 +48,16 @@ func main() {
 			// 2. 若全部节点终态，CAS 收敛到 CANCELLED（Resumer 崩溃时的安全网）。
 			runs, err := s.CancelRequestedRuns(ctx, 100)
 			if err != nil {
-				log.Println("cancel scan:", err)
+				obs.From(ctx).ErrorContext(ctx, "cancel scan failed", "error", err)
 			}
 			for _, run := range runs {
 				if _, err := s.CancelRunNodes(ctx, run.TenantID, run.ID); err != nil {
-					log.Println("cancel nodes:", err)
+					obs.From(ctx).ErrorContext(ctx, "cancel nodes failed", "run_id", run.ID, "error", err)
 					continue
 				}
 				complete, err := s.RunComplete(ctx, run.TenantID, run.ID)
 				if err != nil {
-					log.Println("cancel complete check:", err)
+					obs.From(ctx).ErrorContext(ctx, "cancel complete check failed", "run_id", run.ID, "error", err)
 					continue
 				}
 				if !complete {
@@ -63,34 +65,34 @@ func main() {
 				}
 				ok, err := s.UpdateRunCAS(ctx, run.TenantID, run.ID, run.Version, model.RunCancelled, "", "cancelled by user")
 				if err != nil {
-					log.Println("cancel converge:", err)
+					obs.From(ctx).ErrorContext(ctx, "cancel converge failed", "run_id", run.ID, "error", err)
 					continue
 				}
 				if ok {
-					log.Printf("run cancelled run=%s tenant=%s", run.ID, run.TenantID)
+					obs.From(ctx).InfoContext(ctx, "run cancelled by recovery", "run_id", run.ID, "tenant_id", run.TenantID)
 				}
 			}
 
 			tasks, err := s.RecoverExpired(ctx, 100)
 			if err != nil {
-				log.Println("recovery:", err)
+				obs.From(ctx).ErrorContext(ctx, "recovery scan failed", "error", err)
 			}
 			ready, err := s.ReadyTasks(ctx, 100)
 			if err != nil {
-				log.Println("ready scan:", err)
+				obs.From(ctx).ErrorContext(ctx, "ready scan failed", "error", err)
 			}
 			tasks = append(tasks, ready...)
 			for _, t := range tasks {
 				if err := q.Enqueue(ctx, t); err != nil {
-					log.Println("enqueue recovered task:", err)
+					obs.From(ctx).ErrorContext(ctx, "enqueue recovered task failed", "run_id", t.RunID, "node_id", t.NodeID, "error", err)
 				}
 			}
 			// 回收 Redis Streams PEL 中停滞的未确认消息（worker 崩溃后未 Ack），
 			// 重新入队使其可被正常消费。重复投递由 ClaimNode CAS 拦截。
 			if n, err := q.ReclaimPending(ctx, "recovery", 30*time.Second, 100); err != nil {
-				log.Println("reclaim pending:", err)
+				obs.From(ctx).ErrorContext(ctx, "reclaim pending failed", "error", err)
 			} else if n > 0 {
-				log.Printf("reclaimed %d stale PEL messages", n)
+				obs.From(ctx).InfoContext(ctx, "reclaimed stale PEL messages", "count", n)
 			}
 		}
 	}

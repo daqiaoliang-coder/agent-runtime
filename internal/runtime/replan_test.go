@@ -10,11 +10,11 @@ import (
 
 // replanPlanner 是测试用 Planner，记录 Replan 调用并返回可配置的 Plan。
 type replanPlanner struct {
-	plan       model.Plan
-	err        error
-	called     bool
-	lastRun    *model.Run
-	lastNodes  []model.Node
+	plan      model.Plan
+	err       error
+	called    bool
+	lastRun   *model.Run
+	lastNodes []model.Node
 }
 
 func (p *replanPlanner) Plan(_ context.Context, _ *model.Run) (model.Plan, error) {
@@ -46,10 +46,10 @@ func TestResumer_ReplanRequested_StoresNewNodes(t *testing.T) {
 	newNode := model.PlanNode{ID: "run-1:r2:finish", Type: model.NodeLLM, Name: "finish", Input: "final answer"}
 	planner := &replanPlanner{plan: model.Plan{Nodes: []model.PlanNode{newNode}}}
 	fs := &fakeStore{
-		getRun:           &model.Run{ID: "run-1", TenantID: "tenant-A", Version: 5, Status: model.RunRunning},
-		depsReady:        true,
-		completedNodes:   []model.Node{{ID: "reflect-1", Name: "reflect", Output: `{"action":"replan"}`, Status: model.NodeSuccess, PlanningRound: 1}},
-		insertPlanCalls:  nil,
+		getRun:          &model.Run{ID: "run-1", TenantID: "tenant-A", Version: 5, Status: model.RunRunning},
+		depsReady:       true,
+		completedNodes:  []model.Node{{ID: "reflect-1", Name: "reflect", Output: `{"action":"replan"}`, Status: model.NodeSuccess, PlanningRound: 1}},
+		insertPlanCalls: nil,
 	}
 	q := &fakeQueue{}
 	r := &Resumer{Store: fs, Queue: q, Planner: planner}
@@ -133,8 +133,8 @@ func TestResumer_ReplanRequested_ReplanError_Propagates(t *testing.T) {
 	want := errors.New("planner failed")
 	planner := &replanPlanner{err: want}
 	fs := &fakeStore{
-		getRun:          &model.Run{ID: "run-1", Status: model.RunRunning, Version: 1},
-		completedNodes:  []model.Node{{ID: "n1", Status: model.NodeSuccess}},
+		getRun:         &model.Run{ID: "run-1", Status: model.RunRunning, Version: 1},
+		completedNodes: []model.Node{{ID: "n1", Status: model.NodeSuccess}},
 	}
 	r := &Resumer{Store: fs, Queue: &fakeQueue{}, Planner: planner}
 	err := r.Handle(context.Background(), replanEvent())
@@ -304,9 +304,9 @@ func TestResumer_ReplanRequested_SaveDecisionError_Propagates(t *testing.T) {
 	want := errors.New("decision store write failed")
 	planner := &replanPlanner{plan: model.Plan{Nodes: []model.PlanNode{{ID: "run-1:r2:n", Type: model.NodeLLM}}}}
 	fs := &fakeStore{
-		getRun:         &model.Run{ID: "run-1", Status: model.RunRunning, Version: 1},
-		depsReady:      true,
-		completedNodes: []model.Node{{ID: "reflect-1", Status: model.NodeSuccess, PlanningRound: 1}},
+		getRun:          &model.Run{ID: "run-1", Status: model.RunRunning, Version: 1},
+		depsReady:       true,
+		completedNodes:  []model.Node{{ID: "reflect-1", Status: model.NodeSuccess, PlanningRound: 1}},
 		saveDecisionErr: want,
 	}
 	r := &Resumer{Store: fs, Queue: &fakeQueue{}, Planner: planner}

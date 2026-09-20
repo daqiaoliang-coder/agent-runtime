@@ -4,6 +4,7 @@ import (
 	"agent-runtime/internal/llm"
 	"agent-runtime/internal/model"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -148,5 +149,118 @@ func TestNamespacePlan_PrefixesAndUpdatesRefs(t *testing.T) {
 	}
 	if plan.Nodes[1].ParentNodeID != "run-1:n1" {
 		t.Errorf("parent = %q, want run-1:n1", plan.Nodes[1].ParentNodeID)
+	}
+}
+
+const validSingleNodePlan = `{"nodes":[{"id":"n1","type":"LLM","name":"gen","input":"hi","dependsOn":[]}]}`
+
+// TestLLMPlanner_UsesJSONMode 首次调用应携带 JSONResponse=true 请求结构化输出。
+func TestLLMPlanner_UsesJSONMode(t *testing.T) {
+	var flags []bool
+	stub := &llm.Stub{Responder: func(req llm.Request) string {
+		flags = append(flags, req.JSONResponse)
+		return validSingleNodePlan
+	}}
+	if _, err := (&LLMPlanner{LLM: stub}).Plan(context.Background(), &model.Run{ID: "r", Input: "g"}); err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if len(flags) != 1 || !flags[0] {
+		t.Errorf("expected single call with JSON mode, got flags=%v", flags)
+	}
+}
+
+// TestLLMPlanner_RetriesAfterInvalidJSON 首次返回非 JSON 时应回填错误并重试，第二次成功。
+func TestLLMPlanner_RetriesAfterInvalidJSON(t *testing.T) {
+	calls := 0
+	stub := &llm.Stub{Responder: func(_ llm.Request) string {
+		calls++
+		if calls == 1 {
+			return "sorry, I cannot make a plan"
+		}
+		return validSingleNodePlan
+	}}
+	p, err := (&LLMPlanner{LLM: stub}).Plan(context.Background(), &model.Run{ID: "run-2", Input: "g"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 LLM calls, got %d", calls)
+	}
+	if len(p.Nodes) != 1 || p.Nodes[0].ID != "run-2:n1" {
+		t.Errorf("unexpected plan: %+v", p)
+	}
+}
+
+// TestLLMPlanner_RetriesExhausted 持续返回非法内容时应在 maxPlanAttempts 次后报错。
+func TestLLMPlanner_RetriesExhausted(t *testing.T) {
+	calls := 0
+	stub := &llm.Stub{Responder: func(_ llm.Request) string {
+		calls++
+		return "nope"
+	}}
+	_, err := (&LLMPlanner{LLM: stub}).Plan(context.Background(), &model.Run{ID: "r", Input: "g"})
+	if err == nil || !strings.Contains(err.Error(), "failed after 3 attempts") {
+		t.Fatalf("expected attempts-exhausted error, got %v", err)
+	}
+	if calls != maxPlanAttempts {
+		t.Errorf("expected %d calls, got %d", maxPlanAttempts, calls)
+	}
+}
+
+// http400Client 模拟不支持 response_format 的网关：首次带 JSON 模式返回 400，
+// 随后在普通模式下返回合法计划，并记录每次调用的 JSONResponse 标志。
+type http400Client struct {
+	flags []bool
+}
+
+func (c *http400Client) Complete(_ context.Context, req llm.Request) (llm.Response, error) {
+	c.flags = append(c.flags, req.JSONResponse)
+	if req.JSONResponse {
+		return llm.Response{}, fmt.Errorf("llm: http 400: response_format is not supported")
+	}
+	return llm.Response{Content: validSingleNodePlan}, nil
+}
+
+// TestLLMPlanner_JSONModeUnsupported_FallsBack 网关 400 拒绝 response_format 时
+// 应关闭 JSON 模式重试，且不消耗解析重试次数。
+func TestLLMPlanner_JSONModeUnsupported_FallsBack(t *testing.T) {
+	client := &http400Client{}
+	p, err := (&LLMPlanner{LLM: client}).Plan(context.Background(), &model.Run{ID: "run-3", Input: "g"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if len(client.flags) != 2 || client.flags[0] != true || client.flags[1] != false {
+		t.Errorf("expected flags [true false], got %v", client.flags)
+	}
+	if len(p.Nodes) != 1 || p.Nodes[0].ID != "run-3:n1" {
+		t.Errorf("unexpected plan: %+v", p)
+	}
+}
+
+// TestLLMPlanner_ReplanRetriesAfterInvalidJSON Replan 同样应在解析失败后重试，
+// 且成功节点带上正确的轮次与命名空间。
+func TestLLMPlanner_ReplanRetriesAfterInvalidJSON(t *testing.T) {
+	calls := 0
+	stub := &llm.Stub{Responder: func(_ llm.Request) string {
+		calls++
+		if calls == 1 {
+			return "not json"
+		}
+		return `{"nodes":[{"id":"f","type":"LLM","name":"finish","input":"final","dependsOn":[]}]}`
+	}}
+	completed := []model.Node{{PlanningRound: 1}}
+	p, err := (&LLMPlanner{LLM: stub}).Replan(context.Background(), &model.Run{ID: "run-7"}, completed)
+	if err != nil {
+		t.Fatalf("Replan: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 calls, got %d", calls)
+	}
+	node := p.Nodes[0]
+	if node.PlanningRound != 2 {
+		t.Errorf("PlanningRound=%d, want 2", node.PlanningRound)
+	}
+	if node.ID != "run-7:r2:f" {
+		t.Errorf("ID=%q, want run-7:r2:f", node.ID)
 	}
 }
