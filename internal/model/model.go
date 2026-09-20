@@ -104,11 +104,15 @@ type Task struct {
 // Event 是领域事件，通过 RocketMQ 在组件间传递。
 // 典型事件：AgentStepCompleted / AgentStepFailed，用于驱动 DAG 前进。
 // TenantID 随事件跨进程传递，Resume Controller 据此做租户隔离。
+//
+// TraceContext 承载 W3C traceparent，经 Outbox→RocketMQ 穿透到消费端，
+// 使 resumer 处理事件时的 span 能挂回原 Run 的 trace（而非另起一条）。
 type Event struct {
 	ID, Type, RunID, NodeID, TenantID string
 	Attempt                           int
 	Output, Error                     string
 	Timestamp                         time.Time
+	TraceContext                      map[string]string `json:"trace_context,omitempty"`
 }
 
 // OutboxMessage 是 MySQL Outbox 表中的待发布消息。

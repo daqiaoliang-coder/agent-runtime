@@ -10,6 +10,8 @@ import (
 	"github.com/apache/rocketmq-client-go/v2/consumer"
 	"github.com/apache/rocketmq-client-go/v2/primitive"
 	"github.com/apache/rocketmq-client-go/v2/producer"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // RocketMQ 封装生产者，负责将领域事件发送到指定 Topic。
@@ -62,7 +64,14 @@ func NewConsumer(nameserver, topic, group string, handler func(context.Context, 
 			if err := json.Unmarshal(m.Body, &e); err != nil {
 				return consumer.ConsumeRetryLater, err
 			}
-			if err := handler(ctx, e); err != nil {
+			// 从事件载荷提取 trace 上下文，重建与生产端（worker）同一条 Trace 的 ctx。
+			// 使 resumer/memory-indexer 处理事件的 span 挂回原 Run，避免 Outbox→MQ 跨进程断链。
+			// 无 TraceContext 时（如历史消息）沿用上层 ctx 作为新 trace 根。
+			msgCtx := ctx
+			if len(e.TraceContext) > 0 {
+				msgCtx = otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(e.TraceContext))
+			}
+			if err := handler(msgCtx, e); err != nil {
 				return consumer.ConsumeRetryLater, err
 			}
 		}

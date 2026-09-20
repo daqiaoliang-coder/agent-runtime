@@ -28,8 +28,10 @@ import (
 	"os"
 	"time"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
@@ -207,6 +209,7 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 				"run_id", n.RunID, "node_id", n.ID, "attempt", n.Attempt)
 			_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, budgetErr.Error(), next, "")
 			fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: budgetErr.Error(), Timestamp: time.Now()}
+			injectTraceContext(ctx, &fe)
 			payload, _ := json.Marshal(fe)
 			_, _ = w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{ID: fe.ID, EventType: fe.Type, AggregateID: n.RunID, Payload: string(payload)})
 			w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
@@ -281,6 +284,7 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 			"run_id", n.RunID, "node_id", n.ID, "attempt", n.Attempt, "error", execErr)
 		_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, execErr.Error(), next, output)
 		fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: execErr.Error(), Timestamp: time.Now()}
+		injectTraceContext(ctx, &fe)
 		payload, _ := json.Marshal(fe)
 		if _, ferr := w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{ID: fe.ID, EventType: fe.Type, AggregateID: n.RunID, Payload: string(payload)}); ferr != nil {
 			return fmt.Errorf("persist failure: %w (exec err: %v)", ferr, execErr)
@@ -304,6 +308,7 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		}
 	}
 	e := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: eventType, RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Output: output, Timestamp: time.Now()}
+	injectTraceContext(ctx, &e)
 	payload, _ := json.Marshal(e)
 	// 节点完成 + Outbox 事件在同一事务内提交，保证状态与事件一致。
 	// 上下文不再通过 checkpoint 累积（存在读改写竞态），改由 ContextLoader 从已提交的
@@ -321,6 +326,16 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		Type: contracts.EventNodeFinished, Timestamp: time.Now(), Data: map[string]any{"output": output, "attempt": n.Attempt},
 	})
 	return nil
+}
+
+// injectTraceContext 将当前 ctx 的 W3C trace 上下文注入事件，
+// 使其经 Outbox→RocketMQ 穿透到消费端后，resumer 能挂回原 Run 的 trace。
+// 与 queue.Enqueue 的注入逻辑一致，保证两条异步边界（队列/事件）trace 不断链。
+func injectTraceContext(ctx context.Context, e *model.Event) {
+	if e.TraceContext == nil {
+		e.TraceContext = map[string]string{}
+	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier(e.TraceContext))
 }
 
 // emitRuntimeEvent 发射运行时事件，发射前经 EventChain 变换（当前为脱敏）。
