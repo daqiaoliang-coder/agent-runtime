@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -265,12 +266,80 @@ func (s *MySQL) RunTokenUsage(ctx context.Context, tenant, runID string) (int, e
 
 // CompletedNodes 返回指定 Run 下所有 SUCCESS 节点（按完成时间排序），供 Planner.Replan
 // 读取前序节点的 outputs 作为续规上下文。
-func (s *MySQL) CompletedNodes(ctx context.Context, tenant, runID string) ([]model.Node, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT node_id,run_id,tenant_id,COALESCE(parent_node_id,''),type,name,COALESCE(input,''),COALESCE(output,''),status,attempt,version,COALESCE(lease_owner,''),lease_until,planning_round,created_at,started_at,finished_at FROM agent_node WHERE run_id=? AND tenant_id=? AND status=? ORDER BY finished_at`, runID, tenant, model.NodeSuccess)
+//
+// 排序必须带 node_id 作为 finished_at 并列时的 tiebreaker：并行节点可能在同一
+// 微秒提交，仅按 finished_at 排序的结果在不同执行/恢复之间可能漂移，进而让
+// 派生对话历史的顺序不确定、击穿 LLM 网关的前缀缓存。
+// nodeSelectFields 是节点读取路径共享的列清单（与 scanNodes 的 Scan 顺序一一对应）。
+// CompletedNodes 与 CompletedAncestorNodes 必须共用，保证两条路径行结构解释一致。
+var nodeSelectFields = []string{
+	"node_id", "run_id", "tenant_id", "COALESCE(parent_node_id,'')", "type", "name",
+	"COALESCE(input,'')", "COALESCE(output,'')", "status", "attempt", "version",
+	"COALESCE(lease_owner,'')", "lease_until", "planning_round",
+	"created_at", "started_at", "finished_at",
+}
+
+// nodeColumns 返回可加表别名前缀的列清单，供 JOIN 查询限定列归属。
+func nodeColumns(prefix string) string {
+	cp := make([]string, len(nodeSelectFields))
+	for i, f := range nodeSelectFields {
+		if prefix != "" {
+			f = prefix + "." + f
+		}
+		cp[i] = f
+	}
+	return strings.Join(cp, ",")
+}
+
+var completedNodesSelect = "SELECT " + nodeColumns("") + " FROM agent_node"
+
+// ancestorDepthLimit 限制递归 CTE 的展开深度。正常 DAG 经 planner.validatePlan
+// 保证无环，这里只是防御性兜底，避免异常数据导致无限递归。
+const ancestorDepthLimit = 1000
+
+// CompletedAncestorNodes 返回目标节点在 agent_edge 上的全部上游（递归传递闭包）中
+// 已 SUCCESS 的节点，按 (finished_at, node_id) 确定序排列。
+//
+// 这是"DAG 祖先作用域上下文"的数据来源：节点只应看到自己数据依赖链路上的
+// 前序产出，而不是全 Run 所有节点。并行扇出越大，相比 CompletedNodes 全量读取
+// 省得越多。边表不带 tenant_id（run_id 全局唯一），租户过滤落在节点行上。
+//
+// 递归方向：以目标节点的入边为种子，沿 to_node_id ← from_node_id 向上追溯。
+// 去重在 JOIN 阶段用 DISTINCT 完成（菱形依赖会让同一祖先经多条路径到达）。
+func (s *MySQL) CompletedAncestorNodes(ctx context.Context, tenant, runID, nodeID string) ([]model.Node, error) {
+	// q 含 nodeColumns() 函数调用，必须为变量而非 const（const 初始化不允许函数调用）。
+	q := `WITH RECURSIVE ancestors(depth, anc_id) AS (
+	SELECT 0, from_node_id FROM agent_edge WHERE run_id=? AND to_node_id=?
+	UNION ALL
+	SELECT a.depth+1, e.from_node_id
+	FROM agent_edge e JOIN ancestors a ON e.to_node_id = a.anc_id
+	WHERE e.run_id=? AND a.depth < ?
+)
+SELECT ` + nodeColumns("n") + ` FROM agent_node n
+JOIN (SELECT DISTINCT anc_id FROM ancestors) a ON a.anc_id = n.node_id
+WHERE n.tenant_id=? AND n.status=?
+ORDER BY n.finished_at,n.node_id`
+	rows, err := s.DB.QueryContext(ctx, q,
+		runID, nodeID, runID, ancestorDepthLimit, tenant, model.NodeSuccess)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanNodes(rows)
+}
+
+func (s *MySQL) CompletedNodes(ctx context.Context, tenant, runID string) ([]model.Node, error) {
+	rows, err := s.DB.QueryContext(ctx, completedNodesSelect+` WHERE run_id=? AND tenant_id=? AND status=? ORDER BY finished_at,node_id`, runID, tenant, model.NodeSuccess)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
+// scanNodes 解码节点查询行，供 CompletedNodes / CompletedAncestorNodes 共用，
+// 保证两条读取路径的行结构解释永远一致。
+func scanNodes(rows *sql.Rows) ([]model.Node, error) {
 	var out []model.Node
 	for rows.Next() {
 		var n model.Node

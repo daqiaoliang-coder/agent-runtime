@@ -12,11 +12,8 @@ package worker
 import (
 	"agent-runtime/internal/contracts"
 	"agent-runtime/internal/llm"
-	"agent-runtime/internal/model"
 	"agent-runtime/internal/providers"
 	"context"
-	"database/sql"
-	"errors"
 	"log"
 	"os"
 	"strconv"
@@ -62,57 +59,8 @@ func (o MemoryOptions) maxMessages() int {
 	return o.MaxMessages
 }
 
-// contextStore 是 ContextLoader 所需的持久化能力（*store.MySQL 天然实现）。
-//
-// 抽象为接口而非直接用 *store.MySQL，是为了让拼接/截断/降级逻辑可以被单测覆盖，
-// 不必为了测一个纯函数而起一个真实 MySQL。
-type contextStore interface {
-	CompletedNodes(ctx context.Context, tenant, runID string) ([]model.Node, error)
-	GetRun(ctx context.Context, tenant, id string) (*model.Run, error)
-}
-
-// newContextLoader 构造 executor.Dispatcher.ContextLoader。
-//
-// 返回的闭包把两段上下文拼成对话历史：
-//  1. **跨 Run 语义记忆**（前置）——从向量库召回同会话的历史，让 Agent 跨 Run 连续；
-//  2. **当前 Run 历史**（后置）——从已提交的 SUCCESS 节点派生，这是接入前就有的行为。
-//
-// 记忆在前、当前历史在后，是为了让最近、最相关的上下文紧邻本轮 user prompt，
-// 符合对话的时间顺序直觉，也便于模型优先关注。
-//
-// 错误语义是刻意分层的：
-//   - CompletedNodes 失败 → **向上返回 error**。它是主链路必需数据，
-//     静默吞掉会让 Agent 在缺失历史的情况下推理（executor_test 已锁定该行为）。
-//   - 记忆召回失败 → 只记 warn，返回仅含当前 Run 历史的结果。
-func newContextLoader(s contextStore, opt MemoryOptions) func(context.Context, string, string) ([]llm.Message, error) {
-	return func(ctx context.Context, tenant, runID string) ([]llm.Message, error) {
-		nodes, err := s.CompletedNodes(ctx, tenant, runID)
-		if err != nil {
-			if !errors.Is(err, sql.ErrNoRows) {
-				return nil, err
-			}
-			nodes = nil
-		}
-		current := make([]llm.Message, 0, len(nodes)*2)
-		for _, n := range nodes {
-			current = append(current,
-				llm.Message{Role: llm.RoleUser, Content: n.Input},
-				llm.Message{Role: llm.RoleAssistant, Content: n.Output},
-			)
-		}
-
-		// 记忆未启用时必须**原样返回**，不走截断：
-		// 接入向量检索前 ContextLoader 就是返回全部当前 Run 历史，
-		// 若这里套用 MaxMessages 截断，会悄悄改变未启用记忆部署的既有行为
-		// （长 Run 的上下文被砍掉），违背"现有部署零感知"的前提。
-		if opt.Memory == nil {
-			return current, nil
-		}
-
-		recalled := recallMemory(ctx, s, opt, tenant, runID)
-		return mergeMessages(recalled, current, opt.maxMessages()), nil
-	}
-}
+// ContextLoader 的组装与上下文塑形（祖先作用域、工具结果遮蔽）见 context.go；
+// 本文件只保留跨 Run 语义记忆的召回与拼接逻辑。
 
 // recallMemory 召回跨 Run 的语义记忆。任何失败都返回 nil（降级），绝不返回 error。
 //

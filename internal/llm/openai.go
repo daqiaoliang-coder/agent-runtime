@@ -63,6 +63,18 @@ func (c *OpenAIClient) resolveAuth(ctx context.Context) (string, error) {
 type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
+	// ResponseFormat 非 nil 时要求 provider 输出 JSON（omitempty 保证普通请求不带该字段）。
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+	// PromptCacheKey 透传 OpenAI 兼容网关的 prompt_cache_key 扩展字段：
+	// 网关按该键复用 append-only 前缀的服务端 KV 缓存。空值省略，不支持该扩展的
+	// 严格网关不会在未开启开关时收到任何额外字段（见 worker 的 LLM_PROMPT_CACHE）。
+	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
+}
+
+// responseFormat 对应 OpenAI 的 response_format 参数；Type="json_object" 开启 JSON 模式。
+// 注意：开启时 messages 中必须出现 "json" 字样，否则 OpenAI 会返回 400。
+type responseFormat struct {
+	Type string `json:"type"`
 }
 type chatMessage struct {
 	Role    string `json:"role"`
@@ -107,6 +119,10 @@ func (c *OpenAIClient) Complete(ctx context.Context, req Request) (_ Response, e
 	for i, m := range req.Messages {
 		body.Messages[i] = chatMessage{Role: string(m.Role), Content: m.Content}
 	}
+	if req.JSONResponse {
+		body.ResponseFormat = &responseFormat{Type: "json_object"}
+	}
+	body.PromptCacheKey = req.CacheKey
 	b, err := json.Marshal(body)
 	if err != nil {
 		return Response{}, err

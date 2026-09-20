@@ -48,6 +48,10 @@ type GenerateRequest struct {
 	Model    string
 	Messages []Message
 	Tools    []ToolDefinition
+	// CacheKey 是透传给网关的 prompt 前缀缓存键（如 OpenAI 兼容网关的
+	// prompt_cache_key）。为空表示不透传。同一 Run 内保持稳定，使 append-only
+	// 的历史前缀复用服务端 KV 缓存；是否生成该键由执行器侧开关决定。
+	CacheKey string
 }
 
 // GenerateResponse 是一次模型生成的响应：回复消息、token 用量、可能附带的工具调用。

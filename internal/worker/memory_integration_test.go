@@ -127,9 +127,9 @@ func TestMemoryContextLoader_RealStore_CurrentRunHistory(t *testing.T) {
 	const tenant, thread = "tenant-it", "thread-w1"
 	seedCompletedRun(t, s, tenant, thread, "it-w-run1", "项目为什么延期", "上游依赖未就绪")
 
-	// 记忆未启用（Memory=nil）：应与接入前行为一致。
-	loader := newContextLoader(s, MemoryOptions{})
-	got, err := loader(ctx, tenant, "it-w-run1")
+	// 记忆未启用（Memory=nil）且塑形关闭：应与接入前行为一致。
+	loader := newContextLoader(s, ContextOptions{AncestorScope: false, ToolMasking: false})
+	got, err := loader(ctx, tenant, "it-w-run1", "cur-node")
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -174,13 +174,17 @@ func TestMemoryContextLoader_RealStore_DegradesWhenQdrantDown(t *testing.T) {
 		Collection: itCollection,
 		MinScore:   0,
 	}
-	loader := newContextLoader(s, MemoryOptions{
-		Memory:        mem,
-		SearchTimeout: 3 * time.Second,
-		MaxMessages:   20,
+	loader := newContextLoader(s, ContextOptions{
+		AncestorScope: false,
+		ToolMasking:   false,
+		Memory: MemoryOptions{
+			Memory:        mem,
+			SearchTimeout: 3 * time.Second,
+			MaxMessages:   20,
+		},
 	})
 
-	got, err := loader(ctx, tenant, "it-w-run2")
+	got, err := loader(ctx, tenant, "it-w-run2", "cur-node")
 	if err != nil {
 		t.Fatalf("向量库不可达时 ContextLoader 必须降级而非报错，实际: %v", err)
 	}
@@ -243,9 +247,9 @@ func TestMemoryContextLoader_RealStore_EndToEndRecall(t *testing.T) {
 	mem := &providers.VectorMemory{
 		Embedder: embedder, Store: vs, Collection: itCollection, MinScore: 0, TopK: 10,
 	}
-	loader := newContextLoader(s, MemoryOptions{Memory: mem, SearchTimeout: 5 * time.Second})
+	loader := newContextLoader(s, ContextOptions{AncestorScope: false, ToolMasking: false, Memory: MemoryOptions{Memory: mem, SearchTimeout: 5 * time.Second}})
 
-	got, err := loader(ctx, tenant, "it-w-cur")
+	got, err := loader(ctx, tenant, "it-w-cur", "cur-node")
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -288,8 +292,8 @@ func TestNewFromEnv_MemoryEnabledButQdrantDown(t *testing.T) {
 	defer s.Close()
 	seedCompletedRun(t, s, "tenant-it", "thread-env", "it-w-env", "q", "a")
 
-	loader := newContextLoader(s, opt)
-	got, err := loader(context.Background(), "tenant-it", "it-w-env")
+	loader := newContextLoader(s, ContextOptions{AncestorScope: false, ToolMasking: false, Memory: opt})
+	got, err := loader(context.Background(), "tenant-it", "it-w-env", "cur-node")
 	if err != nil {
 		t.Fatalf("向量库不可达时装配出的 loader 仍须降级，实际报错: %v", err)
 	}

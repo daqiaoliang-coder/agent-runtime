@@ -81,9 +81,12 @@ type Dispatcher struct {
 	Tools         *tool.Registry
 	ToolStore     ToolCallStore                                                          // 工具调用幂等存储；为 nil 时工具退化为直接执行（测试/无 DB 场景）
 	SubAgent      Executor                                                               // 子 Agent 执行器（递归运行子 Run），当前为占位实现
-	ContextLoader func(ctx context.Context, tenant, runID string) ([]llm.Message, error) // 从已提交节点重建对话历史
+	ContextLoader func(ctx context.Context, tenant, runID, nodeID string) ([]llm.Message, error) // 从已提交节点重建对话历史（nodeID 用于 DAG 祖先作用域）
 	UsageRecorder UsageRecorder                                                          // LLM token/cost 持久化；为 nil 时不落库
 	Pricer        Pricer                                                                 // 成本估算函数；为 nil 时 cost 记 0
+	// PromptCache 开启后为每个 Run 的 LLM 请求生成稳定的 prompt_cache_key 并透传给网关，
+	// 使同一 Run 内 append-only 的历史前缀命中 KV 缓存。默认关闭（见 worker 装配）。
+	PromptCache bool
 	// ToolChain 是工具调用的横切链（不可信输入防护 + 数据脱敏），为 nil 时不拦截。
 	//
 	// 挂在 Dispatcher 而非只挂在 react.Engine 的理由：生产路径上工具是由 DAG 的
@@ -193,10 +196,11 @@ func (d *Dispatcher) Execute(ctx context.Context, n *model.Node) (string, error)
 func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, error) {
 	ctx, span := trace.StartSpan(ctx, "executor.llm")
 	defer span.End()
-	// 从 checkpoint 重建对话历史：历史在前，当前 user prompt 在后，保证 Agent 上下文连续。
+	// 历史在前，当前 user prompt 在后，保证 Agent 上下文连续。
+	// 历史由 ContextLoader 从已提交的 SUCCESS（祖先）节点派生，不依赖 checkpoint。
 	msgs := []llm.Message{{Role: llm.RoleUser, Content: n.Input}}
 	if d.ContextLoader != nil {
-		hist, err := d.ContextLoader(ctx, n.TenantID, n.RunID)
+		hist, err := d.ContextLoader(ctx, n.TenantID, n.RunID, n.ID)
 		if err != nil {
 			return "", fmt.Errorf("load context: %w", err)
 		}
@@ -206,7 +210,7 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 	}
 	var resp llm.Response
 	if d.ModelProvider != nil {
-		request := contracts.GenerateRequest{Model: modelForNode(n)}
+		request := contracts.GenerateRequest{Model: modelForNode(n), CacheKey: d.cacheKey(n)}
 		for _, m := range msgs {
 			request.Messages = append(request.Messages, contracts.Message{Role: contracts.Role(m.Role), Content: m.Content})
 		}
@@ -223,7 +227,7 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 		if d.LLM == nil {
 			return "", fmt.Errorf("llm client not configured")
 		}
-		got, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs})
+		got, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs, CacheKey: d.cacheKey(n)})
 		if err != nil {
 			return "", fmt.Errorf("llm: %w", err)
 		}
@@ -279,23 +283,20 @@ func (d *Dispatcher) executeReflect(ctx context.Context, n *model.Node) (string,
 	ctx, span := trace.StartSpan(ctx, "executor.reflect")
 	defer span.End()
 	// 从 checkpoint 重建对话历史作为评估上下文。
-	msgs := []llm.Message{
-		{Role: llm.RoleSystem, Content: reflectSystemPrompt},
-		{Role: llm.RoleUser, Content: n.Input},
-	}
+	// 布局固定为 system（稳定前缀）→ 历史（append-only）→ 当前反思指令，
+	// 既符合 chat 语义也让前缀缓存可复用（system 不会被历史挤到中间）。
+	msgs := []llm.Message{{Role: llm.RoleSystem, Content: reflectSystemPrompt}}
 	if d.ContextLoader != nil {
-		hist, err := d.ContextLoader(ctx, n.TenantID, n.RunID)
+		hist, err := d.ContextLoader(ctx, n.TenantID, n.RunID, n.ID)
 		if err != nil {
 			return "", fmt.Errorf("load context for reflect: %w", err)
 		}
-		if len(hist) > 0 {
-			// 历史在前，反思指令在后。
-			msgs = append(hist, msgs...)
-		}
+		msgs = append(msgs, hist...)
 	}
+	msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: n.Input})
 	var resp llm.Response
 	if d.ModelProvider != nil {
-		request := contracts.GenerateRequest{Model: modelForNode(n)}
+		request := contracts.GenerateRequest{Model: modelForNode(n), CacheKey: d.cacheKey(n)}
 		for _, m := range msgs {
 			request.Messages = append(request.Messages, contracts.Message{Role: contracts.Role(m.Role), Content: m.Content})
 		}
@@ -308,7 +309,7 @@ func (d *Dispatcher) executeReflect(ctx context.Context, n *model.Node) (string,
 		if d.LLM == nil {
 			return "", fmt.Errorf("llm client not configured for reflect")
 		}
-		got, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs})
+		got, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs, CacheKey: d.cacheKey(n)})
 		if err != nil {
 			return "", fmt.Errorf("reflect llm: %w", err)
 		}
@@ -508,6 +509,16 @@ func idempotencyKey(runID, nodeID, toolName, input string) string {
 // 可复用为模型标识），为空时由 LLM 客户端决定默认模型。
 func modelForNode(n *model.Node) string { return n.Name }
 
+// cacheKey 返回该节点所属 Run 的稳定缓存键。同一 Run 内不同节点的历史是 append-only
+// 增长的同一前缀，因此键按 (tenant, run) 维度固定、不带 node_id；带 tenant 是为了
+// 在多租户共用网关时避免键空间碰撞。PromptCache 关闭时返回空串（不透传该字段）。
+func (d *Dispatcher) cacheKey(n *model.Node) string {
+	if !d.PromptCache {
+		return ""
+	}
+	return "agent-run:" + n.TenantID + ":" + n.RunID
+}
+
 // NewDefault 构造一个开箱即用的 Dispatcher：使用 Echo（Stub）LLM + Search/Calculator 工具。
 // 不带 ToolStore（工具直接执行），便于本地无 DB 演示与单元测试。
 func NewDefault() *Dispatcher {
@@ -531,7 +542,7 @@ func (d *Dispatcher) StreamLLM(ctx context.Context, n *model.Node) (<-chan contr
 	if d.ModelProvider != nil {
 		msgs := []contracts.Message{{Role: contracts.RoleUser, Content: n.Input}}
 		if d.ContextLoader != nil {
-			hist, err := d.ContextLoader(ctx, n.TenantID, n.RunID)
+			hist, err := d.ContextLoader(ctx, n.TenantID, n.RunID, n.ID)
 			if err != nil {
 				return nil, fmt.Errorf("load context: %w", err)
 			}
@@ -543,12 +554,12 @@ func (d *Dispatcher) StreamLLM(ctx context.Context, n *model.Node) (<-chan contr
 				msgs = append(msgs, contracts.Message{Role: contracts.RoleUser, Content: n.Input})
 			}
 		}
-		return d.ModelProvider.Stream(ctx, contracts.GenerateRequest{Model: modelForNode(n), Messages: msgs})
+		return d.ModelProvider.Stream(ctx, contracts.GenerateRequest{Model: modelForNode(n), Messages: msgs, CacheKey: d.cacheKey(n)})
 	}
 	if d.LLM == nil {
 		return nil, fmt.Errorf("llm client not configured")
 	}
-	resp, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: []llm.Message{{Role: llm.RoleUser, Content: n.Input}}})
+	resp, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: []llm.Message{{Role: llm.RoleUser, Content: n.Input}}, CacheKey: d.cacheKey(n)})
 	if err != nil {
 		return nil, err
 	}

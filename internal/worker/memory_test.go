@@ -4,26 +4,45 @@ import (
 	"agent-runtime/internal/contracts"
 	"agent-runtime/internal/llm"
 	"agent-runtime/internal/model"
+	"agent-runtime/internal/providers"
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
+
+// legacyLoader 构造关闭祖先作用域与工具遮蔽的 loader（全量节点 + 无差别配对），
+// 供只验证跨 Run 记忆路径的既有测试使用。
+func legacyLoader(s contextStore, mem providers.MemoryProvider) func(context.Context, string, string, string) ([]llm.Message, error) {
+	return newContextLoader(s, ContextOptions{AncestorScope: false, ToolMasking: false, Memory: MemoryOptions{Memory: mem}})
+}
 
 // ==== 测试替身 ====
 
-// fakeContextStore 实现 contextStore，可分别注入 CompletedNodes / GetRun 的行为。
+// fakeContextStore 实现 contextStore，可分别注入全量/祖先节点查询与 GetRun 的行为。
 type fakeContextStore struct {
-	nodes       []model.Node
-	nodesErr    error
-	run         *model.Run
-	runErr      error
-	getRunCalls int
+	nodes        []model.Node
+	nodesErr     error
+	ancestor     []model.Node
+	ancestorErr  error
+	ancestorWith string // 记录最近一次祖先查询的目标 nodeID
+	ancestorN    int
+	run          *model.Run
+	runErr       error
+	getRunCalls  int
 }
 
 func (f *fakeContextStore) CompletedNodes(context.Context, string, string) ([]model.Node, error) {
 	return f.nodes, f.nodesErr
+}
+
+func (f *fakeContextStore) CompletedAncestorNodes(_ context.Context, _, _, nodeID string) ([]model.Node, error) {
+	f.ancestorN++
+	f.ancestorWith = nodeID
+	return f.ancestor, f.ancestorErr
 }
 
 func (f *fakeContextStore) GetRun(context.Context, string, string) (*model.Run, error) {
@@ -206,9 +225,10 @@ func TestContextLoader_MemoryDisabled_UnchangedBehavior(t *testing.T) {
 	}
 	s := &fakeContextStore{nodes: nodes}
 	// MaxMessages 故意设得很小：若被误用，结果会被截断。
-	loader := newContextLoader(s, MemoryOptions{Memory: nil, MaxMessages: 4})
+	// 显式关闭塑形：本用例锁定的是"无截断"旧行为，与祖先/遮蔽策略正交。
+	loader := newContextLoader(s, ContextOptions{AncestorScope: false, ToolMasking: false, Memory: MemoryOptions{Memory: nil, MaxMessages: 4}})
 
-	got, err := loader(context.Background(), "tenant-A", "run-1")
+	got, err := loader(context.Background(), "tenant-A", "run-1", "cur")
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -229,9 +249,9 @@ func TestContextLoader_PrependsMemory(t *testing.T) {
 	fs := &fakeSearcher{msgs: []contracts.Message{
 		{Role: contracts.RoleAssistant, Content: "上次说过依赖未就绪"},
 	}}
-	loader := newContextLoader(s, MemoryOptions{Memory: fs})
+	loader := newContextLoader(s, ContextOptions{AncestorScope: false, ToolMasking: false, Memory: MemoryOptions{Memory: fs}})
 
-	got, err := loader(context.Background(), "tenant-A", "run-2")
+	got, err := loader(context.Background(), "tenant-A", "run-2", "cur")
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -255,9 +275,9 @@ func TestContextLoader_QueryAndIsolation(t *testing.T) {
 		run:   &model.Run{ID: "run-9", TenantID: "tenant-A", ThreadID: "thread-7", Input: "整个会话的原始诉求"},
 	}
 	fs := &fakeSearcher{}
-	loader := newContextLoader(s, MemoryOptions{Memory: fs, MaxMessages: 7})
+	loader := newContextLoader(s, ContextOptions{AncestorScope: false, ToolMasking: false, Memory: MemoryOptions{Memory: fs, MaxMessages: 7}})
 
-	if _, err := loader(context.Background(), "tenant-A", "run-9"); err != nil {
+	if _, err := loader(context.Background(), "tenant-A", "run-9", "cur"); err != nil {
 		t.Fatalf("loader: %v", err)
 	}
 	if fs.calls != 1 {
@@ -287,9 +307,9 @@ func TestContextLoader_SkipsWhenNoSearcher(t *testing.T) {
 		nodes: []model.Node{llmNode("n1", "in", "out")},
 		run:   &model.Run{ID: "run-1", TenantID: "tenant-A", ThreadID: "t", Input: "q"},
 	}
-	loader := newContextLoader(s, MemoryOptions{Memory: plainMemory{}})
+	loader := newContextLoader(s, ContextOptions{AncestorScope: false, ToolMasking: false, Memory: MemoryOptions{Memory: plainMemory{}}})
 
-	got, err := loader(context.Background(), "tenant-A", "run-1")
+	got, err := loader(context.Background(), "tenant-A", "run-1", "cur")
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -314,9 +334,9 @@ func TestContextLoader_DegradesOnSearchError(t *testing.T) {
 		run:   &model.Run{ID: "run-1", TenantID: "tenant-A", ThreadID: "t", Input: "q"},
 	}
 	fs := &fakeSearcher{err: errors.New("qdrant unavailable")}
-	loader := newContextLoader(s, MemoryOptions{Memory: fs})
+	loader := legacyLoader(s, fs)
 
-	got, err := loader(context.Background(), "tenant-A", "run-1")
+	got, err := loader(context.Background(), "tenant-A", "run-1", "cur")
 	if err != nil {
 		t.Fatalf("search failure must degrade, got err=%v", err)
 	}
@@ -332,10 +352,10 @@ func TestContextLoader_DegradesOnTimeout(t *testing.T) {
 		run:   &model.Run{ID: "run-1", TenantID: "tenant-A", ThreadID: "t", Input: "q"},
 	}
 	fs := &fakeSearcher{block: 500 * time.Millisecond} // 远超下面的超时预算
-	loader := newContextLoader(s, MemoryOptions{Memory: fs, SearchTimeout: 10 * time.Millisecond})
+	loader := newContextLoader(s, ContextOptions{AncestorScope: false, ToolMasking: false, Memory: MemoryOptions{Memory: fs, SearchTimeout: 10 * time.Millisecond}})
 
 	start := time.Now()
-	got, err := loader(context.Background(), "tenant-A", "run-1")
+	got, err := loader(context.Background(), "tenant-A", "run-1", "cur")
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -358,9 +378,9 @@ func TestContextLoader_DegradesOnGetRunError(t *testing.T) {
 		runErr: errors.New("db unreachable"),
 	}
 	fs := &fakeSearcher{msgs: []contracts.Message{{Content: "不该出现"}}}
-	loader := newContextLoader(s, MemoryOptions{Memory: fs})
+	loader := legacyLoader(s, fs)
 
-	got, err := loader(context.Background(), "tenant-A", "run-1")
+	got, err := loader(context.Background(), "tenant-A", "run-1", "cur")
 	if err != nil {
 		t.Fatalf("GetRun failure must degrade, got err=%v", err)
 	}
@@ -382,9 +402,9 @@ func TestContextLoader_SkipsWhenRunInputEmpty(t *testing.T) {
 		run:   &model.Run{ID: "run-1", TenantID: "tenant-A", ThreadID: "t", Input: ""},
 	}
 	fs := &fakeSearcher{msgs: []contracts.Message{{Content: "不该出现"}}}
-	loader := newContextLoader(s, MemoryOptions{Memory: fs})
+	loader := legacyLoader(s, fs)
 
-	got, err := loader(context.Background(), "tenant-A", "run-1")
+	got, err := loader(context.Background(), "tenant-A", "run-1", "cur")
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -407,9 +427,9 @@ func TestContextLoader_SkipsEmptyMemoryContent(t *testing.T) {
 		{Role: contracts.RoleAssistant, Content: ""},
 		{Role: contracts.RoleAssistant, Content: "有效记忆"},
 	}}
-	loader := newContextLoader(s, MemoryOptions{Memory: fs})
+	loader := legacyLoader(s, fs)
 
-	got, err := loader(context.Background(), "tenant-A", "run-1")
+	got, err := loader(context.Background(), "tenant-A", "run-1", "cur")
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -432,9 +452,9 @@ func TestContextLoader_RoleConversion(t *testing.T) {
 		{Role: contracts.RoleUser, Content: "usr"},
 		{Role: contracts.RoleAssistant, Content: "ast"},
 	}}
-	loader := newContextLoader(s, MemoryOptions{Memory: fs})
+	loader := legacyLoader(s, fs)
 
-	got, err := loader(context.Background(), "tenant-A", "run-1")
+	got, err := loader(context.Background(), "tenant-A", "run-1", "cur")
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -458,9 +478,9 @@ func TestContextLoader_RoleConversion(t *testing.T) {
 // executor_test.go 已锁定"ContextLoader 报错应传播"的行为，此处保持一致。
 func TestContextLoader_CompletedNodesErrorPropagates(t *testing.T) {
 	s := &fakeContextStore{nodesErr: errors.New("db unreachable")}
-	loader := newContextLoader(s, MemoryOptions{Memory: nil})
+	loader := newContextLoader(s, ContextOptions{AncestorScope: false, ToolMasking: false})
 
-	if _, err := loader(context.Background(), "tenant-A", "run-1"); err == nil {
+	if _, err := loader(context.Background(), "tenant-A", "run-1", "cur"); err == nil {
 		t.Fatal("CompletedNodes failure must propagate")
 	}
 }
@@ -469,9 +489,9 @@ func TestContextLoader_CompletedNodesErrorPropagates(t *testing.T) {
 // 属于正常状态而非故障，不应上抛。
 func TestContextLoader_NoRowsIsNotAnError(t *testing.T) {
 	s := &fakeContextStore{nodesErr: sql.ErrNoRows}
-	loader := newContextLoader(s, MemoryOptions{Memory: nil})
+	loader := newContextLoader(s, ContextOptions{AncestorScope: false, ToolMasking: false})
 
-	got, err := loader(context.Background(), "tenant-A", "run-1")
+	got, err := loader(context.Background(), "tenant-A", "run-1", "cur")
 	if err != nil {
 		t.Fatalf("sql.ErrNoRows should not propagate, got %v", err)
 	}
@@ -549,5 +569,138 @@ func TestNewMemoryOptionsFromEnv_DisabledWithoutKey(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "")
 	if opt := newMemoryOptionsFromEnv(newCredentialsFromEnv()); opt.Memory != nil {
 		t.Error("memory should be disabled without an embedding key")
+	}
+}
+
+// ==== P0：DAG 祖先作用域 ====
+
+// TestContextLoader_AncestorScope_RoutesQuery 开启祖先作用域后必须改走
+// CompletedAncestorNodes 且把当前 nodeID 透传，全量查询不应被调用。
+func TestContextLoader_AncestorScope_RoutesQuery(t *testing.T) {
+	s := &fakeContextStore{ancestor: []model.Node{llmNode("a1", "in", "out")}}
+	loader := newContextLoader(s, ContextOptions{AncestorScope: true, ToolMasking: false})
+
+	got, err := loader(context.Background(), "tenant-A", "run-1", "target-node")
+	if err != nil {
+		t.Fatalf("loader: %v", err)
+	}
+	if s.ancestorN != 1 || s.ancestorWith != "target-node" {
+		t.Errorf("ancestor query must run once with target nodeID, got n=%d node=%q", s.ancestorN, s.ancestorWith)
+	}
+	if len(got) != 2 {
+		t.Errorf("expected 2 messages from ancestors, got %d", len(got))
+	}
+}
+
+// TestContextLoader_AncestorScope_ErrorPropagates 祖先查询失败属于主链路必需数据失败，
+// 必须与 CompletedNodes 失败一样上抛。
+func TestContextLoader_AncestorScope_ErrorPropagates(t *testing.T) {
+	s := &fakeContextStore{ancestorErr: errors.New("cte failed")}
+	loader := newContextLoader(s, ContextOptions{AncestorScope: true, ToolMasking: false})
+
+	if _, err := loader(context.Background(), "t", "r", "n"); err == nil {
+		t.Fatal("ancestor query failure must propagate")
+	}
+}
+
+// ==== P0：工具结果遮蔽 / REFLECT 排除 ====
+
+func toolNode(id, name, out string) model.Node {
+	return model.Node{ID: id, Type: model.NodeTool, Name: name, Status: model.NodeSuccess, Input: "q-" + id, Output: out}
+}
+
+func reflectNode(id string) model.Node {
+	return model.Node{ID: id, Type: model.NodeReflect, Status: model.NodeSuccess,
+		Input: "evaluate", Output: `{"action":"replan","reason":"x"}`}
+}
+
+// TestNodesToMessages_LegacyMapping 塑形关闭时，TOOL/REFLECT 一律无差别配对，
+// 不做前缀、遮蔽与排除——锁定旧行为。
+func TestNodesToMessages_LegacyMapping(t *testing.T) {
+	nodes := []model.Node{
+		toolNode("t1", "search", "big-result"),
+		reflectNode("r1"),
+	}
+	got := nodesToMessages(nodes, ContextOptions{ToolMasking: false})
+	if len(got) != 4 {
+		t.Fatalf("legacy mapping must emit 2 messages per node, got %d: %+v", len(got), got)
+	}
+	if got[0].Content != "q-t1" || got[1].Content != "big-result" {
+		t.Errorf("tool node must pass through verbatim, got %+v", got[:2])
+	}
+	if got[2].Content != "evaluate" || got[3].Content == "" {
+		t.Errorf("reflect node must pass through verbatim, got %+v", got[2:])
+	}
+}
+
+// TestNodesToMessages_MaskOldToolResults 窗口外工具结果替换为占位符（含 node_id 指针与
+// 规模），窗口内保留原文；工具调用消息必须带 [tool_call:<name>] 前缀；REFLECT 整节点排除。
+func TestNodesToMessages_MaskOldToolResults(t *testing.T) {
+	nodes := []model.Node{
+		toolNode("old1", "search", "result-1"),
+		toolNode("old2", "search", "result-2"),
+		llmNode("l1", "think", "answer"),
+		toolNode("new1", "search", "result-3"),
+		reflectNode("rf1"),
+	}
+	// 窗口只保留最近 1 个工具节点（new1）。
+	got := nodesToMessages(nodes, ContextOptions{ToolMasking: true, ToolMaskWindow: 1, ToolOutputMaxRunes: 100000})
+
+	// 4 个非 REFLECT 节点；其中 3 个工具各 2 条 + 1 个 LLM 2 条 = 8 条。
+	if len(got) != 8 {
+		t.Fatalf("expected 8 messages (reflect excluded), got %d: %+v", len(got), got)
+	}
+	if got[0].Content != "[tool_call:search] q-old1" {
+		t.Errorf("tool call must be prefixed, got %q", got[0].Content)
+	}
+	if !strings.Contains(got[1].Content, "Compacted tool result") || !strings.Contains(got[1].Content, `node_id="old1"`) {
+		t.Errorf("old result must be a placeholder with node_id pointer, got %q", got[1].Content)
+	}
+	if strings.Contains(got[1].Content, "result-1") {
+		t.Errorf("masked result must not contain raw content, got %q", got[1].Content)
+	}
+	if got[2].Content != "[tool_call:search] q-old2" || !strings.Contains(got[3].Content, `node_id="old2"`) {
+		t.Errorf("second-oldest tool result must also be masked, got %+v", got[2:4])
+	}
+	// LLM 节点维持原样。
+	if got[4].Content != "think" || got[5].Content != "answer" {
+		t.Errorf("llm node must pass through, got %+v", got[4:6])
+	}
+	// 窗口内的 new1 保留原文。
+	if got[7].Content != "result-3" {
+		t.Errorf("in-window tool result must be kept verbatim, got %q", got[7].Content)
+	}
+}
+
+// TestNodesToMessages_TruncatesLongToolOutput 窗口内但超长的结果按 rune 截断，
+// 附规模与 node_id 指针，且不得切断多字节字符。
+func TestNodesToMessages_TruncatesLongToolOutput(t *testing.T) {
+	long := strings.Repeat("结", 50) // 50 个 rune / 150 字节
+	nodes := []model.Node{toolNode("t1", "search", long)}
+	got := nodesToMessages(nodes, ContextOptions{ToolMasking: true, ToolMaskWindow: 1, ToolOutputMaxRunes: 10})
+	out := got[1].Content
+	if !utf8.ValidString(out) {
+		t.Errorf("truncation produced invalid UTF-8: %q", out)
+	}
+	if !strings.HasPrefix(out, strings.Repeat("结", 10)) {
+		t.Errorf("expected first 10 runes kept, got %q", out)
+	}
+	if !strings.Contains(out, "node_id=\"t1\"") || !strings.Contains(out, "50 characters") {
+		t.Errorf("truncation suffix must carry pointer and original size, got %q", out)
+	}
+}
+
+// TestContextOptions_Defaults 零值选项必须回退默认窗口/上限。
+func TestContextOptions_Defaults(t *testing.T) {
+	var zero ContextOptions
+	if zero.toolMaskWindow() != DefaultToolMaskWindow {
+		t.Errorf("window default = %d", zero.toolMaskWindow())
+	}
+	if zero.toolOutputMaxRunes() != DefaultToolOutputMaxRunes {
+		t.Errorf("max runes default = %d", zero.toolOutputMaxRunes())
+	}
+	explicit := ContextOptions{ToolMaskWindow: 2, ToolOutputMaxRunes: 100}
+	if explicit.toolMaskWindow() != 2 || explicit.toolOutputMaxRunes() != 100 {
+		t.Error("explicit values should be honored")
 	}
 }

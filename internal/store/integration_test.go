@@ -170,6 +170,101 @@ func TestIntegration_InsertPlanAndDAG(t *testing.T) {
 	}
 }
 
+// completeItNode 是集成测试辅助：READY → CLAIM → COMPLETE。
+func completeItNode(t *testing.T, s *MySQL, tenant, nodeID, output string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := s.MarkReady(ctx, tenant, nodeID); err != nil {
+		t.Fatalf("MarkReady(%s): %v", nodeID, err)
+	}
+	n, _ := s.GetNode(ctx, tenant, nodeID)
+	if _, err := s.ClaimNode(ctx, tenant, nodeID, n.Version, "w-it", 30*time.Second); err != nil {
+		t.Fatalf("ClaimNode(%s): %v", nodeID, err)
+	}
+	n2, _ := s.GetNode(ctx, tenant, nodeID)
+	if _, err := s.CompleteNode(ctx, tenant, nodeID, n2.Version, output); err != nil {
+		t.Fatalf("CompleteNode(%s): %v", nodeID, err)
+	}
+}
+
+// TestIntegration_CompletedAncestorNodes 验证 DAG 祖先作用域查询：
+// 菱形依赖去重、跨层传递闭包、无关分支排除、仅返回 SUCCESS。
+func TestIntegration_CompletedAncestorNodes(t *testing.T) {
+	s := newIntegrationStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	const runID, tenant = "it-anc-1", "tenant-it"
+	run := &model.Run{ID: runID, TenantID: tenant, Status: model.RunRunning, Version: 1}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	// 拓扑：a ┐
+	//       ├─ c ─ d    （x 与 d 无任何路径关系）
+	//       b ┘
+	plan := model.Plan{Nodes: []model.PlanNode{
+		{ID: runID + ":a", Type: model.NodeTool, Name: "search", Input: "qa"},
+		{ID: runID + ":b", Type: model.NodeTool, Name: "search", Input: "qb"},
+		{ID: runID + ":c", Type: model.NodeLLM, Name: "reason", DependsOn: []string{runID + ":a", runID + ":b"}},
+		{ID: runID + ":d", Type: model.NodeLLM, Name: "finish", DependsOn: []string{runID + ":c"}},
+		{ID: runID + ":x", Type: model.NodeTool, Name: "search", Input: "qx"},
+	}}
+	if err := s.InsertPlan(ctx, runID, tenant, plan); err != nil {
+		t.Fatalf("InsertPlan: %v", err)
+	}
+	completeItNode(t, s, tenant, runID+":a", "a-out")
+	completeItNode(t, s, tenant, runID+":b", "b-out")
+	completeItNode(t, s, tenant, runID+":c", "c-out")
+	completeItNode(t, s, tenant, runID+":x", "x-out")
+	// d 保持 PENDING：即使存在该节点行，也不应作为他人祖先出现（且查询只取 SUCCESS）。
+
+	got, err := s.CompletedAncestorNodes(ctx, tenant, runID, runID+":d")
+	if err != nil {
+		t.Fatalf("CompletedAncestorNodes(d): %v", err)
+	}
+	var ids []string
+	for _, n := range got {
+		ids = append(ids, n.ID)
+	}
+	want := []string{runID + ":a", runID + ":b", runID + ":c"}
+	if len(ids) != len(want) {
+		t.Fatalf("ancestors of d = %v, want %v (x must be excluded, diamond must dedup)", ids, want)
+	}
+	for i, w := range want {
+		if ids[i] != w {
+			t.Errorf("ancestors of d = %v, want ordered %v", ids, want)
+			break
+		}
+	}
+
+	// c 的祖先只有 a/b：c 自己不算，d/x 也不在闭包内。
+	gotC, err := s.CompletedAncestorNodes(ctx, tenant, runID, runID+":c")
+	if err != nil {
+		t.Fatalf("CompletedAncestorNodes(c): %v", err)
+	}
+	if len(gotC) != 2 || gotC[0].ID != runID+":a" || gotC[1].ID != runID+":b" {
+		t.Errorf("ancestors of c = %+v, want [a b]", gotC)
+	}
+
+	// 根节点无上游。
+	gotA, err := s.CompletedAncestorNodes(ctx, tenant, runID, runID+":a")
+	if err != nil {
+		t.Fatalf("CompletedAncestorNodes(a): %v", err)
+	}
+	if len(gotA) != 0 {
+		t.Errorf("ancestors of root a = %+v, want empty", gotA)
+	}
+
+	// 租户隔离：错误租户查不到任何祖先。
+	gotOther, err := s.CompletedAncestorNodes(ctx, "other-tenant", runID, runID+":d")
+	if err != nil {
+		t.Fatalf("CompletedAncestorNodes(other tenant): %v", err)
+	}
+	if len(gotOther) != 0 {
+		t.Errorf("tenant isolation broken: %+v", gotOther)
+	}
+}
+
 // TestIntegration_ClaimNode_LeaseAndRecover 验证租约机制与崩溃恢复：
 // 认领 -> 租约过期 -> RecoverExpired 重置为 READY -> ReadyTasks 可重新扫到。
 // 这是 P0-7 不变量：恢复流程自身可恢复。

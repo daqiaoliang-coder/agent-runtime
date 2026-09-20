@@ -17,7 +17,7 @@ func (p *Provider) Generate(ctx context.Context, req contracts.GenerateRequest) 
 	for _, m := range req.Messages {
 		msgs = append(msgs, llm.Message{Role: llm.Role(m.Role), Content: m.Content})
 	}
-	resp, err := p.Client.Complete(ctx, llm.Request{Model: req.Model, Messages: msgs})
+	resp, err := p.Client.Complete(ctx, llm.Request{Model: req.Model, Messages: msgs, CacheKey: req.CacheKey})
 	if err != nil {
 		return contracts.GenerateResponse{}, err
 	}

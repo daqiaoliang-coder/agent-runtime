@@ -367,14 +367,17 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	// Retry=指数退避策略，失败可重试节点置回 READY 并按 ready_at 补投递，耗尽入 DLQ。
 	// UsageRecorder=s 使 LLM 节点的 token 用量与成本落 llm_usage 表，支撑成本分析。
 	disp := &executor.Dispatcher{LLM: client, Tools: tools, ModelProvider: llmadapter.New(client), ToolProvider: tooladapter.New(tools), ToolStore: s, UsageRecorder: s, Pricer: DefaultPricer}
-	// ContextLoader 从已提交的 SUCCESS 节点派生对话历史（按完成时间排序），
-	// 避免对 checkpoint 做读改写导致的并行节点竞态。上下文以已提交状态为事实，
-	// 无需额外的累积写入——崩溃恢复后也能从持久化的节点输出重建完整上下文。
-	//
-	// 在此之上追加**跨 Run 语义记忆**：同一 ThreadID 下的历史 Run 内容会被召回并前置，
-	// 使 Agent 跨 Run 保持连续。记忆未启用或检索失败时，行为与接入前完全一致
-	// （只用当前 Run 历史）——记忆是增强项，绝不阻断节点执行。详见 memory.go。
-	disp.ContextLoader = newContextLoader(s, newMemoryOptionsFromEnv(creds))
+	// P0 上下文优化（详见 internal/worker/context.go）：
+	//  - 祖先作用域：节点只加载 agent_edge 传递闭包上的 SUCCESS 祖先，
+	//    并行分支的无关产物不再灌入；CONTEXT_ANCESTOR_SCOPE=false 可退回全量；
+	//  - 工具结果遮蔽：REFLECT 控制节点排除、窗口外/超长工具结果替换为带 node_id
+	//    指针的占位符，原文始终保留在 agent_node.output；CONTEXT_TOOL_MASKING=false 可关；
+	//  - 跨 Run 语义记忆仍按 MEMORY_ENABLED 装配，失败静默降级。
+	// 历史按 (finished_at, node_id) 确定序派生，崩溃恢复也能重建且顺序稳定。
+	disp.ContextLoader = newContextLoader(s, newContextOptionsFromEnv(creds))
+	// Prompt 前缀缓存默认关闭：开启后向网关透传 Run 级 prompt_cache_key，
+	// 配合稳定的消息布局复用 KV 缓存（需网关支持该 OpenAI 兼容扩展字段）。
+	disp.PromptCache = envBool("LLM_PROMPT_CACHE", false)
 
 	// 安全中间件装配：不可信输入防护挂在工具调用前，数据脱敏同时挂在
 	// 工具结果回传与事件出域两处。人工闸门的落库能力在 newSecurityBundle 内部

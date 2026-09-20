@@ -20,9 +20,15 @@ type Message struct {
 }
 
 // Request 是一次补全请求。Model 为空时由实现决定默认模型。
+// JSONResponse 为 true 时要求 provider 以 JSON 模式输出（OpenAI response_format），
+// 用于 Planner 等需要结构化结果的场景；不支持该参数的 provider 会忽略或报错，由调用方降级。
 type Request struct {
-	Model    string
-	Messages []Message
+	Model string
+	// CacheKey 为 prompt 前缀缓存键（如 OpenAI 兼容网关的 prompt_cache_key），
+	// 空值不透传。详见 contracts.GenerateRequest.CacheKey。
+	CacheKey     string
+	Messages     []Message
+	JSONResponse bool
 }
 
 // Usage 描述单次 LLM 调用的 token 消耗，用于成本追踪与配额核算。

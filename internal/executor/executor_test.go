@@ -40,7 +40,7 @@ func TestDispatcher_LLM_PrependsContextHistory(t *testing.T) {
 		got = req.Messages
 		return "ok"
 	}}
-	d := &Dispatcher{LLM: stub, ContextLoader: func(_ context.Context, _, _ string) ([]llm.Message, error) {
+	d := &Dispatcher{LLM: stub, ContextLoader: func(_ context.Context, _, _, _ string) ([]llm.Message, error) {
 		return []llm.Message{{Role: llm.RoleAssistant, Content: "prior"}}, nil
 	}}
 	if _, err := d.Execute(context.Background(), &model.Node{Type: model.NodeLLM, Input: "next", RunID: "run-1"}); err != nil {
@@ -51,9 +51,48 @@ func TestDispatcher_LLM_PrependsContextHistory(t *testing.T) {
 	}
 }
 
+// TestDispatcher_LLM_PromptCacheKey PromptCache 开启时按 (tenant,run) 生成稳定缓存键，
+// 关闭（默认）时必须为空。
+func TestDispatcher_LLM_PromptCacheKey(t *testing.T) {
+	var got llm.Request
+	d := &Dispatcher{LLM: &llm.Stub{Responder: func(req llm.Request) string { got = req; return "ok" }},
+		ContextLoader: func(_ context.Context, _, _, _ string) ([]llm.Message, error) { return nil, nil },
+		PromptCache:   true}
+	if _, err := d.Execute(context.Background(), &model.Node{Type: model.NodeLLM, Input: "x", TenantID: "t1", RunID: "r1", ID: "n1"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.CacheKey != "agent-run:t1:r1" {
+		t.Errorf("cache key = %q, want agent-run:t1:r1", got.CacheKey)
+	}
+
+	off := &Dispatcher{LLM: &llm.Stub{Responder: func(req llm.Request) string { got = req; return "ok" }}}
+	if _, err := off.Execute(context.Background(), &model.Node{Type: model.NodeLLM, Input: "x", TenantID: "t1", RunID: "r1"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.CacheKey != "" {
+		t.Errorf("cache key must be empty when disabled, got %q", got.CacheKey)
+	}
+}
+
+// TestDispatcher_LLM_ContextLoader_ReceivesNodeID 祖先作用域依赖当前节点 ID，
+// loader 必须收到 nodeID。
+func TestDispatcher_LLM_ContextLoader_ReceivesNodeID(t *testing.T) {
+	var seenNode string
+	d := &Dispatcher{LLM: llm.Echo(), ContextLoader: func(_ context.Context, _, _, nodeID string) ([]llm.Message, error) {
+		seenNode = nodeID
+		return nil, nil
+	}}
+	if _, err := d.Execute(context.Background(), &model.Node{Type: model.NodeLLM, Input: "x", RunID: "r", ID: "node-42"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if seenNode != "node-42" {
+		t.Errorf("loader nodeID = %q, want node-42", seenNode)
+	}
+}
+
 // TestDispatcher_LLM_ContextLoaderError_Propagates ContextLoader 报错应传播，不静默吞掉。
 func TestDispatcher_LLM_ContextLoaderError_Propagates(t *testing.T) {
-	d := &Dispatcher{LLM: llm.Echo(), ContextLoader: func(_ context.Context, _, _ string) ([]llm.Message, error) {
+	d := &Dispatcher{LLM: llm.Echo(), ContextLoader: func(_ context.Context, _, _, _ string) ([]llm.Message, error) {
 		return nil, errors.New("db down")
 	}}
 	_, err := d.Execute(context.Background(), &model.Node{Type: model.NodeLLM, Input: "x", RunID: "r"})
