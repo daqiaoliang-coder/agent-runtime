@@ -93,6 +93,13 @@ type Dispatcher struct {
 	// TOOL 节点直接执行的，不经过 ReAct 循环。只接 Engine 会让真实部署完全绕过防护，
 	// 那正是"代码写好了但链路是断的"——挂载点存在却不生效，等于没有。
 	ToolChain *middleware.ToolChain
+	// ModelChain 是模型调用的横切链（输入侧审核 + 输出侧内容护栏），为 nil 时不拦截。
+	//
+	// 与 ToolChain 同理挂在 Dispatcher：生产路径上模型是由 DAG 的 LLM 节点直接调用的。
+	// 输出侧尤其关键——executeLLM 的返回值会被 worker 落库为 agent_node.output，
+	// 再被 ContextLoader 重新注入后续节点的 prompt。不在返回前拦截，
+	// 护栏就永远挡不住已经持久化、并且已经被下一代推理吃进去的模型输出。
+	ModelChain *middleware.ModelChain
 }
 
 // executionContext 组装本次工具调用的执行身份。
@@ -144,6 +151,29 @@ func (d *Dispatcher) afterTool(ctx context.Context, ec contracts.ExecutionContex
 		return result, nil
 	}
 	return d.ToolChain.After(ctx, ec, req, result)
+}
+
+// beforeModel 跑内容护栏的输入侧（发给模型的请求）。ModelChain 为 nil 时原样返回。
+//
+// 与 beforeTool 同样的约束：错误必须原样上抛，不可包装。
+// ErrAwaitingApproval 要路由到人工挂起，ErrBlocked 要路由到不可重试终态，
+// 上层靠 errors.Is 判别；包成普通错误会让等待审批的节点被重试策略反复重跑。
+func (d *Dispatcher) beforeModel(ctx context.Context, ec contracts.ExecutionContext, req contracts.GenerateRequest) (contracts.GenerateRequest, error) {
+	if d.ModelChain == nil {
+		return req, nil
+	}
+	return d.ModelChain.Before(ctx, ec, req)
+}
+
+// afterModel 跑内容护栏的输出侧（模型返回、尚未交给 worker 落库）。ModelChain 为 nil 时原样返回。
+//
+// 这一步的位置是本次修复的要点：一旦越过它，内容就进入持久层与后续 prompt，
+// 事后只能改事件副本（EventChain），改不动 agent_node.output。
+func (d *Dispatcher) afterModel(ctx context.Context, ec contracts.ExecutionContext, req contracts.GenerateRequest, resp contracts.GenerateResponse) (contracts.GenerateResponse, error) {
+	if d.ModelChain == nil {
+		return resp, nil
+	}
+	return d.ModelChain.After(ctx, ec, req, resp)
 }
 
 // Execute 根据 node.Type 分发：
@@ -209,11 +239,21 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 		}
 	}
 	var resp llm.Response
+	// 请求统一收敛为 v3 契约形态，供内容护栏与两条生成路径（ModelProvider / 遗留 LLM）
+	// 共用同一份入参。若各路径各自构造请求，Before 的改写会只对其中一条生效，
+	// 另一条就成了绕过入口——"挂载点存在但不生效"的典型形态。
+	request := contracts.GenerateRequest{Model: modelForNode(n), CacheKey: d.cacheKey(n)}
+	for _, m := range msgs {
+		request.Messages = append(request.Messages, contracts.Message{Role: contracts.Role(m.Role), Content: m.Content})
+	}
+	ec := d.executionContext(ctx, n)
+	// 第一步：内容护栏的输入侧。历史与当前 prompt 都会被发往外部模型，泄露代价与输出同量级。
+	request, err := d.beforeModel(ctx, ec, request)
+	if err != nil {
+		// 原样上抛，保留 ErrAwaitingApproval / ErrBlocked 的哨兵语义。
+		return "", err
+	}
 	if d.ModelProvider != nil {
-		request := contracts.GenerateRequest{Model: modelForNode(n), CacheKey: d.cacheKey(n)}
-		for _, m := range msgs {
-			request.Messages = append(request.Messages, contracts.Message{Role: contracts.Role(m.Role), Content: m.Content})
-		}
 		generated, err := d.ModelProvider.Generate(ctx, request)
 		if err != nil {
 			return "", fmt.Errorf("llm: %w", err)
@@ -227,7 +267,13 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 		if d.LLM == nil {
 			return "", fmt.Errorf("llm client not configured")
 		}
-		got, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs, CacheKey: d.cacheKey(n)})
+		// 遗留客户端只认 llm.Message：由**改写后**的 request 反构造，
+		// 保证 Before 的改写对两条路径同等生效。
+		legacy := llm.Request{Model: request.Model, CacheKey: request.CacheKey}
+		for _, m := range request.Messages {
+			legacy.Messages = append(legacy.Messages, llm.Message{Role: llm.Role(m.Role), Content: m.Content})
+		}
+		got, err := d.LLM.Complete(ctx, legacy)
 		if err != nil {
 			return "", fmt.Errorf("llm: %w", err)
 		}
@@ -262,7 +308,24 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 			Cost:             cost,
 		})
 	}
-	return resp.Content, nil
+	// 第二步：内容护栏的输出侧，必须在返回之前。
+	// 这个返回值有两个下游：worker 落库为 agent_node.output，ContextLoader 把它重新
+	// 注入后续节点的 prompt。越过这里再想补救就只能改事件副本（EventChain），
+	// 持久层与下一代推理里的内容已经收回不来了。
+	guarded, err := d.afterModel(ctx, ec, request, contracts.GenerateResponse{
+		Message: contracts.Message{Role: contracts.RoleAssistant, Content: resp.Content},
+		Model:   resp.Model,
+		Usage: contracts.Usage{
+			PromptTokens:     resp.Usage.PromptTokens,
+			CompletionTokens: resp.Usage.CompletionTokens,
+			TotalTokens:      resp.Usage.TotalTokens,
+		},
+	})
+	if err != nil {
+		// 原样上抛，保留 ErrAwaitingApproval / ErrBlocked 的哨兵语义。
+		return "", err
+	}
+	return guarded.Message.Content, nil
 }
 
 // reflectDecision 是 REFLECT 节点输出的 JSON 结构。

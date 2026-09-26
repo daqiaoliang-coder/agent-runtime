@@ -70,6 +70,44 @@ func (c *ToolChain) After(ctx context.Context, ec contracts.ExecutionContext, re
 	return result, nil
 }
 
+// Model 是模型调用的拦截器，与 Tool 对称：模型链路同样是双边的——
+// Before 作用于发给模型的请求（输入审核 / 提示词加固），
+// After 作用于模型返回的响应（输出内容护栏 / 敏感信息脱敏）。
+//
+// 之所以必须双边而不是只做输出侧：内容护栏的输入侧同样无处可挂，
+// 而输入（历史 + 当前 prompt）会被拼进请求发给外部模型，泄露代价与输出同量级。
+type Model interface {
+	Before(context.Context, contracts.ExecutionContext, contracts.GenerateRequest) (contracts.GenerateRequest, error)
+	After(context.Context, contracts.ExecutionContext, contracts.GenerateRequest, contracts.GenerateResponse) (contracts.GenerateResponse, error)
+}
+
+// ModelChain 串行调用一组 Model。Before 正序执行；After 倒序执行，与 ToolChain 同构。
+type ModelChain struct{ items []Model }
+
+func NewModelChain(items ...Model) *ModelChain { return &ModelChain{items: items} }
+
+func (c *ModelChain) Before(ctx context.Context, ec contracts.ExecutionContext, req contracts.GenerateRequest) (contracts.GenerateRequest, error) {
+	var err error
+	for _, m := range c.items {
+		req, err = m.Before(ctx, ec, req)
+		if err != nil {
+			return req, err
+		}
+	}
+	return req, nil
+}
+
+func (c *ModelChain) After(ctx context.Context, ec contracts.ExecutionContext, req contracts.GenerateRequest, resp contracts.GenerateResponse) (contracts.GenerateResponse, error) {
+	var err error
+	for i := len(c.items) - 1; i >= 0; i-- {
+		resp, err = c.items[i].After(ctx, ec, req, resp)
+		if err != nil {
+			return resp, err
+		}
+	}
+	return resp, nil
+}
+
 // Event 是运行时事件的变换器，用于在事件发射前过滤/脱敏/重塑事件负载。
 type Event interface {
 	Transform(context.Context, contracts.RuntimeEvent) (contracts.RuntimeEvent, error)
