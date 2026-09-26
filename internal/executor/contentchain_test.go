@@ -422,3 +422,37 @@ func TestModelChain_EndToEndWithRealGuard(t *testing.T) {
 		})
 	}
 }
+
+// TestModelChain_EndToEndWithRealRedactor 用真实脱敏策略验证"模型输出在持久化前被脱敏"。
+//
+// 与护栏用例同一个论证结构：前面证明链被调用，这里证明**返回给 worker 的返回值**
+// 已经不含敏感原文。断言必须落在这个返回值上而不是链的内部状态——
+// worker 落库的是 Execute 的返回值，只有它干净，agent_node.output 与
+// 后续节点被回灌的 prompt 才是干净的。
+func TestModelChain_EndToEndWithRealRedactor(t *testing.T) {
+	redactor := middleware.NewRedactor(middleware.NewPolicy(middleware.SensitivityInternal, "test-salt"))
+	client := &capturingLLM{resp: llm.Response{
+		Content: "已查到用户手机 13800138000，调用凭证 sk-abcdefghij1234567890 有效。",
+		Model:   "gpt-4o",
+	}}
+	d := &Dispatcher{LLM: client, ModelChain: middleware.NewModelChain(&middleware.ModelRedactor{Redactor: redactor})}
+
+	out, err := d.Execute(context.Background(), newLLMNode())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	// 原文一个字都不许留下：手机号走掩码、密钥走伪标识，两种动作各覆盖一条。
+	for _, raw := range []string{"13800138000", "sk-abcdefghij1234567890"} {
+		if strings.Contains(out, raw) {
+			t.Errorf("sensitive value %q survived into durable output: %q", raw, out)
+		}
+	}
+	// 掩码保留首 3 后 4，业务仍需可核对性——全遮会让排障失去这一维度。
+	if !strings.Contains(out, "138****8000") {
+		t.Errorf("expected masked phone in output, got %q", out)
+	}
+	// 内容被改写但结构必须完好：上下文里出现半个占位符会让后续模型解析错乱。
+	if !strings.Contains(out, "[REDACTED:openai_key:") {
+		t.Errorf("expected tokenized key placeholder in output, got %q", out)
+	}
+}

@@ -431,6 +431,167 @@ func TestRedactor_Before_Passthrough(t *testing.T) {
 	}
 }
 
+// TestModelRedactor_After_ModelOutput 模型输出必须脱敏，且视图与核心共享同一 Policy 与审计回调。
+//
+// 断言"共享"而不只是"遮住了"：视图若各自持一份 Policy，规则与门槛就会分叉，
+// 而 OnRedact 挂在核心上仍在触发，表面看不出偏差——只有回调真的从视图路径触发才能证明是同一实例。
+func TestModelRedactor_After_ModelOutput(t *testing.T) {
+	var audit AuditContext
+	var auditStats Stats
+	called := false
+	core := NewRedactor(NewPolicy(SensitivityInternal, "salt"))
+	core.OnRedact = func(_ context.Context, ac AuditContext, s Stats) {
+		called, audit, auditStats = true, ac, s
+	}
+	m := &ModelRedactor{Redactor: core}
+
+	resp := contracts.GenerateResponse{
+		Message: contracts.Message{Role: contracts.RoleAssistant, Content: "已登记 13800138000，密钥 sk-abcdefghij1234567890"},
+		Model:   "gpt-4o",
+		Usage:   contracts.Usage{PromptTokens: 11, CompletionTokens: 22, TotalTokens: 33},
+	}
+	out, err := m.After(context.Background(), newEC("tenant-1", "user-9", "run-7"), contracts.GenerateRequest{Model: "gpt-4o"}, resp)
+	if err != nil {
+		t.Fatalf("After: %v", err)
+	}
+	for _, leak := range []string{"13800138000", "sk-abcdefghij1234567890"} {
+		if strings.Contains(out.Message.Content, leak) {
+			t.Errorf("sensitive value %q leaked in model output: %q", leak, out.Message.Content)
+		}
+	}
+	if !strings.Contains(out.Message.Content, "138****8000") {
+		t.Errorf("expected masked phone, got %q", out.Message.Content)
+	}
+	// 角色、模型名与用量不是脱敏对象：Usage 参与成本归集，改了就错账。
+	if out.Message.Role != contracts.RoleAssistant || out.Model != "gpt-4o" || out.Usage.TotalTokens != 33 {
+		t.Errorf("non-content fields altered: %+v", out)
+	}
+	if !called {
+		t.Fatal("OnRedact was not invoked through the model view")
+	}
+	if audit.TenantID != "tenant-1" || audit.UserID != "user-9" || audit.RunID != "run-7" {
+		t.Errorf("audit context mismatch: %+v", audit)
+	}
+	if auditStats.Hits["cn_mobile"] != 1 || auditStats.Hits["openai_key"] != 1 {
+		t.Errorf("audit stats missing rule hits: %v", auditStats.Hits)
+	}
+}
+
+// TestModelRedactor_After_CleanAndEmptyUntouched 干净内容逐字节不变，空内容不触发审计。
+//
+// 与工具侧同一条纪律：脱敏不得引入任何副作用，否则模型输出的幂等复用与断言比较都会失效。
+func TestModelRedactor_After_CleanAndEmptyUntouched(t *testing.T) {
+	fired := 0
+	m := &ModelRedactor{Redactor: NewRedactor(NewPolicy(SensitivityInternal, "salt"))}
+	m.OnRedact = func(context.Context, AuditContext, Stats) { fired++ }
+
+	clean := "构建成功，12 个用例通过"
+	out, err := m.After(context.Background(), newEC("t", "u", "r"), contracts.GenerateRequest{},
+		contracts.GenerateResponse{Message: contracts.Message{Role: contracts.RoleAssistant, Content: clean}})
+	if err != nil {
+		t.Fatalf("After: %v", err)
+	}
+	if out.Message.Content != clean {
+		t.Errorf("clean content altered:\n got=%q\nwant=%q", out.Message.Content, clean)
+	}
+
+	empty, err := m.After(context.Background(), newEC("t", "u", "r"), contracts.GenerateRequest{},
+		contracts.GenerateResponse{Message: contracts.Message{Role: contracts.RoleAssistant}})
+	if err != nil {
+		t.Fatalf("After on empty content: %v", err)
+	}
+	if empty.Message.Content != "" {
+		t.Errorf("empty content became %q", empty.Message.Content)
+	}
+	if fired != 0 {
+		t.Errorf("OnRedact fired %d times on clean/empty content", fired)
+	}
+}
+
+// TestModelRedactor_After_IdempotentOverToolOutput 已经脱敏过的内容二次处理不得套娃。
+//
+// 真实链路上同一段内容会依次经过 Tool.After →（作为模型上下文）→ 模型输出 → Model.After
+// → Event.Transform，多层叠加的硬前提是幂等：非幂等时占位符会被逐层套上新的占位符。
+func TestModelRedactor_After_IdempotentOverToolOutput(t *testing.T) {
+	core := NewRedactor(NewPolicy(SensitivityInternal, "salt"))
+	m := &ModelRedactor{Redactor: core}
+	ec := newEC("t", "u", "r")
+
+	res, err := core.After(context.Background(), ec, toolRequest("c1", "query", "{}"), toolResult("c1", "用户 13800138000", false))
+	if err != nil {
+		t.Fatalf("tool After: %v", err)
+	}
+	once := res.Output
+	if strings.Contains(once, "13800138000") {
+		t.Fatalf("test setup: tool output not redacted: %q", once)
+	}
+
+	second, err := m.After(context.Background(), ec, contracts.GenerateRequest{},
+		contracts.GenerateResponse{Message: contracts.Message{Role: contracts.RoleAssistant, Content: once}})
+	if err != nil {
+		t.Fatalf("model After: %v", err)
+	}
+	if second.Message.Content != once {
+		t.Errorf("model pass re-wrapped already-redacted text:\n in=%q\nout=%q", once, second.Message.Content)
+	}
+}
+
+// TestModelRedactor_After_Disabled 模型挂载点的开关必须独立生效，且不影响工具挂载点。
+func TestModelRedactor_After_Disabled(t *testing.T) {
+	core := NewRedactor(NewPolicy(SensitivityInternal, "salt"))
+	core.ModelEnabled = false
+	m := &ModelRedactor{Redactor: core}
+
+	resp, err := m.After(context.Background(), newEC("t", "u", "r"), contracts.GenerateRequest{},
+		contracts.GenerateResponse{Message: contracts.Message{Role: contracts.RoleAssistant, Content: "13800138000"}})
+	if err != nil {
+		t.Fatalf("After: %v", err)
+	}
+	if resp.Message.Content != "13800138000" {
+		t.Errorf("expected untouched model output when disabled, got %q", resp.Message.Content)
+	}
+	// 关掉模型挂载点不得连带关掉工具挂载点：两者是独立开关。
+	tr, _ := core.After(context.Background(), newEC("t", "u", "r"), toolRequest("c1", "q", "{}"), toolResult("c1", "13800138000", false))
+	if strings.Contains(tr.Output, "13800138000") {
+		t.Errorf("tool mount unexpectedly disabled: %q", tr.Output)
+	}
+}
+
+// TestModelRedactor_Before_Passthrough Before 不得改写发往模型的请求。
+//
+// 改写 prompt 会让模型基于与调用方意图不符的输入作答，且过程静默、错误一路传导到输出。
+func TestModelRedactor_Before_Passthrough(t *testing.T) {
+	m := &ModelRedactor{Redactor: NewRedactor(NewPolicy(SensitivityInternal, "salt"))}
+	req := contracts.GenerateRequest{
+		Model:    "gpt-4o",
+		Messages: []contracts.Message{{Role: contracts.RoleUser, Content: "电话 13800138000"}},
+	}
+	out, err := m.Before(context.Background(), newEC("t", "u", "r"), req)
+	if err != nil {
+		t.Fatalf("Before: %v", err)
+	}
+	if out.Model != req.Model || len(out.Messages) != 1 || out.Messages[0] != req.Messages[0] {
+		t.Errorf("Before altered the outgoing request:\n got=%+v\nwant=%+v", out, req)
+	}
+}
+
+// TestModelRedactor_NilSafe 零值视图不得 panic，原样透传。
+//
+// 链由部署侧拼装，一个零值元素不该让整个 Run 崩掉——
+// 脱敏组件自己成为可用性故障点是不可接受的。
+func TestModelRedactor_NilSafe(t *testing.T) {
+	var m *ModelRedactor
+	resp := contracts.GenerateResponse{Message: contracts.Message{Role: contracts.RoleAssistant, Content: "13800138000"}}
+	out, err := m.After(context.Background(), newEC("t", "u", "r"), contracts.GenerateRequest{}, resp)
+	if err != nil || out.Message.Content != "13800138000" {
+		t.Fatalf("nil view must pass through: out=%+v err=%v", out, err)
+	}
+	out2, err := (&ModelRedactor{}).After(context.Background(), newEC("t", "u", "r"), contracts.GenerateRequest{}, resp)
+	if err != nil || out2.Message.Content != "13800138000" {
+		t.Fatalf("zero-value view must pass through: out=%+v err=%v", out2, err)
+	}
+}
+
 // TestRedactor_Transform_NestedPayload 事件负载的嵌套结构必须被递归脱敏。
 //
 // worker 与 react 发射的事件负载是 map[string]any，工具结果与入参常嵌在其中；

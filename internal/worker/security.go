@@ -31,11 +31,13 @@ const (
 
 // SecurityBundle 是装配好的一组安全中间件，供 Worker 与 Dispatcher 分别取用。
 //
-// Redactor 同时实现 Tool 与 Event 两个接口，因此工具链与事件链**共享同一个实例**：
-// 两处必须用同一套规则与门槛，否则会出现"工具结果没脱敏但事件脱敏了"这种
-// 只在特定路径上泄露的不一致，排查成本极高。共享实例从结构上排除了这种偏差。
+// Redactor 服务于 Tool、Model、Event 三个挂载点（模型挂载点经 ModelRedactor 视图，
+// 底层是同一个 Redactor 实例），因此三条链**共享同一套规则与门槛**：
+// 若各挂各的实例，会出现"工具结果没脱敏但模型输出脱敏了"这种只在特定路径上
+// 泄露的不一致，排查成本极高。共享实例从结构上排除了这种偏差。
 type SecurityBundle struct {
 	ToolChain  *middleware.ToolChain
+	ModelChain *middleware.ModelChain
 	EventChain *middleware.EventChain
 }
 
@@ -54,6 +56,7 @@ func newSecurityBundle(s *store.MySQL, q runtime.Queue, creds contracts.Credenti
 	}
 
 	var tools []middleware.Tool
+	var models []middleware.Model
 	var events []middleware.Event
 
 	if envBool(EnvGuardEnabled, true) {
@@ -83,10 +86,16 @@ func newSecurityBundle(s *store.MySQL, q runtime.Queue, creds contracts.Credenti
 		}
 		tools = append(tools, redactor)
 		events = append(events, redactor)
+		// 模型侧用同一实例的视图：Go 不允许 Redactor 同时具备两套同名 Before/After，
+		// 视图是绕开方法名冲突的手段，共享的仍是同一个 Policy 与审计回调。
+		models = append(models, &middleware.ModelRedactor{Redactor: redactor})
 	}
 
 	if len(tools) > 0 {
 		b.ToolChain = middleware.NewToolChain(tools...)
+	}
+	if len(models) > 0 {
+		b.ModelChain = middleware.NewModelChain(models...)
 	}
 	if len(events) > 0 {
 		b.EventChain = middleware.NewEventChain(events...)

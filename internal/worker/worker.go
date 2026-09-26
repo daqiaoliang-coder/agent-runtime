@@ -408,10 +408,11 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	disp.PromptCache = envBool("LLM_PROMPT_CACHE", false)
 
 	// 安全中间件装配：不可信输入防护挂在工具调用前，数据脱敏同时挂在
-	// 工具结果回传与事件出域两处。人工闸门的落库能力在 newSecurityBundle 内部
+	// 工具结果回传、模型输出与事件出域三处。人工闸门的落库能力在 newSecurityBundle 内部
 	// 已交给护栏持有，worker 侧不需要再拿一份。
 	sec := newSecurityBundle(s, q, creds)
 	disp.ToolChain = sec.ToolChain
+	disp.ModelChain = sec.ModelChain
 	return &Worker{Store: s, Queue: q, Events: r, ID: id, Retry: retry.Default(), Exec: disp, EventChain: sec.EventChain}
 }
 

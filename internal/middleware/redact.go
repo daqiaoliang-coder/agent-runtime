@@ -411,19 +411,23 @@ func auditContextOf(ec contracts.ExecutionContext) AuditContext {
 	return AuditContext{TenantID: ec.TenantID, UserID: ec.UserID, RunID: ec.RunID}
 }
 
-// Redactor 是把 Policy 接到 Tool.After 与 Event.Transform 两个挂载点的中间件。
+// Redactor 是把 Policy 接到 Tool.After、Model.After 与 Event.Transform 三个挂载点的中间件。
 //
-// 为什么两处都要挂：脱敏有两个方向，很多方案只做出向。
+// 为什么多处都要挂：脱敏针对的是"敏感数据跨越信任边界"的每个出口，只做一处必留缺口。
 //   - Tool.After：工具结果回传给 LLM 之前。拦住的是"外部系统的数据带着敏感信息进入模型上下文"。
+//   - Model.After（经 ModelRedactor 视图）：模型输出被持久化之前。返回值会被 worker 落库为
+//     agent_node.output 并被 ContextLoader 回灌进后续节点的 prompt——
+//     与工具结果同理，落库后事件链再脱敏也收不回库里与下一代推理里的原文。
 //   - Event.Transform：事件离开 Runtime 之前。**这一层的扩散面最大**——
 //     同一份事件会进 SSE 推给前端、进 MQ 给下游消费者、进日志、进可观测系统，
 //     任何一处泄露都是跨边界的。工具结果即便在 After 漏了，这里还有一道。
 //
-// 两层叠加要求 Redact 幂等，见该方法注释。
+// 多层叠加要求 Redact 幂等，见该方法注释。
 type Redactor struct {
 	Policy *Policy
-	// ToolEnabled / EventEnabled 分别控制两个挂载点是否生效，便于按链路差异配置。
+	// ToolEnabled / ModelEnabled / EventEnabled 分别控制三个挂载点是否生效，便于按链路差异配置。
 	ToolEnabled  bool
+	ModelEnabled bool
 	EventEnabled bool
 	// OnRedact 为命中回调（可 nil），用于把审计事实送进日志或审计流。
 	// 回调拿到的是身份与统计，**不含原文**——审计本身不该成为二次泄露点。
@@ -433,12 +437,12 @@ type Redactor struct {
 	OnUnsupported func(typeName string)
 }
 
-// NewRedactor 构造默认两个挂载点都开启的脱敏中间件。policy 为 nil 时使用内置规则。
+// NewRedactor 构造默认三个挂载点都开启的脱敏中间件。policy 为 nil 时使用内置规则。
 func NewRedactor(policy *Policy) *Redactor {
 	if policy == nil {
 		policy = NewPolicy(SensitivityInternal, "")
 	}
-	return &Redactor{Policy: policy, ToolEnabled: true, EventEnabled: true}
+	return &Redactor{Policy: policy, ToolEnabled: true, ModelEnabled: true, EventEnabled: true}
 }
 
 var _ Tool = (*Redactor)(nil)
@@ -469,6 +473,51 @@ func (r *Redactor) After(ctx context.Context, ec contracts.ExecutionContext, _ c
 		}
 	}
 	return result, nil
+}
+
+// ModelRedactor 是 Redactor 在模型挂载点上的视图，实现 Model 接口。
+//
+// 之所以是独立的视图类型而不是直接给 Redactor 加方法：Go 不允许同一类型上
+// 存在同名方法，而 Tool 与 Model 两个接口的方法名都是 Before/After（签名不同），
+// 一个类型无法同时满足两者。视图持有的是**同一个** Redactor 指针，
+// 因此 Policy、OnRedact、OnUnsupported 与工具链、事件链完全共享——
+// "工具结果遮了但模型输出没遮"这类不一致在结构上依然不可能出现。
+type ModelRedactor struct{ *Redactor }
+
+var _ Model = (*ModelRedactor)(nil)
+
+// Before 不改写请求，原样透传。
+//
+// 与工具侧同理：模型请求的入参（上下文历史 + 当前 prompt）是调用链的决策输入，
+// 脱敏层静默改写它会让模型基于与调用方意图不符的输入作答，错误一路传导到输出。
+// 入向的影响面另有归属——上下文历史里的工具结果已由 Tool.After 拦过一遍，
+// 历史里的模型输出由本视图的 After 拦过，剩下的入口防护由输入侧护栏承担。
+func (m *ModelRedactor) Before(_ context.Context, _ contracts.ExecutionContext, req contracts.GenerateRequest) (contracts.GenerateRequest, error) {
+	return req, nil
+}
+
+// After 对模型输出脱敏。
+//
+// 这是"模型输出"这一泄露面在持久化之前唯一的拦截点：返回值会被 worker 落库为
+// agent_node.output，并被 ContextLoader 重新注入后续节点的 prompt。
+// 只靠 Event.Transform 挡不住——事件变换时库里与下一代推理里的原文已经存在了。
+//
+// 只处理 Message.Content：ToolCalls 里的参数是模型的执行决策，
+// 改写它会让工具收到与模型意图不符的参数（同工具侧 Before 的理由），
+// 且参数经由 tool_call 落库链路，改在这里也拦不住，只会让事件与实际执行不一致。
+func (m *ModelRedactor) After(ctx context.Context, ec contracts.ExecutionContext, _ contracts.GenerateRequest, resp contracts.GenerateResponse) (contracts.GenerateResponse, error) {
+	// 视图为 nil 或未持核（零值构造）时透传：脱敏组件自己成为可用性故障点是不可接受的。
+	if m == nil || m.Redactor == nil || !m.ModelEnabled || resp.Message.Content == "" {
+		return resp, nil
+	}
+	out, stats := m.Policy.Redact(resp.Message.Content)
+	if stats.HitAny() {
+		resp.Message.Content = out
+		if m.OnRedact != nil {
+			m.OnRedact(ctx, auditContextOf(ec), stats)
+		}
+	}
+	return resp, nil
 }
 
 // Transform 对事件负载脱敏。

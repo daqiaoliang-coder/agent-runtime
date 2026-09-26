@@ -2,7 +2,9 @@ package worker
 
 import (
 	"agent-runtime/internal/contracts"
+	"agent-runtime/internal/executor"
 	"agent-runtime/internal/middleware"
+	"agent-runtime/internal/model"
 	"context"
 	"errors"
 	"strings"
@@ -166,14 +168,14 @@ func TestSecurityBundle_DisabledByEnv(t *testing.T) {
 	t.Setenv(EnvRedactEnabled, "false")
 
 	b := newSecurityBundle(nil, nil, nil)
-	if b.ToolChain != nil || b.EventChain != nil {
-		t.Errorf("expected no chains when both disabled, got tool=%v event=%v", b.ToolChain, b.EventChain)
+	if b.ToolChain != nil || b.ModelChain != nil || b.EventChain != nil {
+		t.Errorf("expected no chains when both disabled, got tool=%v model=%v event=%v", b.ToolChain, b.ModelChain, b.EventChain)
 	}
 }
 
-// TestSecurityBundle_RedactOnlySkipsToolGuard 只关护栏时脱敏仍须在两处生效。
+// TestSecurityBundle_RedactOnlySkipsToolGuard 只关护栏时脱敏仍须在三处生效。
 //
-// Redactor 同时挂在工具链与事件链上，共用同一实例。
+// Redactor 同时挂在工具链、模型链与事件链上，共用同一实例。
 // 只关护栏不应影响脱敏 —— 否则一次策略调整会连带关掉另一个独立能力。
 func TestSecurityBundle_RedactOnlySkipsToolGuard(t *testing.T) {
 	t.Setenv(EnvGuardEnabled, "false")
@@ -183,6 +185,9 @@ func TestSecurityBundle_RedactOnlySkipsToolGuard(t *testing.T) {
 	b := newSecurityBundle(nil, nil, newCredentialsFromEnv())
 	if b.ToolChain == nil {
 		t.Fatal("expected tool chain with redactor when guard disabled")
+	}
+	if b.ModelChain == nil {
+		t.Fatal("expected model chain with redactor when guard disabled")
 	}
 	if b.EventChain == nil {
 		t.Fatal("expected event chain with redactor when guard disabled")
@@ -198,6 +203,75 @@ func TestSecurityBundle_RedactOnlySkipsToolGuard(t *testing.T) {
 	payload, _ := sink.events[0].Data.(map[string]any)
 	if got, _ := payload["output"].(string); strings.Contains(got, "13900139000") {
 		t.Errorf("assembled event chain did not redact: %q", got)
+	}
+}
+
+// TestNewFromEnv_WiresModelChain 生产装配路径必须把模型脱敏链接进 Dispatcher。
+//
+// 这是本轮改造的**唯一实质证据**：中间件与链本身都有单测，但若 NewFromEnv
+// 忘了 disp.ModelChain = sec.ModelChain，所有测试仍会全绿，而模型输出照旧裸奔。
+// 因此这里从 NewFromEnv 出发走完整执行路径，断言落在 Execute 的返回值上——
+// 那正是 worker 落库为 agent_node.output、并被 ContextLoader 回灌后续节点的值。
+func TestNewFromEnv_WiresModelChain(t *testing.T) {
+	t.Setenv(EnvGuardEnabled, "false")
+	t.Setenv(EnvRedactEnabled, "true")
+	t.Setenv("REDACTION_SALT", "unit-salt")
+	// 不配网关地址 → 走 llm.Echo（回显最后一条 user 消息），让敏感值可控地流经输出。
+	t.Setenv("OPENAI_BASE_URL", "")
+
+	w := NewFromEnv(nil, nil, nil)
+	// Exec 字段是窄接口 Executor，装配细节要看底层 Dispatcher。
+	disp, ok := w.Exec.(*executor.Dispatcher)
+	if !ok || disp.ModelChain == nil {
+		t.Fatal("NewFromEnv did not wire ModelChain into the dispatcher")
+	}
+	// ContextLoader 闭包在调用时解引用 store，本用例无真实库，须摘掉。
+	disp.ContextLoader = nil
+
+	out, err := w.Exec.Execute(context.Background(), &model.Node{
+		ID: "n1", TenantID: "t1", RunID: "r1", Type: model.NodeLLM, Input: "联系人 13600136000",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if strings.Contains(out, "13600136000") {
+		t.Errorf("model output reached the caller unredacted: %q", out)
+	}
+	if !strings.Contains(out, "136****6000") {
+		t.Errorf("expected masked phone in durable output, got %q", out)
+	}
+}
+
+// TestSecurityBundle_ModelChainRedacts 装配出的模型链必须真的改写模型输出。
+//
+// 与事件链用例同理：断言非 nil 只证明装配没报错，断言**输出被改写**才证明
+// 规则与门槛被正确传递到了这条链上（三条链共享同一个 Policy 实例，
+// 但"共享"本身也要被证明——装配时各建一个 Policy 是很容易犯的错）。
+func TestSecurityBundle_ModelChainRedacts(t *testing.T) {
+	t.Setenv(EnvGuardEnabled, "false")
+	t.Setenv(EnvRedactEnabled, "true")
+	t.Setenv("REDACTION_SALT", "unit-salt")
+
+	b := newSecurityBundle(nil, nil, newCredentialsFromEnv())
+	if b.ModelChain == nil {
+		t.Fatal("expected model chain with redactor")
+	}
+
+	ec := contracts.ExecutionContext{TenantID: "t1", RunID: "r1", NodeID: "n1"}
+	resp, err := b.ModelChain.After(context.Background(), ec,
+		contracts.GenerateRequest{},
+		contracts.GenerateResponse{
+			Message: contracts.Message{Role: contracts.RoleAssistant, Content: "his phone is 13700137000"},
+			Model:   "gpt-4o",
+		})
+	if err != nil {
+		t.Fatalf("model chain after: %v", err)
+	}
+	if strings.Contains(resp.Message.Content, "13700137000") {
+		t.Errorf("assembled model chain did not redact: %q", resp.Message.Content)
+	}
+	if !strings.Contains(resp.Message.Content, "137****7000") {
+		t.Errorf("expected masked phone, got %q", resp.Message.Content)
 	}
 }
 
