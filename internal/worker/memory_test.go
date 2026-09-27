@@ -697,7 +697,7 @@ func TestNodesToMessages_LegacyMapping(t *testing.T) {
 		toolNode("t1", "search", "big-result"),
 		reflectNode("r1"),
 	}
-	got := nodesToMessages(nodes, ContextOptions{ToolMasking: false})
+	got := nodesToMessages(nodes, ContextOptions{ToolMasking: false}, DefaultToolMaskWindow, nil)
 	if len(got) != 4 {
 		t.Fatalf("legacy mapping must emit 2 messages per node, got %d: %+v", len(got), got)
 	}
@@ -720,7 +720,7 @@ func TestNodesToMessages_MaskOldToolResults(t *testing.T) {
 		reflectNode("rf1"),
 	}
 	// 窗口只保留最近 1 个工具节点（new1）。
-	got := nodesToMessages(nodes, ContextOptions{ToolMasking: true, ToolMaskWindow: 1, ToolOutputMaxRunes: 100000})
+	got := nodesToMessages(nodes, ContextOptions{ToolMasking: true, ToolMaskWindow: 1, ToolOutputMaxRunes: 100000}, 1, nil)
 
 	// 4 个非 REFLECT 节点；其中 3 个工具各 2 条 + 1 个 LLM 2 条 = 8 条。
 	if len(got) != 8 {
@@ -753,7 +753,7 @@ func TestNodesToMessages_MaskOldToolResults(t *testing.T) {
 func TestNodesToMessages_TruncatesLongToolOutput(t *testing.T) {
 	long := strings.Repeat("结", 50) // 50 个 rune / 150 字节
 	nodes := []model.Node{toolNode("t1", "search", long)}
-	got := nodesToMessages(nodes, ContextOptions{ToolMasking: true, ToolMaskWindow: 1, ToolOutputMaxRunes: 10})
+	got := nodesToMessages(nodes, ContextOptions{ToolMasking: true, ToolMaskWindow: 1, ToolOutputMaxRunes: 10}, 1, nil)
 	out := got[1].Content
 	if !utf8.ValidString(out) {
 		t.Errorf("truncation produced invalid UTF-8: %q", out)

@@ -394,7 +394,19 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	// ToolStore=s 使 TOOL 节点经 tool_call 表保证幂等（SUCCESS 复用、崩溃在途拒绝重执行）。
 	// Retry=指数退避策略，失败可重试节点置回 READY 并按 ready_at 补投递，耗尽入 DLQ。
 	// UsageRecorder=s 使 LLM 节点的 token 用量与成本落 llm_usage 表，支撑成本分析。
-	disp := &executor.Dispatcher{LLM: client, Tools: tools, ModelProvider: llmadapter.New(client), ToolProvider: tooladapter.New(tools), ToolStore: s, UsageRecorder: s, Pricer: DefaultPricer}
+	// ModelProvider 提升为 mp 局部变量：压缩管线的摘要调用与主推理复用同一适配器。
+	mp := llmadapter.New(client)
+	disp := &executor.Dispatcher{LLM: client, Tools: tools, ModelProvider: mp, ToolProvider: tooladapter.New(tools), ToolStore: s, UsageRecorder: s, Pricer: DefaultPricer}
+
+	// 安全中间件装配：不可信输入防护挂在工具调用前，数据脱敏同时挂在
+	// 工具结果回传、模型输出与事件出域三处。人工闸门的落库能力在 newSecurityBundle 内部
+	// 已交给护栏持有，worker 侧不需要再拿一份。
+	// 顺序上先于 ContextLoader：压缩管线（Compactor）的摘要调用需要复用
+	// ModelChain 护栏（摘要输入含全量历史，泄露面与主调用同量级，没有理由豁免）。
+	sec := newSecurityBundle(s, q, creds)
+	disp.ToolChain = sec.ToolChain
+	disp.ModelChain = sec.ModelChain
+
 	// P0 上下文优化（详见 internal/worker/context.go）：
 	//  - 祖先作用域：节点只加载 agent_edge 传递闭包上的 SUCCESS 祖先，
 	//    并行分支的无关产物不再灌入；CONTEXT_ANCESTOR_SCOPE=false 可退回全量；
@@ -402,17 +414,28 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	//    指针的占位符，原文始终保留在 agent_node.output；CONTEXT_TOOL_MASKING=false 可关；
 	//  - 跨 Run 语义记忆仍按 MEMORY_ENABLED 装配，失败静默降级。
 	// 历史按 (finished_at, node_id) 确定序派生，崩溃恢复也能重建且顺序稳定。
-	disp.ContextLoader = newContextLoader(s, newContextOptionsFromEnv(creds))
+	ctxOpt := newContextOptionsFromEnv(creds)
+	// 上下文压缩管线（docs/context-compaction.md）：CONTEXT_COMPACTION_ENABLED
+	// 默认关闭，关闭时 ContextLoader 走无压缩路径、行为与接入前完全一致。
+	// Events 留 nil：生产 cmd/worker 尚无 RuntimeEvent 出口，日志是唯一可观测
+	// 信号（接入出口后在此补接即可，见 compaction.go 的取舍说明）。
+	if compOpt := newCompactionOptionsFromEnv(); compOpt != nil {
+		comp := &Compactor{
+			Store:      s,
+			Model:      mp,
+			ModelChain: sec.ModelChain,
+			Usage:      s,
+			Pricer:     DefaultPricer,
+			Opt:        *compOpt,
+		}
+		ctxOpt.Compaction = comp
+		disp.CacheGen = comp.CacheGen
+	}
+	disp.ContextLoader = newContextLoader(s, ctxOpt)
 	// Prompt 前缀缓存默认关闭：开启后向网关透传 Run 级 prompt_cache_key，
 	// 配合稳定的消息布局复用 KV 缓存（需网关支持该 OpenAI 兼容扩展字段）。
+	// 压缩启用时键经 CacheGen 带代数后缀：全量压缩改写前缀，旧代缓存整体作废。
 	disp.PromptCache = envBool("LLM_PROMPT_CACHE", false)
-
-	// 安全中间件装配：不可信输入防护挂在工具调用前，数据脱敏同时挂在
-	// 工具结果回传、模型输出与事件出域三处。人工闸门的落库能力在 newSecurityBundle 内部
-	// 已交给护栏持有，worker 侧不需要再拿一份。
-	sec := newSecurityBundle(s, q, creds)
-	disp.ToolChain = sec.ToolChain
-	disp.ModelChain = sec.ModelChain
 	return &Worker{Store: s, Queue: q, Events: r, ID: id, Retry: retry.Default(), Exec: disp, EventChain: sec.EventChain}
 }
 

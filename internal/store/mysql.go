@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // MySQL 封装 *sql.DB，提供 Run/Node/Outbox 等表的全部数据访问方法。
@@ -280,10 +282,16 @@ var nodeSelectFields = []string{
 }
 
 // nodeColumns 返回可加表别名前缀的列清单，供 JOIN 查询限定列归属。
+//
+// 只对裸列名加前缀，函数表达式（COALESCE(...)）原样保留：给表达式整体加
+// `n.` 前缀会被 MySQL 解析为"schema n 下的存储例程 n.COALESCE"，在真实库上
+// 报 Error 1370 权限错误（此前长期未被发现，因为该查询只在集成测试里执行）。
+// 表达式内的列名不加前缀是安全的：CompletedAncestorNodes 的 JOIN 对端是只含
+// anc_id 一列的派生表，不存在列名歧义。
 func nodeColumns(prefix string) string {
 	cp := make([]string, len(nodeSelectFields))
 	for i, f := range nodeSelectFields {
-		if prefix != "" {
+		if prefix != "" && !strings.Contains(f, "(") {
 			f = prefix + "." + f
 		}
 		cp[i] = f
@@ -583,10 +591,105 @@ func (s *MySQL) MarkInbox(ctx context.Context, tenant, eventID string) error {
 // RecordLLMUsage 记录单次 LLM 调用的 token 消耗与成本到 llm_usage 表。
 // 用于按 run/tenant/model 维度聚合统计，支撑成本分析与配额管控。
 func (s *MySQL) RecordLLMUsage(ctx context.Context, u model.LLMUsage) error {
+	// 注意占位符数必须与列数一致（9 列 9 个 ?）：此前写成了 10 个占位符，
+	// 调用方普遍以 `_ =` 忽略错误，导致这个 bug 长期静默存在、usage 从未落库。
 	_, err := s.DB.ExecContext(ctx,
-		`INSERT INTO llm_usage(usage_id,run_id,node_id,tenant_id,model,prompt_tokens,completion_tokens,total_tokens,cost) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO llm_usage(usage_id,run_id,node_id,tenant_id,model,prompt_tokens,completion_tokens,total_tokens,cost) VALUES(?,?,?,?,?,?,?,?,?)`,
 		u.ID, u.RunID, u.NodeID, u.TenantID, u.Model, u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.Cost)
 	return err
+}
+
+// LastLLMPromptUsage 返回该 Run 最近一次主推理 LLM 调用的用量记录，
+// 作为上下文 token 估算的实测锚点（估算 = 实测值 + 自此之后的新增内容估算）。
+//
+// 排除压缩器自己产生的摘要调用（usage_id 前缀 usage-compact-）：
+// 摘要调用的 prompt_tokens 反映的是"摘要输入"的规模，拿它当主推理锚点
+// 会把下一次估算整体拉低，恰好违反"宁可高估"的原则。
+// 兜底排序带 usage_id 作 tiebreaker：同一微秒内的多次调用结果才稳定。
+func (s *MySQL) LastLLMPromptUsage(ctx context.Context, tenant, runID string) (model.LLMUsage, bool, error) {
+	var u model.LLMUsage
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT usage_id,run_id,node_id,tenant_id,model,prompt_tokens,completion_tokens,total_tokens,COALESCE(cost,0)
+		 FROM llm_usage
+		 WHERE run_id=? AND tenant_id=? AND usage_id NOT LIKE 'usage-compact-%'
+		 ORDER BY created_at DESC, usage_id DESC LIMIT 1`,
+		runID, tenant).
+		Scan(&u.ID, &u.RunID, &u.NodeID, &u.TenantID, &u.Model, &u.PromptTokens, &u.CompletionTokens, &u.TotalTokens, &u.Cost)
+	if err == sql.ErrNoRows {
+		return model.LLMUsage{}, false, nil
+	}
+	if err != nil {
+		return model.LLMUsage{}, false, err
+	}
+	return u, true, nil
+}
+
+// LatestCompaction 返回该 Run 指定 kind（'micro'/'full'）最新产生的压缩记录。
+//
+// "最新产生"即"水位线最深"：水位线只推进不回退，两条序一致，
+// 因此读取端不需要理解 waterline_node_id 的语义，按 created_at 取最新即可。
+func (s *MySQL) LatestCompaction(ctx context.Context, tenant, runID, kind string) (*model.RunCompaction, error) {
+	var (
+		rec    model.RunCompaction
+		hasSec sql.NullString
+	)
+	// summary 允许为空字符串，sections 允许为 NULL，均经 COALESCE/NullString 归一。
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT compaction_id,tenant_id,run_id,kind,waterline_node_id,COALESCE(summary,''),sections,estimated_tokens,COALESCE(model,'')
+		 FROM run_compaction
+		 WHERE tenant_id=? AND run_id=? AND kind=?
+		 ORDER BY created_at DESC, compaction_id DESC LIMIT 1`,
+		tenant, runID, kind).
+		Scan(&rec.ID, &rec.TenantID, &rec.RunID, &rec.Kind, &rec.WaterlineNodeID, &rec.Summary, &hasSec, &rec.EstimatedTokens, &rec.Model)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if hasSec.Valid && hasSec.String != "" {
+		if err := json.Unmarshal([]byte(hasSec.String), &rec.Sections); err != nil {
+			return nil, fmt.Errorf("unmarshal compaction sections: %w", err)
+		}
+	}
+	return &rec, nil
+}
+
+// InsertCompaction 插入一条压缩记录，实现并发压缩的"先算后插、冲突丢弃"：
+// 唯一键 (tenant,run,kind,waterline) 冲突时返回 (false, nil)，调用方应丢弃
+// 本地结果、改读 LatestCompaction 使用已存在记录——摘要无副作用且输入相同，
+// 浪费上界是并发竞态的一次重复 LLM 调用，不值得为它引入占位租约状态机。
+func (s *MySQL) InsertCompaction(ctx context.Context, rec *model.RunCompaction) (bool, error) {
+	var sections any
+	if len(rec.Sections) > 0 {
+		b, err := json.Marshal(rec.Sections)
+		if err != nil {
+			return false, fmt.Errorf("marshal compaction sections: %w", err)
+		}
+		sections = string(b)
+	}
+	_, err := s.DB.ExecContext(ctx,
+		`INSERT INTO run_compaction(compaction_id,tenant_id,run_id,kind,waterline_node_id,summary,sections,estimated_tokens,model) VALUES(?,?,?,?,?,?,?,?,?)`,
+		rec.ID, rec.TenantID, rec.RunID, rec.Kind, rec.WaterlineNodeID, rec.Summary, sections, rec.EstimatedTokens, rec.Model)
+	if err != nil {
+		// MySQL 1062 = duplicate entry on unique key：并发方先插入成功，视为正常竞态。
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1062 {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// CountCompactions 统计该 Run 指定 kind 的记录数。full 代数用于 prompt cache
+// 换代（docs/context-compaction.md §6）：每次全量压缩改写前缀，cache key 必须换代。
+func (s *MySQL) CountCompactions(ctx context.Context, tenant, runID, kind string) (int, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run_compaction WHERE tenant_id=? AND run_id=? AND kind=?`,
+		tenant, runID, kind).Scan(&n)
+	return n, err
 }
 
 // SaveDecision 持久化 Planner 决策（Plan JSON），以 (run,trigger_node,round) 为唯一键。
