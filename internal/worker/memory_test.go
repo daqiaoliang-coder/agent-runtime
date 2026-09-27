@@ -50,6 +50,10 @@ func (f *fakeContextStore) GetRun(context.Context, string, string) (*model.Run, 
 	return f.run, f.runErr
 }
 
+func (f *fakeContextStore) GetNode(context.Context, string, string) (*model.Node, error) {
+	return nil, nil // 压缩分支未启用时不查询；返回空值即 loader 降级为空 currentInput
+}
+
 // fakeSearcher 同时实现 MemoryProvider 与 MemorySearcher，记录调用入参。
 type fakeSearcher struct {
 	msgs     []contracts.Message

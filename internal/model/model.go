@@ -162,12 +162,12 @@ type RunCompaction struct {
 	ID              string
 	TenantID        string
 	RunID           string
-	Kind            string // CompactionKindMicro / CompactionKindFull（定义在 worker 包，这里保持纯数据）
-	WaterlineNodeID string // 覆盖到的最后一个节点（按 (finished_at,node_id) 确定序）
-	Summary         string             // full：八段结构化摘要
-	Sections        map[string]string  // micro：node_id → 一句话摘要
-	EstimatedTokens int                // 压缩前的估算值，仅用于可观测与回归分析
-	Model           string             // 生成摘要的模型
+	Kind            string            // CompactionKindMicro / CompactionKindFull（定义在 worker 包，这里保持纯数据）
+	WaterlineNodeID string            // 覆盖到的最后一个节点（按 (finished_at,node_id) 确定序）
+	Summary         string            // full：八段结构化摘要
+	Sections        map[string]string // micro：node_id → 一句话摘要
+	EstimatedTokens int               // 压缩前的估算值，仅用于可观测与回归分析
+	Model           string            // 生成摘要的模型
 }
 
 // MemoryNode 是记忆索引器的投影候选：一个已成功完成、尚未投影为向量的节点。

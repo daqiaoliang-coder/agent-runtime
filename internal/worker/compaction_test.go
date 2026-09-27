@@ -68,11 +68,16 @@ func (f *fakeCompactionStore) CountCompactions(context.Context, string, string, 
 }
 
 // fakeSummaryModel 按最后一条 user 消息（摘要 prompt）回调响应内容。
+// onModel 可选捕获请求的 model 字段，供摘要模型回退用例断言。
 type fakeSummaryModel struct {
 	respond func(prompt string) string
+	onModel func(model string)
 }
 
 func (f fakeSummaryModel) Generate(_ context.Context, req contracts.GenerateRequest) (contracts.GenerateResponse, error) {
+	if f.onModel != nil {
+		f.onModel(req.Model)
+	}
 	if len(req.Messages) == 0 || f.respond == nil {
 		return contracts.GenerateResponse{}, errors.New("fake model: no prompt")
 	}
@@ -95,8 +100,14 @@ func (f *fakeEventSink) Emit(_ context.Context, ev contracts.RuntimeEvent) error
 	return nil
 }
 
-// tightOpt 返回阈值钳到 1024 token 的配置：tMicro == tAuto == 1024。
-func tightOpt() CompactionOptions { return CompactionOptions{ModelWindow: 8192} }
+// tightOpt 给出小窗口、显式摘要模型的配置：管线用例聚焦 L2-L5 机制本身，
+// 摘要模型解析（配置缺失→锚点回退→显式报错）由 SummaryModelFallsBackToAnchor 单测覆盖。
+func tightOpt() CompactionOptions {
+	return CompactionOptions{ModelWindow: 8192, SummaryModel: "sum-model"}
+}
+
+// bareOpt 不配置摘要模型：锚点回退/空模型守卫用例专用。
+func bareOpt() CompactionOptions { return CompactionOptions{ModelWindow: 8192} }
 
 func testEC() contracts.ExecutionContext {
 	return contracts.ExecutionContext{TenantID: "tenant-t", RunID: "run-1", NodeID: "node-cur"}
@@ -201,9 +212,9 @@ func TestHardTruncate(t *testing.T) {
 	}
 	// 超预算：最老消息被丢、system 保留、指针在保留段头部。
 	msgs := []llm.Message{
-		{Role: llm.RoleSystem, Content: strings.Repeat("s", 100)},          // 25 token，永不丢
-		{Role: llm.RoleUser, Content: strings.Repeat("a", 40000)},          // 10000 token，必丢
-		{Role: llm.RoleAssistant, Content: strings.Repeat("b", 200)},       // 50 token，保留
+		{Role: llm.RoleSystem, Content: strings.Repeat("s", 100)},    // 25 token，永不丢
+		{Role: llm.RoleUser, Content: strings.Repeat("a", 40000)},    // 10000 token，必丢
+		{Role: llm.RoleAssistant, Content: strings.Repeat("b", 200)}, // 50 token，保留
 	}
 	got = hardTruncate(msgs, 200, 4, "run-9")
 	if len(got) != 3 {
@@ -262,6 +273,12 @@ func TestMicroPrefix(t *testing.T) {
 	if got := microPrefix(active, map[string]string{"t1": "done"}, 2); len(got) != 1 || got[0].ID != "l1" {
 		t.Errorf("already-sectioned nodes must be skipped, got %+v", idsOf(got))
 	}
+	// REFLECT 排除：控制信号节点不进摘要——塑形分支整节点跳过它，
+	// section 回填永不生效，送进摘要 prompt 只是白付 token。
+	withReflect := []model.Node{toolNode("t1", "search", "o1"), reflectNode("r1"), llmNode("l1", "i1", "o1")}
+	if got := microPrefix(withReflect, nil, 0); len(got) != 2 || got[0].ID != "t1" || got[1].ID != "l1" {
+		t.Errorf("REFLECT must be excluded from the prefix, got %+v", idsOf(got))
+	}
 }
 
 // TestNodesToMessages_SectionsBackfill 回填是水位线语义，不随塑形开关退化：
@@ -308,7 +325,7 @@ func TestCompactor_Apply_NoneWhenSmall(t *testing.T) {
 	c := &Compactor{Store: store, Opt: tightOpt()}
 	nodes := []model.Node{llmNode("n1", "i1", "o1"), toolNode("t1", "search", "small result")}
 	opt := ContextOptions{ToolMasking: true, ToolMaskWindow: 6}
-	got := c.Apply(context.Background(), testEC(), nodes, nil, opt)
+	got := c.Apply(context.Background(), testEC(), nodes, nil, "", opt)
 	want := nodesToMessages(nodes, opt, 6, nil)
 	if len(got) != len(want) {
 		t.Fatalf("small context must pass through untouched: got %d want %d msgs", len(got), len(want))
@@ -337,7 +354,7 @@ func TestCompactor_Apply_L2Shrink(t *testing.T) {
 		toolNode("t1", "search", big), toolNode("t2", "search", big),
 		toolNode("t3", "search", big), toolNode("t4", "search", big),
 	}
-	got := c.Apply(context.Background(), testEC(), nodes, nil, ContextOptions{ToolMasking: true, ToolMaskWindow: 4})
+	got := c.Apply(context.Background(), testEC(), nodes, nil, "", ContextOptions{ToolMasking: true, ToolMaskWindow: 4})
 	if len(got) != 8 {
 		t.Fatalf("4 tool nodes must yield 8 messages, got %d", len(got))
 	}
@@ -374,7 +391,7 @@ func TestCompactor_Apply_Micro(t *testing.T) {
 	c := &Compactor{Store: store, Model: fm, Events: sink, Opt: tightOpt()}
 	// 无工具可遮蔽、LLM 原文 6000 rune（1500 token > 1024）：L2 无从收缩，必须走 L3。
 	nodes := []model.Node{llmNode("n1", "i1", strings.Repeat("x", 6000)), llmNode("l1", "i2", "o2")}
-	got := c.Apply(context.Background(), testEC(), nodes, nil, ContextOptions{ToolMasking: true})
+	got := c.Apply(context.Background(), testEC(), nodes, nil, "", ContextOptions{ToolMasking: true})
 	for _, m := range got {
 		if !strings.Contains(m.Content, "[Summary of node") {
 			t.Errorf("all messages must be summary backfills, got %q", m.Content)
@@ -392,6 +409,13 @@ func TestCompactor_Apply_Micro(t *testing.T) {
 	data := eventData(t, sink.events[0])
 	if data["kind"] != CompactionKindMicro || data["waterline_node_id"] != "l1" {
 		t.Errorf("event must carry kind/waterline only: %+v", data)
+	}
+	// docs §7 事件口径：after_tokens 必须在场（微压缩后的重估算值）。
+	if at, ok := data["after_tokens"].(int); !ok || at <= 0 {
+		t.Errorf("event must carry positive after_tokens, got %v", data["after_tokens"])
+	}
+	if data["fallback"] != false {
+		t.Errorf("micro event fallback must be false: %+v", data)
 	}
 	for _, m := range got {
 		if !strings.Contains(m.Content, "node ") {
@@ -412,7 +436,7 @@ func TestCompactor_Apply_AnchorSkipsCompaction(t *testing.T) {
 	var called bool
 	fm := fakeSummaryModel{respond: func(string) string { called = true; return "{}" }}
 	c := &Compactor{Store: anchored, Model: fm, Opt: tightOpt()}
-	got := c.Apply(ctx, ec, nodes, nil, ContextOptions{ToolMasking: true})
+	got := c.Apply(ctx, ec, nodes, nil, "", ContextOptions{ToolMasking: true})
 	if called {
 		t.Error("anchored estimate must stay under threshold; summary model must not be called")
 	}
@@ -424,7 +448,7 @@ func TestCompactor_Apply_AnchorSkipsCompaction(t *testing.T) {
 	plain := &fakeCompactionStore{}
 	fm2 := fakeSummaryModel{respond: func(string) string { return `{"n1":"s1","n2":"s2"}` }}
 	c2 := &Compactor{Store: plain, Model: fm2, Opt: tightOpt()}
-	got2 := c2.Apply(ctx, ec, nodes, nil, ContextOptions{ToolMasking: true})
+	got2 := c2.Apply(ctx, ec, nodes, nil, "", ContextOptions{ToolMasking: true})
 	if plain.micro == nil {
 		t.Fatal("without anchor the same nodes must trigger micro compaction")
 	}
@@ -450,7 +474,7 @@ func TestCompactor_Apply_FullCompaction(t *testing.T) {
 		llmNode("l1", "i1", strings.Repeat("x", 20000)),
 		toolNode("t2", "search", strings.Repeat("r", 2500)),
 	}
-	got := c.Apply(context.Background(), testEC(), nodes, nil, ContextOptions{ToolMasking: true, ToolMaskWindow: 2})
+	got := c.Apply(context.Background(), testEC(), nodes, nil, "", ContextOptions{ToolMasking: true, ToolMaskWindow: 2})
 	// 水位线推进到最后一个节点：active 清空，上下文只剩摘要基座（当前指令由 executor 追加）。
 	if len(got) != 1 {
 		t.Fatalf("full compaction must reduce context to the summary base, got %d msgs: %+v", len(got), got)
@@ -473,12 +497,14 @@ func TestCompactor_Apply_FullCompaction(t *testing.T) {
 }
 
 // TestCompactor_Apply_HardTruncateFallback L5 兜底：Model 完全缺省（L3/L4 均降级）
-// 时仍必须产出预算内的消息——压缩失败绝不挂 Run。
+// 时仍必须产出预算内的消息——压缩失败绝不挂 Run；且必须发 fallback 事件
+// （docs §7：长期兜底是最需要被监控发现的质量劣化形态）。
 func TestCompactor_Apply_HardTruncateFallback(t *testing.T) {
 	store := &fakeCompactionStore{}
-	c := &Compactor{Store: store, Opt: tightOpt()} // Model=nil：L3/L4 直接降级
+	sink := &fakeEventSink{}
+	c := &Compactor{Store: store, Events: sink, Opt: tightOpt()} // Model=nil：L3/L4 直接降级
 	nodes := []model.Node{llmNode("n1", "i1", strings.Repeat("x", 20000))}
-	got := c.Apply(context.Background(), testEC(), nodes, nil, ContextOptions{ToolMasking: true})
+	got := c.Apply(context.Background(), testEC(), nodes, nil, "", ContextOptions{ToolMasking: true})
 	if len(got) < 2 {
 		t.Fatalf("hard truncate must keep at least the pointer and recent messages, got %+v", got)
 	}
@@ -491,6 +517,17 @@ func TestCompactor_Apply_HardTruncateFallback(t *testing.T) {
 	if len(store.inserted) != 0 {
 		t.Errorf("fallback path must not persist records, got %d", len(store.inserted))
 	}
+	// L5 兜底事件：kind=l5_truncate、fallback=true、after_tokens 在场。
+	if len(sink.events) != 1 {
+		t.Fatalf("L5 fallback must emit exactly one event, got %+v", sink.events)
+	}
+	data := eventData(t, sink.events[0])
+	if data["kind"] != "l5_truncate" || data["fallback"] != true {
+		t.Errorf("L5 event must carry kind=l5_truncate/fallback=true: %+v", data)
+	}
+	if at, ok := data["after_tokens"].(int); !ok || at <= 0 {
+		t.Errorf("L5 event must carry after_tokens, got %v", data["after_tokens"])
+	}
 }
 
 // TestCompactor_Apply_PreexistingFullBase 既有 full 记录：基座注入 system、
@@ -502,7 +539,7 @@ func TestCompactor_Apply_PreexistingFullBase(t *testing.T) {
 	}}
 	c := &Compactor{Store: store, Opt: tightOpt()}
 	nodes := []model.Node{llmNode("n1", "i1", "o1"), llmNode("n2", "i2", "o2"), llmNode("n3", "i3", "o3")}
-	got := c.Apply(context.Background(), testEC(), nodes, nil, ContextOptions{ToolMasking: true})
+	got := c.Apply(context.Background(), testEC(), nodes, nil, "", ContextOptions{ToolMasking: true})
 	if len(got) != 3 {
 		t.Fatalf("base + one post-waterline pair expected, got %d: %+v", len(got), got)
 	}
@@ -515,7 +552,8 @@ func TestCompactor_Apply_PreexistingFullBase(t *testing.T) {
 }
 
 // TestTryMicro_ConflictReusesExisting 并发压缩"先算后插、冲突丢弃"：
-// 插入冲突时复用已存在记录，本地结果丢弃无信息损失。
+// 插入冲突时复用已存在记录（含其水位线），本地结果丢弃无信息损失；
+// 事件发射已上移到 Apply（after_tokens 依赖重估算），本函数零事件。
 func TestTryMicro_ConflictReusesExisting(t *testing.T) {
 	existing := &model.RunCompaction{
 		ID: "existing", TenantID: "tenant-t", RunID: "run-1", Kind: CompactionKindMicro,
@@ -526,15 +564,63 @@ func TestTryMicro_ConflictReusesExisting(t *testing.T) {
 	fm := fakeSummaryModel{respond: func(string) string { return `{"t0":"fresh summary"}` }}
 	c := &Compactor{Store: store, Model: fm, Events: sink, Opt: tightOpt()}
 	ctx := context.Background()
-	secs, ok := c.tryMicro(ctx, oteltrace.SpanFromContext(ctx), testEC(),
-		[]model.Node{toolNode("t0", "search", "o")}, nil, 0, 5000)
+	secs, wl, ok := c.tryMicro(ctx, oteltrace.SpanFromContext(ctx), testEC(),
+		[]model.Node{toolNode("t0", "search", "o")}, nil, 0, 5000, "sum-model")
 	if !ok {
 		t.Fatal("conflict must reuse the existing record, not fail the layer")
 	}
 	if secs["t0"] != "existing summary" {
 		t.Errorf("conflicting insert must drop local result and reuse existing, got %q", secs["t0"])
 	}
-	if len(sink.events) != 1 || eventData(t, sink.events[0])["waterline_node_id"] != "t0" {
-		t.Errorf("event must report the reused record's waterline, got %+v", sink.events)
+	if wl != "t0" {
+		t.Errorf("returned waterline must be the reused record's, got %q", wl)
+	}
+	if len(sink.events) != 0 {
+		t.Errorf("tryMicro must not emit events (moved to Apply), got %+v", sink.events)
+	}
+}
+
+// TestCompactor_SummaryModelFallsBackToAnchor docs §8 "缺省复用主模型"：
+// CONTEXT_SUMMARY_MODEL 未配置时摘要请求应携带锚点模型（最近主推理模型）；
+// 无锚点且未配置时 generate 显式报错降级，绝不发出空 model 请求。
+func TestCompactor_SummaryModelFallsBackToAnchor(t *testing.T) {
+	ec := testEC()
+	ctx := context.Background()
+
+	// 有锚点：摘要请求的 model 必须是锚点模型。
+	// 锚点 100 token + n2 的 6000 rune 增量（≈1500 token）⇒ est>tMicro 触发 L3。
+	var gotModel string
+	fm := fakeSummaryModel{
+		respond: func(string) string { return `{"n1":"s1","n2":"s2"}` },
+		onModel: func(m string) { gotModel = m },
+	}
+	nodes := []model.Node{llmNode("n1", "i1", "o1"), llmNode("n2", "i2", strings.Repeat("x", 6000))}
+	store := &fakeCompactionStore{usage: &model.LLMUsage{ID: "u1", RunID: ec.RunID, NodeID: "n1", TenantID: ec.TenantID, Model: "anchor-model", PromptTokens: 100}}
+	c := &Compactor{Store: store, Model: fm, Opt: bareOpt()} // SummaryModel 留空
+	c.Apply(ctx, ec, nodes, nil, "", ContextOptions{ToolMasking: true})
+	if gotModel != "anchor-model" {
+		t.Errorf("summary request must fall back to the anchor model, got %q", gotModel)
+	}
+
+	// 无锚点且未配置：generate 显式报错（不发空 model），管线降级不停摆。
+	var called bool
+	fm2 := fakeSummaryModel{
+		respond: func(string) string { called = true; return "{}" },
+		onModel: func(m string) {
+			if m == "" {
+				t.Error("empty model must never reach the provider: generate must reject it first")
+			}
+		},
+	}
+	c2 := &Compactor{Store: &fakeCompactionStore{}, Model: fm2, Opt: bareOpt()}
+	got := c2.Apply(ctx, ec, nodes, nil, "", ContextOptions{ToolMasking: true})
+	if called {
+		t.Error("without anchor and config, generate must fail before calling the provider")
+	}
+	if len(got) == 0 {
+		t.Fatal("pipeline must still return messages via L5 degradation")
+	}
+	if !strings.Contains(got[0].Content, "[Dropped") {
+		t.Errorf("expected L5 truncation pointer, got %q", got[0].Content)
 	}
 }

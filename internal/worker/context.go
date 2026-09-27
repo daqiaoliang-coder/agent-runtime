@@ -78,6 +78,7 @@ type contextStore interface {
 	CompletedNodes(ctx context.Context, tenant, runID string) ([]model.Node, error)
 	CompletedAncestorNodes(ctx context.Context, tenant, runID, nodeID string) ([]model.Node, error)
 	GetRun(ctx context.Context, tenant, id string) (*model.Run, error)
+	GetNode(ctx context.Context, tenant, id string) (*model.Node, error)
 }
 
 // newContextLoader 构造 executor.Dispatcher.ContextLoader。
@@ -109,11 +110,18 @@ func newContextLoader(s contextStore, opt ContextOptions) func(context.Context, 
 		// 它只降级不报错，因此这里的错误语义与无压缩路径完全一致。
 		if opt.Compaction != nil {
 			recalled := recallMemory(ctx, s, opt.Memory, tenant, runID)
+			// 当前节点输入交给估算计入：executor 会在 loader 返回后把它
+			// 追加进最终请求，估算漏掉它就系统性偏小（违反"宁可高估"）。
+			// 读取失败按空串降级——只损失估算精度，不影响组装正确性。
+			var currentInput string
+			if cn, nerr := s.GetNode(ctx, tenant, nodeID); nerr == nil && cn != nil {
+				currentInput = cn.Input
+			}
 			return opt.Compaction.Apply(ctx, contracts.ExecutionContext{
 				TenantID: tenant,
 				RunID:    runID,
 				NodeID:   nodeID,
-			}, nodes, recalled, opt), nil
+			}, nodes, recalled, currentInput, opt), nil
 		}
 
 		current := nodesToMessages(nodes, opt, opt.toolMaskWindow(), nil)

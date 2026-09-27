@@ -196,12 +196,13 @@ func compactionID(runID, kind, waterline string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// Apply 是管线的唯一入口：输入全部已完成祖先节点与跨 Run 记忆召回，
+// Apply 是管线的唯一入口：输入全部已完成祖先节点、跨 Run 记忆召回与当前
+// 节点输入（executor 在 loader 返回后追加它，估算必须计入——宁可高估），
 // 输出预算内的最终消息列表。任何内部错误都只降级、绝不返回 error。
 //
 // 分工：水位线查询/过滤、组装（buildCur）、估算（estimate）都在本函数内
 // 闭包化，因为它们共享 active/keep/sections/full 这组随管线推进而变化的状态。
-func (c *Compactor) Apply(ctx context.Context, ec contracts.ExecutionContext, nodes []model.Node, recalled []llm.Message, opt ContextOptions) []llm.Message {
+func (c *Compactor) Apply(ctx context.Context, ec contracts.ExecutionContext, nodes []model.Node, recalled []llm.Message, currentInput string, opt ContextOptions) []llm.Message {
 	ctx, span := trace.StartSpan(ctx, "context.compaction")
 	defer span.End()
 
@@ -227,9 +228,18 @@ func (c *Compactor) Apply(ctx context.Context, ec contracts.ExecutionContext, no
 		anchorModel = anchor.Model
 	}
 	tMicro, tAuto := c.thresholds(anchorModel)
+	// 摘要模型解析（docs §8 "缺省复用主模型"）：主模型即最近一次主推理所用
+	// 模型（锚点携带）。无锚点（首节点即超窗）且未显式配置时 generate 会以
+	// 明确错误降级——比发出空 model 的请求被网关以含混的 400 拒绝好排查。
+	// 不做装配期强校验：锚点回退是主路径，装配期无从预知运行时锚点是否存在。
+	sumModel := c.Opt.SummaryModel
+	if sumModel == "" {
+		sumModel = anchorModel
+	}
 
 	keep := opt.toolMaskWindow()
 	runesRecalled := messagesRunes(recalled)
+	runesCurrent := utf8.RuneCountInString(currentInput)
 
 	// buildCur 组装 DAG 视图：[全量摘要(system)] → [水位线后节点展开]。
 	// finalize 叠加记忆召回（与现状 newContextLoader 的记忆路径一致）。
@@ -250,13 +260,15 @@ func (c *Compactor) Apply(ctx context.Context, ec contracts.ExecutionContext, no
 	// estimate 实测锚定 + 增量估算（docs §3.3）：
 	//   base = 最近一次主推理实测 prompt_tokens
 	//   delta = 自锚点节点之后新增内容的字符数 ÷ K
+	// 当前节点输入计入 curRunes：executor 在 loader 返回后追加它，锚点请求
+	// 当年也含锚点节点自己的输入（其消息对已在 prev 中），口径对齐。
 	// 锚点节点不在 active（被水位线覆盖/未识别）时退化为全量估算——
 	// 锚点失效意味着上次实测与当前视图之间隔了一次压缩，比例校准不再可信，
 	// 全量 ÷K 偏高估，方向安全。prev 里带上当前 system 与 recalled：
 	// 锚点在 active 中 ⇒ 上次请求已含同一条 system（水位线未推进）与近似
 	// 等量的记忆召回，二者相消，delta 只剩真正的新增节点。
 	estimate := func(cur []llm.Message, act []model.Node, keep int, secs map[string]string) int {
-		curRunes := messagesRunes(cur) + runesRecalled
+		curRunes := messagesRunes(cur) + runesRecalled + runesCurrent
 		if !hasAnchor {
 			return curRunes / c.Opt.charsPerToken()
 		}
@@ -314,19 +326,29 @@ func (c *Compactor) Apply(ctx context.Context, ec contracts.ExecutionContext, no
 	}
 
 	// ---- L3 微压缩：前缀节点批量摘要，持久化后内联回填 ----
-	if newSecs, ok := c.tryMicro(ctx, span, ec, active, sections, keep, est); ok {
-		sections = newSecs
-		cur = buildCur(keep, sections)
-		msgs = finalize(cur)
-		est = estimate(cur, active, keep, sections)
-		if est <= tAuto {
-			return finish("l3_micro", est, msgs)
+	if est > tMicro {
+		estAtLayer := est
+		if newSecs, wl, ok := c.tryMicro(ctx, span, ec, active, sections, keep, est, sumModel); ok {
+			sections = newSecs
+			cur = buildCur(keep, sections)
+			msgs = finalize(cur)
+			est = estimate(cur, active, keep, sections)
+			// 微压缩真实发生且已持久化：即便继续走 L4 也发本层事件
+			// （两条记录、两次事件，与水位线事实一一对应）。
+			c.emit(ctx, ec, map[string]any{
+				"kind": CompactionKindMicro, "before_tokens": estAtLayer, "after_tokens": est,
+				"waterline_node_id": wl, "fallback": false,
+			})
+			if est <= tAuto {
+				return finish("l3_micro", est, msgs)
+			}
 		}
 	}
 
 	// ---- L4 全量压缩：八段摘要成为基座，水位线推进 ----
 	if est > tAuto {
-		if newFull, ok := c.tryFull(ctx, span, ec, cur, active, est); ok {
+		estAtLayer := est
+		if newFull, ok := c.tryFull(ctx, span, ec, cur, active, est, sumModel); ok {
 			full = newFull
 			active = afterWaterline(nodes, newFull.WaterlineNodeID)
 			sections = map[string]string{} // 旧回填已被新基座吸收
@@ -334,6 +356,10 @@ func (c *Compactor) Apply(ctx context.Context, ec contracts.ExecutionContext, no
 			cur = buildCur(keep, sections)
 			msgs = finalize(cur)
 			est = estimate(cur, active, keep, sections)
+			c.emit(ctx, ec, map[string]any{
+				"kind": CompactionKindFull, "before_tokens": estAtLayer, "after_tokens": est,
+				"waterline_node_id": newFull.WaterlineNodeID, "fallback": false,
+			})
 			if est <= tAuto {
 				return finish("l4_full", est, msgs)
 			}
@@ -345,7 +371,15 @@ func (c *Compactor) Apply(ctx context.Context, ec contracts.ExecutionContext, no
 	// 截断后改用全量估算而非 estimate：msgs 已含 recalled（finalize 已合并），
 	// 再走 estimate 会叠加 runesRecalled 双计；且截断改写了前缀，锚点增量口径
 	// （append-only 假设）不再成立，全量 ÷K 才是对最终请求的真实刻画。
-	after := messagesRunes(msgs) / c.Opt.charsPerToken()
+	// currentInput 一并计入：它随后就会被 executor 追加进最终请求。
+	after := (messagesRunes(msgs) + runesCurrent) / c.Opt.charsPerToken()
+	// L5 兜底必须发事件（docs §7）："长期靠兜底截断"是最需要被监控发现的
+	// 质量劣化形态，静默兜底等于把缺陷藏进正常路径。无水位线可指（截断不
+	// 持久化），waterline_node_id 留空。
+	c.emit(ctx, ec, map[string]any{
+		"kind": "l5_truncate", "before_tokens": est, "after_tokens": after,
+		"waterline_node_id": "", "fallback": true,
+	})
 	return finish("l5_truncate", after, msgs)
 }
 
@@ -381,11 +415,13 @@ func (c *Compactor) usageAnchor(ctx context.Context, ec contracts.ExecutionConte
 // ---- L3 微压缩 ----
 
 // tryMicro 对水位线后、保留区之前的前缀节点做一次批量摘要，持久化后返回
-// 继承合并的回填映射。任何失败都返回 (_, false)：管线停留在 L2 收缩态。
-func (c *Compactor) tryMicro(ctx context.Context, span oteltrace.Span, ec contracts.ExecutionContext, active []model.Node, inherited map[string]string, keep int, estBefore int) (map[string]string, bool) {
+// 继承合并的回填映射与新记录的水位线。任何失败都返回 (_, "", false)：
+// 管线停留在 L2 收缩态。事件发射不在本函数内：after_tokens 要等 Apply
+// 重估算后才有值（docs §7 的事件口径含 after_tokens）。
+func (c *Compactor) tryMicro(ctx context.Context, span oteltrace.Span, ec contracts.ExecutionContext, active []model.Node, inherited map[string]string, keep int, estBefore int, sumModel string) (map[string]string, string, bool) {
 	prefix := microPrefix(active, inherited, keep)
 	if len(prefix) == 0 {
-		return nil, false // 保留区已经覆盖到头部：没有可摘要的前缀
+		return nil, "", false // 保留区已经覆盖到头部：没有可摘要的前缀
 	}
 	waterline := prefix[len(prefix)-1].ID
 
@@ -396,17 +432,17 @@ func (c *Compactor) tryMicro(ctx context.Context, span oteltrace.Span, ec contra
 	}
 	b.WriteString("</nodes>")
 
-	content, err := c.generate(ctx, ec, b.String())
+	content, err := c.generate(ctx, ec, sumModel, b.String())
 	if err != nil {
 		obs.From(ctx).WarnContext(ctx, "micro-compaction skipped (summary generation failed)",
 			"run_id", ec.RunID, "node_id", ec.NodeID, "error", err)
-		return nil, false
+		return nil, "", false
 	}
 	parsed, err := parseSummaryMap(content)
 	if err != nil {
 		obs.From(ctx).WarnContext(ctx, "micro-compaction skipped (unparseable summary)",
 			"run_id", ec.RunID, "node_id", ec.NodeID, "error", err)
-		return nil, false
+		return nil, "", false
 	}
 	// 宽容缺失：模型漏掉的节点补短占位，继续比整体失败好（缺一个节点的
 	// 转述远好于整段前缀继续以原文膨胀）。
@@ -433,35 +469,34 @@ func (c *Compactor) tryMicro(ctx context.Context, span oteltrace.Span, ec contra
 		WaterlineNodeID: waterline,
 		Sections:        merged,
 		EstimatedTokens: estBefore,
-		Model:           c.Opt.SummaryModel,
+		Model:           sumModel,
 	}
 	inserted, err := c.Store.InsertCompaction(ctx, rec)
 	if err != nil {
 		obs.From(ctx).WarnContext(ctx, "micro-compaction skipped (persist failed)",
 			"run_id", ec.RunID, "waterline", waterline, "error", err)
-		return nil, false
+		return nil, "", false
 	}
 	if !inserted {
 		// 并发方先插入成功（先算后插、冲突丢弃）：复用已存在记录。
 		// 摘要无副作用、输入相同、产出等价，丢弃本地结果没有信息损失。
 		existing, lerr := c.Store.LatestCompaction(ctx, ec.TenantID, ec.RunID, CompactionKindMicro)
 		if lerr != nil || existing == nil {
-			return nil, false
+			return nil, "", false
 		}
 		merged = existing.Sections
 		waterline = existing.WaterlineNodeID
 	}
 	span.SetAttributes(attribute.String("compaction.micro_waterline", waterline))
-	c.emit(ctx, ec, map[string]any{
-		"kind": CompactionKindMicro, "before_tokens": estBefore,
-		"waterline_node_id": waterline, "fallback": false,
-	})
-	return merged, true
+	return merged, waterline, true
 }
 
 // microPrefix 选择微压缩的前缀：保留区 = 最后 keep 个 TOOL 节点中最早者
 // 之后的全部节点（含其间与之后的 LLM 轮次）；前缀 = 保留区之前、尚未被
 // 回填映射覆盖的节点（重复摘要已覆盖节点没有增益，只浪费 LLM 预算）。
+// REFLECT 节点排除：其输出是 {"action":...} 控制信号而非业务对话——
+// nodesToMessages 塑形分支本来就整节点排除（sections 回填永不命中），
+// 把它送进摘要 prompt 只是白付 token，还会污染 JSON map 输出。
 // keep==0（L2 收缩终点档）时保留区为空，全部节点都可进入摘要——此时若仍
 // 超阈值，能压缩的只剩"把整段 active 换成转述"这一条路。
 func microPrefix(active []model.Node, sections map[string]string, keep int) []model.Node {
@@ -481,6 +516,9 @@ func microPrefix(active []model.Node, sections map[string]string, keep int) []mo
 	}
 	var prefix []model.Node
 	for i := 0; i < suffixStart; i++ {
+		if active[i].Type == model.NodeReflect {
+			continue
+		}
 		if _, done := sections[active[i].ID]; done {
 			continue
 		}
@@ -526,7 +564,8 @@ func parseSummaryMap(content string) (map[string]string, error) {
 // tryFull 把当前 DAG 视图摘要为固定八段结构，水位线推进到最新已完成节点。
 // 摘要输入是 cur（system 基座 + 节点展开 + 回填）而不含跨 Run 记忆召回：
 // recalled 每次组装都会重新前置，若被摘要吸收会在下一代上下文中重复出现。
-func (c *Compactor) tryFull(ctx context.Context, span oteltrace.Span, ec contracts.ExecutionContext, cur []llm.Message, active []model.Node, estBefore int) (*model.RunCompaction, bool) {
+// 事件发射同样留给 Apply（after_tokens 依赖重估算）。
+func (c *Compactor) tryFull(ctx context.Context, span oteltrace.Span, ec contracts.ExecutionContext, cur []llm.Message, active []model.Node, estBefore int, sumModel string) (*model.RunCompaction, bool) {
 	if len(active) == 0 {
 		// 无节点可覆盖：膨胀来自记忆召回或旧摘要自身，L4 无从下手，交给 L5。
 		return nil, false
@@ -553,7 +592,7 @@ Respond with exactly these eight numbered sections, keeping the headings, conten
 	}
 	b.WriteString("</history>")
 
-	summary, err := c.generate(ctx, ec, b.String())
+	summary, err := c.generate(ctx, ec, sumModel, b.String())
 	if err != nil {
 		obs.From(ctx).WarnContext(ctx, "full compaction skipped (summary generation failed)",
 			"run_id", ec.RunID, "node_id", ec.NodeID, "error", err)
@@ -574,7 +613,7 @@ Respond with exactly these eight numbered sections, keeping the headings, conten
 		WaterlineNodeID: waterline,
 		Summary:         summary,
 		EstimatedTokens: estBefore,
-		Model:           c.Opt.SummaryModel,
+		Model:           sumModel,
 	}
 	inserted, err := c.Store.InsertCompaction(ctx, rec)
 	if err != nil {
@@ -590,10 +629,6 @@ Respond with exactly these eight numbered sections, keeping the headings, conten
 		rec = existing
 	}
 	span.SetAttributes(attribute.String("compaction.full_waterline", rec.WaterlineNodeID))
-	c.emit(ctx, ec, map[string]any{
-		"kind": CompactionKindFull, "before_tokens": estBefore,
-		"waterline_node_id": rec.WaterlineNodeID, "fallback": false,
-	})
 	return rec, true
 }
 
@@ -603,14 +638,21 @@ Respond with exactly these eight numbered sections, keeping the headings, conten
 // 过 ModelChain 护栏（摘要输入包含全部历史，泄露面与主调用同量级，
 // 没有理由豁免），token 用量记入 llm_usage（usage-compact- 前缀供实测
 // 锚点排除，见 store.LastLLMPromptUsage）。
-func (c *Compactor) generate(ctx context.Context, ec contracts.ExecutionContext, prompt string) (string, error) {
+// sumModel 由 Apply 解析后传入（CONTEXT_SUMMARY_MODEL 或锚点回退，见 Apply）；
+// 仍为空时显式报错降级：链路对空 model 无任何兜底（openai 客户端会原样
+// 发出 "model":""），含混的网关 400 不如本地的明确错误好排查。
+// （参数名不用 model：会遮蔽 model 包，下方记账要用 model.LLMUsage。）
+func (c *Compactor) generate(ctx context.Context, ec contracts.ExecutionContext, sumModel, prompt string) (string, error) {
 	if c.Model == nil {
 		return "", errors.New("compactor: model provider not configured")
+	}
+	if sumModel == "" {
+		return "", errors.New("compactor: summary model not configured (set CONTEXT_SUMMARY_MODEL; no main-inference anchor to fall back to)")
 	}
 	sctx, cancel := context.WithTimeout(ctx, summaryTimeout)
 	defer cancel()
 	req := contracts.GenerateRequest{
-		Model:   c.Opt.SummaryModel,
+		Model:    sumModel,
 		Messages: []contracts.Message{{Role: contracts.RoleUser, Content: prompt}},
 	}
 	if c.ModelChain != nil {
@@ -638,15 +680,15 @@ func (c *Compactor) generate(ctx context.Context, ec contracts.ExecutionContext,
 			cost = c.Pricer(resp.Model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 		}
 		if uerr := c.Usage.RecordLLMUsage(sctx, model.LLMUsage{
-			ID:              fmt.Sprintf("usage-compact-%d", time.Now().UnixNano()),
-			RunID:           ec.RunID,
-			NodeID:          ec.NodeID,
-			TenantID:        ec.TenantID,
-			Model:           resp.Model,
-			PromptTokens:    resp.Usage.PromptTokens,
+			ID:               fmt.Sprintf("usage-compact-%d", time.Now().UnixNano()),
+			RunID:            ec.RunID,
+			NodeID:           ec.NodeID,
+			TenantID:         ec.TenantID,
+			Model:            resp.Model,
+			PromptTokens:     resp.Usage.PromptTokens,
 			CompletionTokens: resp.Usage.CompletionTokens,
-			TotalTokens:     resp.Usage.TotalTokens,
-			Cost:            cost,
+			TotalTokens:      resp.Usage.TotalTokens,
+			Cost:             cost,
 		}); uerr != nil {
 			// 记账失败不影响摘要产出，但必须可见：锚点长期缺失会让估算退化为全量。
 			obs.From(sctx).WarnContext(sctx, "record summary usage failed",
