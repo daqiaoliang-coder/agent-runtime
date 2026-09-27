@@ -33,7 +33,7 @@ const (
 	DefaultToolOutputMaxRunes = 4000
 )
 
-// ContextOptions 描述 ContextLoader 的完整装配：上下文塑形开关 + 跨 Run 记忆。
+// ContextOptions 描述 ContextLoader 的完整装配：上下文塑形开关 + 跨 Run 记忆 + 压缩管线。
 type ContextOptions struct {
 	// Memory 为跨 Run 语义记忆配置；Memory.Memory 为 nil 表示未启用。
 	Memory MemoryOptions
@@ -44,9 +44,16 @@ type ContextOptions struct {
 	// 老/长工具结果替换为占位符。false 时保持"全部节点无差别 input/output 配对"。
 	ToolMasking bool
 	// ToolMaskWindow 保留完整结果的最近 TOOL 节点数；<=0 用默认值。
+	// 注意这只是**初始**窗口：压缩管线（Compaction）启用时，L2 收缩会
+	// 在预算压力下把实际窗口逐档收窄到 4/2/0，这里配置的是起点而非下限。
 	ToolMaskWindow int
 	// ToolOutputMaxRunes 单条工具结果的字符上限；<=0 用默认值。
 	ToolOutputMaxRunes int
+	// Compaction 为上下文压缩管线（docs/context-compaction.md）；nil 时整条
+	// 管线旁路，行为与接入前完全一致。压缩开关与塑形开关正交：微压缩的回填
+	// 在塑形关闭时同样生效（水位线语义不依赖塑形），L2 收缩则只在塑形开启时
+	// 有收缩空间。
+	Compaction *Compactor
 }
 
 func (o ContextOptions) toolMaskWindow() int {
@@ -77,6 +84,8 @@ type contextStore interface {
 //
 // 闭包签名带 nodeID：祖先作用域需要以"当前要执行的节点"为起点沿边追溯。
 // 组装顺序为：[塑形后的当前 Run 历史] →（启用记忆时）前置跨 Run 召回。
+// 压缩管线启用时，整条组装交给 Compactor.Apply（它在同一位置叠加
+// 水位线基座/回填/预算收缩，详见 compaction.go）。
 //
 // 错误语义：节点历史查询失败（含祖先查询）按主链路必需数据上抛；
 // 记忆召回失败只 warn 降级，见 memory.go。
@@ -95,7 +104,19 @@ func newContextLoader(s contextStore, opt ContextOptions) func(context.Context, 
 			}
 			nodes = nil
 		}
-		current := nodesToMessages(nodes, opt)
+
+		// 压缩管线接管组装：水位线过滤/基座/回填/L2-L5 都在 Apply 内。
+		// 它只降级不报错，因此这里的错误语义与无压缩路径完全一致。
+		if opt.Compaction != nil {
+			recalled := recallMemory(ctx, s, opt.Memory, tenant, runID)
+			return opt.Compaction.Apply(ctx, contracts.ExecutionContext{
+				TenantID: tenant,
+				RunID:    runID,
+				NodeID:   nodeID,
+			}, nodes, recalled, opt), nil
+		}
+
+		current := nodesToMessages(nodes, opt, opt.toolMaskWindow(), nil)
 
 		// 记忆未启用时原样返回当前 Run 历史（截断是记忆路径的预算策略，不偷渡到这里）。
 		if opt.Memory.Memory == nil {
@@ -109,16 +130,27 @@ func newContextLoader(s contextStore, opt ContextOptions) func(context.Context, 
 
 // nodesToMessages 把已完成节点派生为对话消息，是 worker 与单测共用的纯函数。
 //
+// keepFullWindow 为保留完整工具结果的最近 TOOL 节点数（压缩管线的 L2 收缩
+// 会传入收缩后的档位；0 表示全部遮蔽）。sections 为微压缩回填映射，
+// node_id 命中时该节点整对替换为一条摘要消息——微压缩不合并语义，
+// 对话轮次与顺序完全不变，只是"大原文"换成"小转述"。
+//
 // 塑形关闭时严格保持旧行为：所有节点（含 TOOL/REFLECT）按时间序无差别展开为
-// user(input)/assistant(output) 对。塑形开启时：
+// user(input)/assistant(output) 对；但 sections 回填仍然生效——摘要产物替换
+// 原文是水位线语义（持久化事实），不随塑形开关退化，否则微压缩白做。
+// 塑形开启时：
 //   - REFLECT：整节点排除（其输出是 {"action":...} 控制信号，不是业务对话）；
 //   - TOOL：user 消息加 [tool_call:<name>] 前缀让模型知道文本来源；assistant 消息
 //     按窗口保留/遮蔽/截断，占位符携带 node_id 作为原文指针；
 //   - LLM：维持 input→user、output→assistant。
-func nodesToMessages(nodes []model.Node, opt ContextOptions) []llm.Message {
+func nodesToMessages(nodes []model.Node, opt ContextOptions, keepFullWindow int, sections map[string]string) []llm.Message {
 	if !opt.ToolMasking {
 		out := make([]llm.Message, 0, len(nodes)*2)
 		for _, n := range nodes {
+			if s, ok := sections[n.ID]; ok {
+				out = append(out, llm.Message{Role: llm.RoleUser, Content: summarizedNodePlaceholder(n, s)})
+				continue
+			}
 			out = append(out,
 				llm.Message{Role: llm.RoleUser, Content: n.Input},
 				llm.Message{Role: llm.RoleAssistant, Content: n.Output},
@@ -127,7 +159,8 @@ func nodesToMessages(nodes []model.Node, opt ContextOptions) []llm.Message {
 		return out
 	}
 
-	// 找出全部 TOOL 节点的位置，只保留最近 W 个的完整结果；其余遮蔽。
+	// 找出全部 TOOL 节点的位置，只保留最近 keepFullWindow 个的完整结果；其余遮蔽。
+	// keepFullWindow==0 是 L2 收缩的终点档：全部遮蔽（调用本身仍保留，模型知道发生过什么）。
 	toolPositions := make([]int, 0, len(nodes))
 	for i, n := range nodes {
 		if n.Type == model.NodeTool {
@@ -135,8 +168,8 @@ func nodesToMessages(nodes []model.Node, opt ContextOptions) []llm.Message {
 		}
 	}
 	keepFull := make(map[int]bool, len(toolPositions))
-	w := opt.toolMaskWindow()
-	if w <= 0 || len(toolPositions) <= w {
+	w := keepFullWindow
+	if w < 0 || len(toolPositions) <= w {
 		for _, i := range toolPositions {
 			keepFull[i] = true
 		}
@@ -149,10 +182,14 @@ func nodesToMessages(nodes []model.Node, opt ContextOptions) []llm.Message {
 	maxRunes := opt.toolOutputMaxRunes()
 	out := make([]llm.Message, 0, len(nodes)*2)
 	for i, n := range nodes {
-		switch n.Type {
-		case model.NodeReflect:
+		switch {
+		case n.Type == model.NodeReflect:
 			continue
-		case model.NodeTool:
+		case n.Type == model.NodeTool:
+			if s, ok := sections[n.ID]; ok {
+				out = append(out, llm.Message{Role: llm.RoleUser, Content: summarizedNodePlaceholder(n, s)})
+				continue
+			}
 			out = append(out, llm.Message{
 				Role:    llm.RoleUser,
 				Content: fmt.Sprintf("[tool_call:%s] %s", n.Name, n.Input),
@@ -169,6 +206,10 @@ func nodesToMessages(nodes []model.Node, opt ContextOptions) []llm.Message {
 				})
 			}
 		default:
+			if s, ok := sections[n.ID]; ok {
+				out = append(out, llm.Message{Role: llm.RoleUser, Content: summarizedNodePlaceholder(n, s)})
+				continue
+			}
 			out = append(out,
 				llm.Message{Role: llm.RoleUser, Content: n.Input},
 				llm.Message{Role: llm.RoleAssistant, Content: n.Output},
@@ -176,6 +217,12 @@ func nodesToMessages(nodes []model.Node, opt ContextOptions) []llm.Message {
 		}
 	}
 	return out
+}
+
+// summarizedNodePlaceholder 生成微压缩回填的摘要消息。
+// 保留 node_id 指针：摘要丢失细节时，模型可经 fetch_tool_result 按需取回原文。
+func summarizedNodePlaceholder(n model.Node, summary string) string {
+	return fmt.Sprintf("[Summary of node %s (%s %s): %s]", n.ID, n.Type, n.Name, summary)
 }
 
 // maskedToolPlaceholder 生成窗口外工具结果的占位符。

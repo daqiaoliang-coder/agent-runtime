@@ -87,6 +87,12 @@ type Dispatcher struct {
 	// PromptCache 开启后为每个 Run 的 LLM 请求生成稳定的 prompt_cache_key 并透传给网关，
 	// 使同一 Run 内 append-only 的历史前缀命中 KV 缓存。默认关闭（见 worker 装配）。
 	PromptCache bool
+	// CacheGen 返回 Run 当前缓存键的代数后缀（docs/context-compaction.md §6）：
+	// 全量压缩（L4）会把历史前缀整体改写为摘要基座，KV 缓存随之失效，键必须按
+	// 代数换代（":g<N>"，N=已持久化的 full 记录数）才能避免命中错位前缀。
+	// 为 nil（压缩未启用）时键不带代数。代数查询按次进行：它由水位线推进驱动，
+	// 无法在装配期预知；查询失败由提供方自行降级（退 g0，代价仅缓存不命中）。
+	CacheGen func(ctx context.Context, tenant, runID string) string
 	// ToolChain 是工具调用的横切链（不可信输入防护 + 数据脱敏），为 nil 时不拦截。
 	//
 	// 挂在 Dispatcher 而非只挂在 react.Engine 的理由：生产路径上工具是由 DAG 的
@@ -242,7 +248,7 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 	// 请求统一收敛为 v3 契约形态，供内容护栏与两条生成路径（ModelProvider / 遗留 LLM）
 	// 共用同一份入参。若各路径各自构造请求，Before 的改写会只对其中一条生效，
 	// 另一条就成了绕过入口——"挂载点存在但不生效"的典型形态。
-	request := contracts.GenerateRequest{Model: modelForNode(n), CacheKey: d.cacheKey(n)}
+	request := contracts.GenerateRequest{Model: modelForNode(n), CacheKey: d.cacheKey(ctx, n)}
 	for _, m := range msgs {
 		request.Messages = append(request.Messages, contracts.Message{Role: contracts.Role(m.Role), Content: m.Content})
 	}
@@ -359,7 +365,7 @@ func (d *Dispatcher) executeReflect(ctx context.Context, n *model.Node) (string,
 	msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: n.Input})
 	var resp llm.Response
 	if d.ModelProvider != nil {
-		request := contracts.GenerateRequest{Model: modelForNode(n), CacheKey: d.cacheKey(n)}
+		request := contracts.GenerateRequest{Model: modelForNode(n), CacheKey: d.cacheKey(ctx, n)}
 		for _, m := range msgs {
 			request.Messages = append(request.Messages, contracts.Message{Role: contracts.Role(m.Role), Content: m.Content})
 		}
@@ -372,7 +378,7 @@ func (d *Dispatcher) executeReflect(ctx context.Context, n *model.Node) (string,
 		if d.LLM == nil {
 			return "", fmt.Errorf("llm client not configured for reflect")
 		}
-		got, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs, CacheKey: d.cacheKey(n)})
+		got, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: msgs, CacheKey: d.cacheKey(ctx, n)})
 		if err != nil {
 			return "", fmt.Errorf("reflect llm: %w", err)
 		}
@@ -576,12 +582,17 @@ func modelForNode(n *model.Node) string { return n.Name }
 
 // cacheKey 返回该节点所属 Run 的稳定缓存键。同一 Run 内不同节点的历史是 append-only
 // 增长的同一前缀，因此键按 (tenant, run) 维度固定、不带 node_id；带 tenant 是为了
-// 在多租户共用网关时避免键空间碰撞。PromptCache 关闭时返回空串（不透传该字段）。
-func (d *Dispatcher) cacheKey(n *model.Node) string {
+// 在多租户共用网关时避免键空间碰撞。装配了 CacheGen（压缩管线启用）时追加代数后缀：
+// 全量压缩改写前缀后旧代缓存必须整体作废。PromptCache 关闭时返回空串（不透传该字段）。
+func (d *Dispatcher) cacheKey(ctx context.Context, n *model.Node) string {
 	if !d.PromptCache {
 		return ""
 	}
-	return "agent-run:" + n.TenantID + ":" + n.RunID
+	key := "agent-run:" + n.TenantID + ":" + n.RunID
+	if d.CacheGen != nil {
+		key += d.CacheGen(ctx, n.TenantID, n.RunID)
+	}
+	return key
 }
 
 // NewDefault 构造一个开箱即用的 Dispatcher：使用 Echo（Stub）LLM + Search/Calculator 工具。
@@ -619,12 +630,12 @@ func (d *Dispatcher) StreamLLM(ctx context.Context, n *model.Node) (<-chan contr
 				msgs = append(msgs, contracts.Message{Role: contracts.RoleUser, Content: n.Input})
 			}
 		}
-		return d.ModelProvider.Stream(ctx, contracts.GenerateRequest{Model: modelForNode(n), Messages: msgs, CacheKey: d.cacheKey(n)})
+		return d.ModelProvider.Stream(ctx, contracts.GenerateRequest{Model: modelForNode(n), Messages: msgs, CacheKey: d.cacheKey(ctx, n)})
 	}
 	if d.LLM == nil {
 		return nil, fmt.Errorf("llm client not configured")
 	}
-	resp, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: []llm.Message{{Role: llm.RoleUser, Content: n.Input}}, CacheKey: d.cacheKey(n)})
+	resp, err := d.LLM.Complete(ctx, llm.Request{Model: modelForNode(n), Messages: []llm.Message{{Role: llm.RoleUser, Content: n.Input}}, CacheKey: d.cacheKey(ctx, n)})
 	if err != nil {
 		return nil, err
 	}

@@ -42,7 +42,7 @@ func newIntegrationStore(t *testing.T) *MySQL {
 	if _, err := s.DB.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS=0"); err != nil {
 		t.Fatalf("disable FK: %v", err)
 	}
-	for _, tbl := range []string{"planner_decision", "llm_usage", "checkpoint", "agent_inbox", "event_outbox", "agent_dlq", "tool_call", "agent_edge", "agent_node", "agent_run", "run_interrupt"} {
+	for _, tbl := range []string{"run_compaction", "planner_decision", "llm_usage", "checkpoint", "agent_inbox", "event_outbox", "agent_dlq", "tool_call", "agent_edge", "agent_node", "agent_run", "run_interrupt"} {
 		if _, err := s.DB.ExecContext(ctx, fmt.Sprintf("TRUNCATE TABLE %s", tbl)); err != nil {
 			t.Logf("truncate %s: %v", tbl, err)
 		}
@@ -691,5 +691,87 @@ func TestIntegration_CancelRun_LeavesRunningForWorker(t *testing.T) {
 	nStillRunning, _ := s.GetNode(ctx, "tenant-it", "it-cancel-2:run")
 	if nStillRunning.Status != model.NodeRunning {
 		t.Errorf("RUNNING node should remain RUNNING after CancelNode attempt, got %s", nStillRunning.Status)
+	}
+}
+
+// TestIntegration_RunCompaction 验证压缩持久化（run_compaction 表）的关键不变量：
+//   - 实测锚点取最新主推理、且排除压缩器自身的摘要调用（usage-compact- 前缀）；
+//   - 记录插入/读取回环（micro 的 sections JSON / full 的 summary）；
+//   - 唯一键 (tenant,run,kind,waterline) 的"先算后插、冲突丢弃"并发语义（1062 → (false,nil)）；
+//   - kind 维度互不干扰；full 代数计数供 prompt cache 换代。
+func TestIntegration_RunCompaction(t *testing.T) {
+	s := newIntegrationStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	const runID, tenant = "it-comp-1", "tenant-it"
+	// 实测锚点：两条主推理夹一条摘要调用，锚点必须取 u-main-2（最新非压缩调用）。
+	_ = s.RecordLLMUsage(ctx, model.LLMUsage{ID: "u-main-1", RunID: runID, NodeID: "n1", TenantID: tenant, Model: "m1", PromptTokens: 100, CompletionTokens: 20, TotalTokens: 120})
+	_ = s.RecordLLMUsage(ctx, model.LLMUsage{ID: "usage-compact-999", RunID: runID, NodeID: "n1", TenantID: tenant, Model: "m1", PromptTokens: 99999, CompletionTokens: 1, TotalTokens: 100000})
+	_ = s.RecordLLMUsage(ctx, model.LLMUsage{ID: "u-main-2", RunID: runID, NodeID: "n2", TenantID: tenant, Model: "m1", PromptTokens: 200, CompletionTokens: 40, TotalTokens: 240})
+	u, ok, err := s.LastLLMPromptUsage(ctx, tenant, runID)
+	if err != nil || !ok {
+		t.Fatalf("LastLLMPromptUsage: ok=%v err=%v", ok, err)
+	}
+	if u.ID != "u-main-2" || u.PromptTokens != 200 {
+		t.Errorf("anchor must be the latest non-compaction usage, got %+v", u)
+	}
+	// 租户隔离 + 无记录时 (nil-usage, false, nil)。
+	if _, ok, err = s.LastLLMPromptUsage(ctx, "other-tenant", runID); err != nil || ok {
+		t.Errorf("mismatched tenant must miss, ok=%v err=%v", ok, err)
+	}
+
+	// micro 记录：sections JSON 回环。
+	micro := &model.RunCompaction{
+		ID: "comp-micro-1", TenantID: tenant, RunID: runID, Kind: "micro",
+		WaterlineNodeID: runID + ":n2",
+		Sections:        map[string]string{runID + ":n1": "n1 done", runID + ":n2": "n2 done"},
+		EstimatedTokens: 5000, Model: "m1",
+	}
+	inserted, err := s.InsertCompaction(ctx, micro)
+	if err != nil || !inserted {
+		t.Fatalf("InsertCompaction(micro): inserted=%v err=%v", inserted, err)
+	}
+	// 唯一键冲突：并发方对同一 (tenant,run,kind,waterline) 的插入被静默丢弃。
+	dup := *micro
+	dup.ID = "comp-micro-1-concurrent"
+	if inserted, err = s.InsertCompaction(ctx, &dup); err != nil || inserted {
+		t.Errorf("duplicate waterline must be dropped silently: inserted=%v err=%v", inserted, err)
+	}
+	got, err := s.LatestCompaction(ctx, tenant, runID, "micro")
+	if err != nil {
+		t.Fatalf("LatestCompaction(micro): %v", err)
+	}
+	if got == nil || got.ID != "comp-micro-1" || got.WaterlineNodeID != runID+":n2" {
+		t.Fatalf("micro record roundtrip failed: %+v", got)
+	}
+	if len(got.Sections) != 2 || got.Sections[runID+":n1"] != "n1 done" {
+		t.Errorf("sections JSON roundtrip broken: %+v", got.Sections)
+	}
+
+	// full 记录：summary 回环 + 代数计数（prompt cache 换代依据）。
+	full := &model.RunCompaction{
+		ID: "comp-full-1", TenantID: tenant, RunID: runID, Kind: "full",
+		WaterlineNodeID: runID + ":n3", Summary: "1 任务目标与约束: demo", EstimatedTokens: 9000, Model: "m1",
+	}
+	if inserted, err = s.InsertCompaction(ctx, full); err != nil || !inserted {
+		t.Fatalf("InsertCompaction(full): inserted=%v err=%v", inserted, err)
+	}
+	n, err := s.CountCompactions(ctx, tenant, runID, "full")
+	if err != nil || n != 1 {
+		t.Errorf("full generation count = %d (err %v), want 1", n, err)
+	}
+	if n, err = s.CountCompactions(ctx, tenant, runID, "micro"); err != nil || n != 1 {
+		t.Errorf("micro count = %d (err %v), want 1", n, err)
+	}
+	// kind 互不干扰：latest(full) 不得读出 micro 的记录。
+	gotFull, err := s.LatestCompaction(ctx, tenant, runID, "full")
+	if err != nil || gotFull == nil || gotFull.Kind != "full" || gotFull.Summary != "1 任务目标与约束: demo" {
+		t.Errorf("full record roundtrip failed: %+v (err %v)", gotFull, err)
+	}
+	// 无记录：(nil, nil) 而非错误（读取端按"无基座"降级）。
+	none, err := s.LatestCompaction(ctx, tenant, "it-comp-none", "full")
+	if err != nil || none != nil {
+		t.Errorf("no record must yield (nil,nil), got (%+v,%v)", none, err)
 	}
 }

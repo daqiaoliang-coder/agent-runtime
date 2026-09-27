@@ -132,6 +132,11 @@ const (
 	EventReasoning       RuntimeEventType = "REASONING"
 	EventHITLRequested   RuntimeEventType = "HITL_REQUESTED"
 	EventHITLResumed     RuntimeEventType = "HITL_RESUMED"
+	// EventContextCompacted 表示一次上下文压缩实际发生（L3 微压缩 / L4 全量 / L5 截断兜底）。
+	// Data 只携带 {kind, before_tokens, after_tokens, waterline_node_id, fallback}，
+	// 绝不携带摘要原文——事件会进 SSE 与日志系统，摘要里是全量历史的转述，
+	// 抄进事件流等于二次扩散（与 Guard/Redactor 审计口径一致）。
+	EventContextCompacted RuntimeEventType = "CONTEXT_COMPACTED"
 )
 
 // RuntimeEvent 是运行时对外发布的事件，跨进程边界传递 Run/Node 进度与流式数据。
