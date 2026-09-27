@@ -137,8 +137,10 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 				ID:          fmt.Sprintf("policy-deny-%s-%d", n.ID, time.Now().UnixNano()),
 				EventType:   "AgentPolicyDenied",
 				AggregateID: n.RunID,
-				Payload: fmt.Sprintf(`{"node_id":%q,"policy_id":%q,"reason":%q}`,
-					n.ID, decision.PolicyID, decision.Reason),
+				// 审计口径（docs/permission-classifier.md §8）：只记层级/规则
+				// 标识与理由，绝不记录工具入参原文。
+				Payload: fmt.Sprintf(`{"node_id":%q,"policy_id":%q,"layer":%q,"reason":%q}`,
+					n.ID, decision.PolicyID, decision.Layer, decision.Reason),
 			}); ferr != nil {
 				return fmt.Errorf("persist policy denial: %w", ferr)
 			}
@@ -155,7 +157,7 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 				n.TenantID,
 				n.RunID,
 				n.ID,
-				fmt.Sprintf("policy=%s risk=%s reason=%s", decision.PolicyID, decision.Risk, decision.Reason),
+				fmt.Sprintf("policy=%s risk=%s layer=%s reason=%s", decision.PolicyID, decision.Risk, decision.Layer, decision.Reason),
 			)
 		}
 	}
@@ -436,7 +438,12 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	// 配合稳定的消息布局复用 KV 缓存（需网关支持该 OpenAI 兼容扩展字段）。
 	// 压缩启用时键经 CacheGen 带代数后缀：全量压缩改写前缀，旧代缓存整体作废。
 	disp.PromptCache = envBool("LLM_PROMPT_CACHE", false)
-	return &Worker{Store: s, Queue: q, Events: r, ID: id, Retry: retry.Default(), Exec: disp, EventChain: sec.EventChain}
+	// 权限瀑布（docs/permission-classifier.md）：PERMISSION_WATERFALL_ENABLED
+	// 默认关闭，旁路回退 CommandPolicy；开启后 L1 规则 → L2 命令解析防线 →
+	// L3 分类器（可选）→ 默认送审，整体实现 policy.Policy 注入 Worker.Policy，
+	// gate 位置不变（ClaimNode 之前、仅 NodeTool）。
+	permPolicy := newPolicyFromEnv(mp, sec.ModelChain, s)
+	return &Worker{Store: s, Queue: q, Events: r, ID: id, Retry: retry.Default(), Exec: disp, EventChain: sec.EventChain, Policy: permPolicy}
 }
 
 // newMemoryOptionsFromEnv 按环境变量装配读取路径的记忆能力。
