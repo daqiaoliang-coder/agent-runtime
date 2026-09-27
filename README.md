@@ -1248,6 +1248,9 @@ LLM Final          Tool Call
 - `docs/design.md`：基础设计
 - `docs/architecture-v2.md`：Durable Execution 架构
 - `docs/architecture-v3.md`：Provider / Event / Middleware / ReAct / HITL 架构
+- `docs/policy-gateway.md`：策略网关（ALLOW / REQUIRE_APPROVAL / DENY）
+- `docs/context-compaction.md`：上下文压缩（五层级联压缩管线 / 水位线持久化）
+- `docs/permission-classifier.md`：权限分类（确定性瀑布 / LLM 分类器 / Hook）
 
 ***
 
