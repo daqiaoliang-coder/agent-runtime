@@ -843,16 +843,231 @@ func (s *MySQL) ResumeRun(ctx context.Context, tenant, runID, decision string, v
 
 // HasResolvedApproval 报告某节点是否已获人工放行（存在 RESOLVED 的审批记录）。
 //
-// 供护栏的 Bypass 判定使用：人工放行后节点被重新调度，
-// 若不查这个状态，同样的入参会再次命中同一条规则并再次转人工，
-// 审批永远收敛不了。判定收窄到 (tenant, run, node) 三元组，
-// 不做跨节点或跨 Run 的豁免 —— 一次放行只解一次锁。
+// 供护栏的 Bypass 判定与权限 gate 的二次送审旁路（worker.Handle）使用：
+// 人工放行后节点被重新调度，若不查这个状态，同样的入参会再次命中同一条
+// 规则并再次转人工，审批永远收敛不了。判定收窄到 (tenant, run, node)
+// 三元组，不做跨节点或跨 Run 的豁免 —— 一次放行只解一次锁。
+//
+// decision 排除 'deny%'：人工否决同样把 interrupt 置 RESOLVED（决策端
+// 记在 decision 字段）。若不排除，被否决的节点一旦被重新调度（不应发生，
+// 但防御性兜底），Bypass 会把"已否决"误读成"已放行"直接执行——
+// 在 fail-closed 方向上不可接受。
 func (s *MySQL) HasResolvedApproval(ctx context.Context, tenant, runID, nodeID string) (bool, error) {
 	if nodeID == "" {
 		return false, nil
 	}
 	var n int
-	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_interrupt WHERE tenant_id=? AND run_id=? AND node_id=? AND status='RESOLVED'`, tenant, runID, nodeID).Scan(&n)
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_interrupt WHERE tenant_id=? AND run_id=? AND node_id=? AND status='RESOLVED' AND (decision IS NULL OR decision NOT LIKE 'deny%')`, tenant, runID, nodeID).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// GetInterrupt 按标识取回人工介入记录（审批 API 的裁决入口：先取记录
+// 拿到 run_id/node_id，再驱动 Resume/Reject）。
+func (s *MySQL) GetInterrupt(ctx context.Context, tenant, interruptID string) (model.Interrupt, error) {
+	var in model.Interrupt
+	var resolved sql.NullTime
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT interrupt_id,run_id,tenant_id,COALESCE(node_id,''),reason,status,COALESCE(decision,''),created_at,resolved_at FROM run_interrupt WHERE interrupt_id=? AND tenant_id=?`,
+		interruptID, tenant).
+		Scan(&in.ID, &in.RunID, &in.TenantID, &in.NodeID, &in.Reason, &in.Status, &in.Decision, &in.CreatedAt, &resolved)
+	if err != nil {
+		return model.Interrupt{}, err
+	}
+	if resolved.Valid {
+		in.ResolvedAt = resolved.Time
+	}
+	return in, nil
+}
+
+// ListWaitingInterrupts 列出租户的待审批记录（L5 审批 UI 的列表入口）。
+// 不 JOIN agent_node：节点快照（工具名/入参——审批人判定的必要输入）由
+// 审批服务按 node_id 逐条补齐。待审队列是人驱动的低频路径，N+1 换取
+// 存储层保持单一的表职责。
+func (s *MySQL) ListWaitingInterrupts(ctx context.Context, tenant string, limit int) ([]model.Interrupt, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT interrupt_id,run_id,tenant_id,COALESCE(node_id,''),reason,status,COALESCE(decision,''),created_at,resolved_at FROM run_interrupt WHERE tenant_id=? AND status='WAITING' ORDER BY created_at LIMIT ?`,
+		tenant, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Interrupt
+	for rows.Next() {
+		var in model.Interrupt
+		var resolved sql.NullTime
+		if err := rows.Scan(&in.ID, &in.RunID, &in.TenantID, &in.NodeID, &in.Reason, &in.Status, &in.Decision, &in.CreatedAt, &resolved); err != nil {
+			return nil, err
+		}
+		if resolved.Valid {
+			in.ResolvedAt = resolved.Time
+		}
+		out = append(out, in)
+	}
+	return out, rows.Err()
+}
+
+// RejectRun 是 ResumeRun 的对偶：人工否决。同一事务内解决 interrupt、
+// 把 Run 从 WAITING_HUMAN 切回 RUNNING，并把被挂起的节点置为 FAILED。
+//
+// 事件类型用 AgentStepFailed 而非 worker policy-deny 路径的
+// AgentPolicyDenied：Resumer 只认 AgentStepCompleted/AgentStepFailed/
+// ReplanRequested（runtime/resume.go 的事件过滤），发别的类型 Run 永远
+// 不会收敛。节点失败后由 Resumer 按既有语义把 Run 收敛到 FAILED，
+// 这里不直接判 Run 失败——收敛裁决（综合 attempt/剩余节点）是 Resumer
+// 的职责，本方法只负责投递事实。
+//
+// 节点必须置 FAILED 而不是重新武装：否决后若回 READY，重新调度会再次
+// 命中瀑布、再次转人工，审批闭环退化成死循环。
+//
+// 切回 RUNNING 而非直接 FAILED 的理由同上：Run 级状态收敛交给 Resumer。
+// 若停留 WAITING_HUMAN，Resumer 的事件驱动路径不会触碰它（状态机只认
+// RUNNING 附近的转移），Run 会挂着 FAILED 节点永久等待。
+func (s *MySQL) RejectRun(ctx context.Context, tenant, runID, decision string, version int64) (bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	// 先捞出被挂起的节点：interrupt 置 RESOLVED 后就定位不到了（同 ResumeRun）。
+	rows, err := tx.QueryContext(ctx, `SELECT node_id FROM run_interrupt WHERE run_id=? AND tenant_id=? AND status='WAITING' AND node_id IS NOT NULL AND node_id<>''`, runID, tenant)
+	if err != nil {
+		return false, err
+	}
+	var nodeIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return false, err
+		}
+		nodeIDs = append(nodeIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return false, err
+	}
+	rows.Close()
+
+	res, err := tx.ExecContext(ctx, `UPDATE agent_run SET status=?,output=?,version=version+1,updated_at=NOW(6) WHERE run_id=? AND tenant_id=? AND version=? AND status=?`, model.RunRunning, decision, runID, tenant, version, model.RunWaitingHuman)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n != 1 {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_interrupt SET status='RESOLVED',decision=?,resolved_at=NOW(6) WHERE run_id=? AND tenant_id=? AND status='WAITING'`, decision, runID, tenant); err != nil {
+		return false, err
+	}
+	for _, id := range nodeIDs {
+		if _, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,ready_at=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND status=?`,
+			model.NodeFailed, id, tenant, model.NodeWaitingHuman); err != nil {
+			return false, err
+		}
+		fe := model.Event{ID: fmt.Sprintf("event-reject-%s-%d", id, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: runID, NodeID: id, TenantID: tenant, Error: "human rejected: " + decision, Timestamp: time.Now()}
+		payload, _ := json.Marshal(fe)
+		if err := s.PutOutbox(ctx, tx, model.OutboxMessage{ID: fe.ID, EventType: fe.Type, AggregateID: runID, Payload: string(payload)}); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit()
+}
+
+// SavePermissionRule 写回一条授权学习规则（docs/permission-classifier.md §7）。
+// 已存在同 (tenant, run, tool, pattern, effect, source) 的未撤销规则时跳过：
+// 审批是低频人工操作，反复点击"always allow"不该堆出重复行——重复行对
+// 判定无害（聚合取最严），但会污染配置面列表、模糊"何时授权的"审计。
+// 查重与插入不在同一事务内：写侧是人工点击，竞态窗口极小，且竞态后果
+// 只是一条重复行（无害），不值得为此加锁。
+func (s *MySQL) SavePermissionRule(ctx context.Context, r model.PermissionRule) error {
+	var n int
+	var err error
+	if r.RunID == "" {
+		err = s.DB.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM permission_rule WHERE tenant_id=? AND run_id IS NULL AND tool=? AND pattern=? AND effect=? AND source=? AND revoked_at IS NULL`,
+			r.TenantID, r.Tool, r.Pattern, r.Effect, r.Source).Scan(&n)
+	} else {
+		err = s.DB.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM permission_rule WHERE tenant_id=? AND run_id=? AND tool=? AND pattern=? AND effect=? AND source=? AND revoked_at IS NULL`,
+			r.TenantID, r.RunID, r.Tool, r.Pattern, r.Effect, r.Source).Scan(&n)
+	}
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	var runID any
+	if r.RunID != "" {
+		runID = r.RunID
+	}
+	_, err = s.DB.ExecContext(ctx,
+		`INSERT INTO permission_rule(rule_id,tenant_id,run_id,tool,pattern,effect,source,learned_by) VALUES(?,?,?,?,?,?,?,?)`,
+		r.ID, r.TenantID, runID, r.Tool, r.Pattern, r.Effect, r.Source, r.LearnedBy)
+	return err
+}
+
+// ListActivePermissionRules 返回 (tenant, run) 作用域内生效的学习规则：
+// 租户级（run_id IS NULL）+ 本 Run 级，已撤销的排除。供权限瀑布的动态
+// 规则层在判定时合并进静态规则表（worker/permission_learned.go）。
+// 未命中任何行时返回空切片——调用方退回纯静态规则，行为与 P0/P1 一致。
+func (s *MySQL) ListActivePermissionRules(ctx context.Context, tenant, runID string) ([]model.PermissionRule, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT rule_id,tenant_id,COALESCE(run_id,''),tool,pattern,effect,source,learned_by,learned_at FROM permission_rule WHERE tenant_id=? AND (run_id IS NULL OR run_id=?) AND revoked_at IS NULL`,
+		tenant, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.PermissionRule
+	for rows.Next() {
+		var r model.PermissionRule
+		if err := rows.Scan(&r.ID, &r.TenantID, &r.RunID, &r.Tool, &r.Pattern, &r.Effect, &r.Source, &r.LearnedBy, &r.LearnedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListPermissionRules 列出租户的全部授权学习规则（含已撤销，配置面用：
+// 规则可列出、可撤销，撤销动作本身留在账上）。
+func (s *MySQL) ListPermissionRules(ctx context.Context, tenant string, limit int) ([]model.PermissionRule, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT rule_id,tenant_id,COALESCE(run_id,''),tool,pattern,effect,source,learned_by,learned_at,revoked_at FROM permission_rule WHERE tenant_id=? ORDER BY learned_at DESC LIMIT ?`,
+		tenant, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.PermissionRule
+	for rows.Next() {
+		var r model.PermissionRule
+		var revoked sql.NullTime
+		if err := rows.Scan(&r.ID, &r.TenantID, &r.RunID, &r.Tool, &r.Pattern, &r.Effect, &r.Source, &r.LearnedBy, &r.LearnedAt, &revoked); err != nil {
+			return nil, err
+		}
+		if revoked.Valid {
+			r.RevokedAt = revoked.Time
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RevokePermissionRule 撤销一条学习规则（软删，审计保留）。已撤销的
+// 再撤销返回 false——幂等入口不制造虚假的"撤销成功"。
+func (s *MySQL) RevokePermissionRule(ctx context.Context, tenant, ruleID string) (bool, error) {
+	res, err := s.DB.ExecContext(ctx,
+		`UPDATE permission_rule SET revoked_at=NOW(6) WHERE rule_id=? AND tenant_id=? AND revoked_at IS NULL`,
+		ruleID, tenant)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
 	if err != nil {
 		return false, err
 	}

@@ -9,11 +9,13 @@
 //
 //	任何层返回 Deny            → 立即终止，Deny
 //	L1/L2 命中 allow           → 立即终止，Allow（确定性层有放行资格）
-//	L3 分类器 allow            → 终止，Allow（L4 Hook 为 P2，落地后在此收紧）
+//	L3 分类器 allow            → 携带下行给 L4 收紧层复核，无收紧层则 Allow
 //	其余一切（未命中/ask/失败） → REQUIRE_APPROVAL（L5 终局）
 //
 // 结构不变量：放行只能出自确定性层或分类器的明确授权推理；Deny 判定权
-// 永远不经过 LLM——L1 的 deny 规则在分类器之前已经短路。
+// 永远不经过 LLM——L1 的 deny 规则在分类器之前已经短路。L4 收紧层
+// （RefiningStage）是唯一能拿到"当前判定"的层：只能收紧不能放宽，
+// 确定性层的 allow 在它之前已短路，它连收紧的资格都没有。
 package policy
 
 import (
@@ -35,11 +37,32 @@ func (f StageFunc) Evaluate(ctx context.Context, req Request) (DecisionResult, b
 	return f(ctx, req)
 }
 
+// RefiningStage 是瀑布的"收紧层"（L4 外部 Hook）。与普通层的差异：
+// 它拿得到瀑布携带下行的当前判定（soFar），语义是复核而非独立裁决——
+// 最终判定只能比 soFar 更严（可收紧不可放宽，§6）。soFar 的来源只有
+// 两种：分类器 allow（携带下行的推断性授权）或瀑布默认送审（未命中）；
+// 确定性层与分类器的 ask/deny 在它之前已短路，轮不到它复核。
+type RefiningStage interface {
+	Refine(ctx context.Context, req Request, soFar DecisionResult) (DecisionResult, bool, error)
+}
+
+// refinableAllow 标记"allow 需被下游收紧层复核"的层。只有 L3 分类器实现：
+// 它的 allow 是 matched_grant 推理出的授权，外部合规有权收紧（§2.1
+// "L3 分类器 allow → 继续走 L4"）；L1/L2 的 allow 是运维显式配置的
+// 确定性授权，立即终局，Hook 无权收紧（"确定性层有放行资格"）。
+type refinableAllow interface{ allowRefinable() bool }
+
+func allowRefinable(s Stage) bool {
+	r, ok := s.(refinableAllow)
+	return ok && r.allowRefinable()
+}
+
 // 层标识（DecisionResult.Layer 的取值域，docs §8）。
 const (
 	LayerRules      = "l1_rules"
 	LayerParser     = "l2_parser"
 	LayerClassifier = "l3_classifier"
+	LayerHook       = "l4_hook"
 	LayerDefault    = "l5_default"
 )
 
@@ -51,29 +74,80 @@ func NewWaterfall(stages ...Stage) *Waterfall {
 	return &Waterfall{stages: stages}
 }
 
-func (w *Waterfall) Evaluate(ctx context.Context, req Request) (DecisionResult, error) {
-	for _, s := range w.stages {
-		if s == nil {
-			continue
-		}
-		res, hit, err := s.Evaluate(ctx, req)
-		if err != nil {
-			// 层内错误按 fail-closed 收口为 ask：任何失败模式都不得落到 Allow（§9）。
-			return DecisionResult{
-				Decision: RequireApproval, Risk: RiskHigh, PolicyID: "waterfall-error",
-				Reason: "stage error, fail-closed to approval: " + err.Error(), Layer: LayerDefault,
-			}, nil
-		}
-		if hit {
-			return res, nil
+// hasRefinerAfter 报告位置 i 之后是否还有收紧层。没有收紧层时，
+// 分类器 allow 按原语义立即返回——P0/P1 行为零变化（PERMISSION_HOOK_URL
+// 缺省不启用时就是这条路径）。
+func (w *Waterfall) hasRefinerAfter(i int) bool {
+	for _, s := range w.stages[i+1:] {
+		if _, ok := s.(RefiningStage); ok {
+			return true
 		}
 	}
-	// L5 终局：未命中任何层的调用一律送审——默认策略即边界之外的兜底。
+	return false
+}
+
+func (w *Waterfall) defaultResult() DecisionResult {
+	return defaultAskResult()
+}
+
+// defaultAskResult 是瀑布的 L5 终局（未命中任何层的默认送审），也是
+// 收紧层在"无携带判定"时的 soFar 基线。
+func defaultAskResult() DecisionResult {
 	return DecisionResult{
 		Decision: RequireApproval, Risk: RiskMedium, PolicyID: "waterfall-default",
 		Reason: "no deterministic rule matched and no classifier authorization; human approval required",
 		Layer:  LayerDefault,
-	}, nil
+	}
+}
+
+func stageErrorResult(err error) DecisionResult {
+	return DecisionResult{
+		Decision: RequireApproval, Risk: RiskHigh, PolicyID: "waterfall-error",
+		Reason: "stage error, fail-closed to approval: " + err.Error(), Layer: LayerDefault,
+	}
+}
+
+func (w *Waterfall) Evaluate(ctx context.Context, req Request) (DecisionResult, error) {
+	// carry 是携带下行的判定：分类器 allow 时不立即返回，等下游收紧层
+	// 复核。收紧层未命中（hit=false）时 carry 在收尾处生效——"否则 Allow"。
+	var carry *DecisionResult
+	for i, s := range w.stages {
+		if s == nil {
+			continue
+		}
+		if r, ok := s.(RefiningStage); ok {
+			soFar := w.defaultResult()
+			if carry != nil {
+				soFar = *carry
+			}
+			res, hit, err := r.Refine(ctx, req, soFar)
+			if err != nil {
+				// 层内错误按 fail-closed 收口为 ask：任何失败模式都不得落到 Allow（§9）。
+				return stageErrorResult(err), nil
+			}
+			if hit {
+				return res, nil
+			}
+			continue
+		}
+		res, hit, err := s.Evaluate(ctx, req)
+		if err != nil {
+			return stageErrorResult(err), nil
+		}
+		if !hit {
+			continue
+		}
+		if res.Decision == Allow && allowRefinable(s) && w.hasRefinerAfter(i) {
+			carry = &res
+			continue
+		}
+		return res, nil
+	}
+	if carry != nil {
+		return *carry, nil
+	}
+	// L5 终局：未命中任何层的调用一律送审——默认策略即边界之外的兜底。
+	return w.defaultResult(), nil
 }
 
 // ---- L1 硬规则层（§3）----

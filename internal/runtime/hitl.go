@@ -86,3 +86,38 @@ func (r *Runtime) Resume(ctx context.Context, tenant, runID, decision string) er
 	log.Printf("run resumed run=%s tenant=%s decision=%q requeued=%d", runID, tenant, decision, len(tasks))
 	return nil
 }
+
+// RejectStore 是人工否决的存储端口。与 CancelStore 同理以独立小接口暴露：
+// runtime 的测试替身按需实现，不必为一个新能力全体升级。
+type RejectStore interface {
+	RejectRun(context.Context, string, string, string, int64) (bool, error)
+}
+
+// Reject 是 Resume 的对偶：人工否决被挂起的 Run。被挂起节点在同一事务内
+// 置为 FAILED 并写 AgentStepFailed Outbox 事件（store.RejectRun），由
+// Resumer 按既有失败语义收敛 Run；不重新投递任何任务。decision 记录
+// 否决人与理由，进入 run_interrupt.decision——HasResolvedApproval 会排除
+// deny 开头的 decision，杜绝"已否决"被误读成"已放行"。
+func (r *Runtime) Reject(ctx context.Context, tenant, runID, decision string) error {
+	h, ok := r.Store.(RejectStore)
+	if !ok {
+		return fmt.Errorf("reject store is not configured")
+	}
+	run, err := r.Store.GetRun(ctx, tenant, runID)
+	if err != nil {
+		return err
+	}
+	if run.Status != model.RunWaitingHuman {
+		return fmt.Errorf("run %s is not waiting for human: %s", runID, run.Status)
+	}
+	ok, err = h.RejectRun(ctx, tenant, runID, decision, run.Version)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("run %s changed while rejecting", runID)
+	}
+	// 关键日志：人工否决回流，Run 回到 RUNNING 等待 Resumer 按失败事件收敛。
+	log.Printf("run rejected run=%s tenant=%s decision=%q", runID, tenant, decision)
+	return nil
+}

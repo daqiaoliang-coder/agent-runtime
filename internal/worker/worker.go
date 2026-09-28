@@ -120,46 +120,58 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	// Policy gate MUST run before ClaimNode. A step waiting for human approval
 	// therefore remains READY instead of becoming RUNNING and holding a lease.
 	if n.Type == model.NodeTool && w.Policy != nil {
-		decision, err := w.Policy.Evaluate(ctx, policy.Request{
-			TenantID: n.TenantID,
-			RunID:    n.RunID,
-			NodeID:   n.ID,
-			ToolName: n.Name,
-			Input:    n.Input,
-		})
-		if err != nil {
-			return fmt.Errorf("policy evaluate: %w", err)
+		// 人工已放行的节点跳过瀑布（docs/permission-classifier.md §7
+		// "approve (一次)：Bypass 按 node 放行"）：不查的话，放行后重新调度
+		// 的节点会再次命中同一条规则、再次转人工，审批闭环退化成死循环
+		// ——这正是 Guard.Bypass 早已修过的同一类问题在 policy gate 的镜像。
+		// 查询失败按未放行处理（宁可再问一次人工，不可误放）。
+		approved, aerr := w.Store.HasResolvedApproval(ctx, n.TenantID, n.RunID, n.ID)
+		if aerr != nil {
+			obs.From(ctx).WarnContext(ctx, "approval bypass lookup failed; re-evaluating policy",
+				"run_id", n.RunID, "node_id", n.ID, "error", aerr)
 		}
-		switch decision.Decision {
-		case policy.Deny:
-			// Deny is a deterministic policy failure. Do not execute and do not
-			// retry it as an infrastructure failure.
-			if _, ferr := w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{
-				ID:          fmt.Sprintf("policy-deny-%s-%d", n.ID, time.Now().UnixNano()),
-				EventType:   "AgentPolicyDenied",
-				AggregateID: n.RunID,
-				// 审计口径（docs/permission-classifier.md §8）：只记层级/规则
-				// 标识与理由，绝不记录工具入参原文。
-				Payload: fmt.Sprintf(`{"node_id":%q,"policy_id":%q,"layer":%q,"reason":%q}`,
-					n.ID, decision.PolicyID, decision.Layer, decision.Reason),
-			}); ferr != nil {
-				return fmt.Errorf("persist policy denial: %w", ferr)
+		if !(aerr == nil && approved) {
+			decision, err := w.Policy.Evaluate(ctx, policy.Request{
+				TenantID: n.TenantID,
+				RunID:    n.RunID,
+				NodeID:   n.ID,
+				ToolName: n.Name,
+				Input:    n.Input,
+			})
+			if err != nil {
+				return fmt.Errorf("policy evaluate: %w", err)
 			}
-			return nil
-		case policy.RequireApproval:
-			if w.Approval == nil {
-				return fmt.Errorf("policy requires approval but approval requester is not configured")
+			switch decision.Decision {
+			case policy.Deny:
+				// Deny is a deterministic policy failure. Do not execute and do not
+				// retry it as an infrastructure failure.
+				if _, ferr := w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{
+					ID:          fmt.Sprintf("policy-deny-%s-%d", n.ID, time.Now().UnixNano()),
+					EventType:   "AgentPolicyDenied",
+					AggregateID: n.RunID,
+					// 审计口径（docs/permission-classifier.md §8）：只记层级/规则
+					// 标识与理由，绝不记录工具入参原文。
+					Payload: fmt.Sprintf(`{"node_id":%q,"policy_id":%q,"layer":%q,"reason":%q}`,
+						n.ID, decision.PolicyID, decision.Layer, decision.Reason),
+				}); ferr != nil {
+					return fmt.Errorf("persist policy denial: %w", ferr)
+				}
+				return nil
+			case policy.RequireApproval:
+				if w.Approval == nil {
+					return fmt.Errorf("policy requires approval but approval requester is not configured")
+				}
+				// Durable HITL is a Run-level interrupt in the current runtime.
+				// Because the node has not been claimed yet, Resume can safely
+				// re-queue the same READY node after approval.
+				return w.Approval.Interrupt(
+					ctx,
+					n.TenantID,
+					n.RunID,
+					n.ID,
+					fmt.Sprintf("policy=%s risk=%s layer=%s reason=%s", decision.PolicyID, decision.Risk, decision.Layer, decision.Reason),
+				)
 			}
-			// Durable HITL is a Run-level interrupt in the current runtime.
-			// Because the node has not been claimed yet, Resume can safely
-			// re-queue the same READY node after approval.
-			return w.Approval.Interrupt(
-				ctx,
-				n.TenantID,
-				n.RunID,
-				n.ID,
-				fmt.Sprintf("policy=%s risk=%s layer=%s reason=%s", decision.PolicyID, decision.Risk, decision.Layer, decision.Reason),
-			)
 		}
 	}
 

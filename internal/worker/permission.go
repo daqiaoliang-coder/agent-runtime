@@ -10,11 +10,11 @@ import (
 	"log"
 	"strings"
 
-	"agent-runtime/internal/executor"
 	"agent-runtime/internal/middleware"
 	"agent-runtime/internal/obs"
 	"agent-runtime/internal/policy"
 	"agent-runtime/internal/providers"
+	"agent-runtime/internal/store"
 )
 
 // newPolicyFromEnv 装配 Worker.Policy。
@@ -28,7 +28,10 @@ import (
 // L1 规则配置非法直接 log.Fatal（docs §9：fail-fast，不静默丢防线）——
 // 与记忆等可选增强的降级语义不同，规则表是安全边界本身，带病运行的
 // 代价是防线静默缺失。
-func newPolicyFromEnv(mp providers.ModelProvider, chain *middleware.ModelChain, usage executor.UsageRecorder) policy.Policy {
+//
+// s 是审批学习规则的存储来源（PERMISSION_LEARN_ENABLED 开启时动态合并），
+// 同时充当 L3 的记账端口；测试装配传 nil 时学习层静默不装。
+func newPolicyFromEnv(mp providers.ModelProvider, chain *middleware.ModelChain, s *store.MySQL) policy.Policy {
 	if !envBool("PERMISSION_WATERFALL_ENABLED", false) {
 		return nil
 	}
@@ -38,10 +41,22 @@ func newPolicyFromEnv(mp providers.ModelProvider, chain *middleware.ModelChain, 
 	}
 	rules := policy.NewRuleSet(append(policy.BuiltinRules(), envRules...))
 
-	stages := []policy.Stage{
-		&policy.RulesStage{Rules: rules},
-		&policy.ParserStage{Rules: rules},
+	// L1/L2：PERMISSION_LEARN_ENABLED 开启时换装动态规则层——审批写回的
+	// run/tenant/learned 规则按 (tenant, run) 合并进静态表（§7"同模式后续
+	// 调用 L1 直接 allow"）；关闭时纯静态层，零额外 DB 查询、行为与
+	// P0/P1 一致。
+	var l1l2 policy.Stage = &policy.RulesStage{Rules: rules}
+	l2 := policy.Stage(&policy.ParserStage{Rules: rules})
+	if envBool("PERMISSION_LEARN_ENABLED", false) {
+		if s != nil {
+			dyn := &learnedRulesStage{Store: s, Base: rules.Rules()}
+			l1l2, l2 = dyn, dyn
+		} else {
+			obs.From(context.Background()).WarnContext(context.Background(),
+				"PERMISSION_LEARN_ENABLED but store is not configured; learned rules disabled")
+		}
 	}
+	stages := []policy.Stage{l1l2, l2}
 
 	// L3 分类器：默认关闭；开启但模型未配置时不装配。docs §10"缺省复用
 	// 主模型"在当前装配里没有稳定取值——主推理模型来自 Run/节点配置，
@@ -63,7 +78,7 @@ func newPolicyFromEnv(mp providers.ModelProvider, chain *middleware.ModelChain, 
 			stages = append(stages, &policy.ClassifierStage{
 				Model:  mp,
 				Chain:  chain,
-				Usage:  usage,
+				Usage:  s,
 				Pricer: DefaultPricer,
 				Opt: policy.ClassifierOptions{
 					Model:         m,
@@ -78,5 +93,31 @@ func newPolicyFromEnv(mp providers.ModelProvider, chain *middleware.ModelChain, 
 				"PERMISSION_CLASSIFIER_ENABLED but PERMISSION_CLASSIFIER_MODEL is empty; L3 classifier disabled")
 		}
 	}
+
+	// L4 外部 Hook（§6）：PERMISSION_HOOK_URL 缺省不启用；逗号分隔多端点，
+	// 全部咨询、按 Chain 语义取最严。装配在最后——它前面的确定性层与
+	// 分类器 ask/deny 短路时它不被咨询（"可收紧不可放宽"由层序保证）。
+	if hooks := splitList(envString("PERMISSION_HOOK_URL", "")); len(hooks) > 0 {
+		stages = append(stages, &policy.HookStage{
+			Opt: policy.HookOptions{
+				Endpoints: hooks,
+				Timeout:   envDuration("PERMISSION_HOOK_TIMEOUT", policy.DefaultHookTimeout),
+			},
+		})
+	}
 	return policy.NewWaterfall(stages...)
+}
+
+// splitList 把逗号分隔的配置拆成有序去空列表。与 csvNames 的差异：
+// Hook 端点要保序（审计的 RuleID 记端点，多实例语义按配置序全部咨询），
+// map 会丢序。
+func splitList(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
