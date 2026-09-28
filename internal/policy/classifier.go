@@ -111,6 +111,11 @@ type ClassifierStage struct {
 	cache map[string]classifierCacheEntry
 }
 
+// allowRefinable 实现 refinableAllow 标记（waterfall.go）：分类器 allow 是
+// matched_grant 推理出的授权，需携带下行给 L4 收紧层复核（§2.1）。
+// 确定性层（L1/L2）不实现该标记，allow 立即终局。
+func (*ClassifierStage) allowRefinable() bool { return true }
+
 type classifierCacheEntry struct {
 	result DecisionResult
 	expire time.Time

@@ -119,6 +119,28 @@ type Event struct {
 // 节点完成时与状态变更写入同一事务，保证至少一次投递到 RocketMQ。
 type OutboxMessage struct{ ID, EventType, AggregateID, Payload string }
 
+// Interrupt 是一次人工介入记录，对应 run_interrupt 表。
+// 状态机：WAITING（待审）→ RESOLVED（已裁决，Decision 记录 approve/deny
+// 及审批人）。审批 UI（internal/approval）以它为工作队列。
+type Interrupt struct {
+	ID, RunID, TenantID, NodeID string
+	Reason, Status, Decision    string
+	CreatedAt, ResolvedAt       time.Time
+}
+
+// PermissionRule 是授权学习写回的权限规则，对应 permission_rule 表
+// （migrations/015，docs/permission-classifier.md §7）。
+// Source：run（Run 级 always allow，RunID 非空）| tenant（租户级 always
+// allow，需审批人显式选择）| learned（deny 写回）；RevokedAt 非零表示
+// 已撤销（软删，审计保留）。
+type PermissionRule struct {
+	ID, TenantID, RunID  string
+	Tool, Pattern        string
+	Effect, Source       string
+	LearnedBy            string
+	LearnedAt, RevokedAt time.Time
+}
+
 // ToolCall 记录一次工具调用的幂等状态，对应 tool_call 表。
 // IdempotencyKey 全局唯一，由 (run_id, node_id, tool_name, input) 派生、跨重试稳定。
 // 状态机：RUNNING -> SUCCESS/FAILED。SUCCESS 的记录可被复用以跳过重复副作用。
