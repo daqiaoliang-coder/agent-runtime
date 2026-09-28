@@ -602,16 +602,17 @@ func (s *MySQL) RecordLLMUsage(ctx context.Context, u model.LLMUsage) error {
 // LastLLMPromptUsage 返回该 Run 最近一次主推理 LLM 调用的用量记录，
 // 作为上下文 token 估算的实测锚点（估算 = 实测值 + 自此之后的新增内容估算）。
 //
-// 排除压缩器自己产生的摘要调用（usage_id 前缀 usage-compact-）：
-// 摘要调用的 prompt_tokens 反映的是"摘要输入"的规模，拿它当主推理锚点
-// 会把下一次估算整体拉低，恰好违反"宁可高估"的原则。
+// 排除非主推理调用（usage_id 前缀 usage-compact- / usage-permission-）：
+// 压缩摘要调用的 prompt_tokens 反映"摘要输入"的规模、权限分类调用反映
+// "分类 prompt"的规模，拿它们当主推理锚点会把下一次估算整体拉低，
+// 恰好违反"宁可高估"的原则。
 // 兜底排序带 usage_id 作 tiebreaker：同一微秒内的多次调用结果才稳定。
 func (s *MySQL) LastLLMPromptUsage(ctx context.Context, tenant, runID string) (model.LLMUsage, bool, error) {
 	var u model.LLMUsage
 	err := s.DB.QueryRowContext(ctx,
 		`SELECT usage_id,run_id,node_id,tenant_id,model,prompt_tokens,completion_tokens,total_tokens,COALESCE(cost,0)
 		 FROM llm_usage
-		 WHERE run_id=? AND tenant_id=? AND usage_id NOT LIKE 'usage-compact-%'
+		 WHERE run_id=? AND tenant_id=? AND usage_id NOT LIKE 'usage-compact-%' AND usage_id NOT LIKE 'usage-permission-%'
 		 ORDER BY created_at DESC, usage_id DESC LIMIT 1`,
 		runID, tenant).
 		Scan(&u.ID, &u.RunID, &u.NodeID, &u.TenantID, &u.Model, &u.PromptTokens, &u.CompletionTokens, &u.TotalTokens, &u.Cost)

@@ -41,6 +41,12 @@ type DecisionResult struct {
 	Risk     RiskLevel
 	PolicyID string
 	Reason   string
+	// Layer / RuleID / ClassifierVersion 是权限瀑布（docs/permission-classifier.md §8）
+	// 的可观测性扩展：零值不影响既有调用方（Chain/CommandPolicy 路径不填），
+	// 满足验收口径"每条决策可回答哪一层、哪条规则/哪个模板版本判的"。
+	Layer             string `json:"layer,omitempty"`              // l1_rules | l2_parser | l3_classifier | l5_default
+	RuleID            string `json:"rule_id,omitempty"`            // 命中的规则/模式标识（source:tool:pattern）
+	ClassifierVersion string `json:"classifier_version,omitempty"` // L3 输出的模板版本
 }
 
 type Policy interface {
