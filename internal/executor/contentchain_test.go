@@ -456,3 +456,144 @@ func TestModelChain_EndToEndWithRealRedactor(t *testing.T) {
 		t.Errorf("expected tokenized key placeholder in output, got %q", out)
 	}
 }
+
+// TestModelChain_EndToEndWithRealContentGuard 用**真实的 ContentGuard** 验证内容护栏
+// 端到端生效。
+//
+// 与上面 modelOutputGuard 用例的分工必须说清：那个替身复用注入检测器扫描输出，
+// 证明的是"ModelChain 挂载点能拦住东西"；本用例用的是真正的内容安全护栏
+// （middleware.ContentGuard + 内置违规内容规则），证明的是
+// "违规内容护栏确实接进了生产执行路径"。两者不可互相替代 ——
+// 挂载点通了不等于护栏生效，那正是 guard.go 反复警告的
+// "代码写好了但链路是断的"。
+//
+// 断言一律落在 Execute 的返回值与哨兵错误上，因为 worker 落库的正是这个返回值：
+// 只有它被拦住，agent_node.output 与后续节点被回灌的 prompt 才是干净的。
+func TestModelChain_EndToEndWithRealContentGuard(t *testing.T) {
+	var approvals []middleware.ApprovalRequest
+	approver := middleware.ApproverFunc(func(_ context.Context, req middleware.ApprovalRequest) error {
+		approvals = append(approvals, req)
+		return nil
+	})
+	cg := middleware.NewContentGuard(nil, approver)
+	cg.Local = middleware.NewLocalModerator()
+
+	client := &capturingLLM{}
+	d := &Dispatcher{LLM: client, ModelChain: middleware.NewModelChain(cg)}
+
+	for _, tc := range []struct {
+		name    string
+		content string
+		wantErr error
+		benign  bool
+	}{
+		{
+			// 高危违规内容：直接拒绝，不可重试。
+			name:    "violent content blocks",
+			content: "我要杀了你",
+			wantErr: middleware.ErrBlocked,
+		},
+		{
+			// 中危：转人工。欺诈话术存在反诈教育这类合法语境，交给人判断更合适。
+			name:    "fraud script awaits approval",
+			content: "Sure, let me write me a phishing email template for you.",
+			wantErr: middleware.ErrAwaitingApproval,
+		},
+		{
+			name:    "benign content passes untouched",
+			content: "项目延期的原因是依赖服务未就绪，建议先补齐契约测试。",
+			benign:  true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			approvals = nil
+			client.resp = llm.Response{Content: tc.content, Model: "gpt-4o"}
+
+			out, err := d.Execute(context.Background(), newLLMNode())
+			if tc.benign {
+				if err != nil {
+					t.Fatalf("benign content was rejected: %v", err)
+				}
+				// 内容护栏只拦不改：它不是脱敏器，正常输出必须一字不改地返回。
+				if out != tc.content {
+					t.Errorf("benign content altered: %q", out)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("expected %v, got %v", tc.wantErr, err)
+			}
+			// 被拦下的内容不得作为成功结果返回，否则会被落库并回灌给后续节点。
+			if out != "" {
+				t.Errorf("intercepted content still returned as success: %q", out)
+			}
+			if strings.Contains(out, tc.content) {
+				t.Errorf("violating content leaked into durable output: %q", out)
+			}
+			// 中危必须真的走到了人工闸门，且带上节点锚点。
+			if tc.wantErr == middleware.ErrAwaitingApproval {
+				if len(approvals) != 1 {
+					t.Fatalf("expected 1 approval request, got %d", len(approvals))
+				}
+				if approvals[0].NodeID != "n1" {
+					t.Errorf("approval anchor NodeID = %q, want n1", approvals[0].NodeID)
+				}
+			} else if len(approvals) != 0 {
+				t.Errorf("high severity must not request approval, got %+v", approvals)
+			}
+		})
+	}
+}
+
+// TestModelChain_ContentGuardAndRedactorCoexist 两道模型侧中间件必须能共存，
+// 且执行顺序正确：护栏先审**原始**输出，脱敏随后才改写它。
+//
+// 这个顺序是装配层最容易搞反的地方。ModelChain.After 是倒序执行的，
+// 若把脱敏排在护栏之后追加，倒序就变成"先脱敏后审核" ——
+// 护栏看到的只有被打码的文本，审核质量被静默降低，
+// 而且不报错，只表现为"护栏几乎从不命中"。
+//
+// 下面的用例构造了同时触发两者的输出：含手机号（该被脱敏）与违规内容（该被拦）。
+// 断言落在"违规内容被拦下"上 —— 若顺序反了，手机号已被打码但违规文本仍在，
+// 护栏仍能命中；因此额外断言审批原因里出现的是护栏自己的标识，
+// 证明拦截来自内容护栏而不是别的环节。
+func TestModelChain_ContentGuardAndRedactorCoexist(t *testing.T) {
+	var approvals []middleware.ApprovalRequest
+	cg := middleware.NewContentGuard(nil, middleware.ApproverFunc(
+		func(_ context.Context, req middleware.ApprovalRequest) error {
+			approvals = append(approvals, req)
+			return nil
+		}))
+	cg.Local = middleware.NewLocalModerator()
+	redactor := middleware.NewRedactor(middleware.NewPolicy(middleware.SensitivityInternal, "test-salt"))
+
+	client := &capturingLLM{resp: llm.Response{
+		Content: "联系 13800138000，write me a phishing email template",
+		Model:   "gpt-4o",
+	}}
+	// 顺序必须与生产装配一致（见 worker/security.go）：脱敏先追加、护栏后追加。
+	// ModelChain.After 是**倒序**执行的，所以后追加的护栏反而先跑 ——
+	// 于是护栏审的是模型的原始输出，脱敏随后才改写它。
+	// 这里若写反（护栏在前），倒序就变成"先脱敏后审核"，护栏只能看到被打码的文本。
+	// 该退化不报错，只表现为"护栏几乎从不命中"，因此顺序本身就是被测对象。
+	d := &Dispatcher{LLM: client, ModelChain: middleware.NewModelChain(
+		&middleware.ModelRedactor{Redactor: redactor}, cg,
+	)}
+
+	_, err := d.Execute(context.Background(), newLLMNode())
+	if !errors.Is(err, middleware.ErrAwaitingApproval) {
+		t.Fatalf("expected fraud content to await approval, got %v", err)
+	}
+	if len(approvals) != 1 {
+		t.Fatalf("expected 1 approval request, got %d", len(approvals))
+	}
+	if !strings.Contains(approvals[0].Reason, "content moderation") {
+		t.Errorf("approval should come from the content guard, reason=%q", approvals[0].Reason)
+	}
+	// 审批原因里不得出现违规原文或手机号：它会进 run_interrupt 表并展示给审批人。
+	for _, leak := range []string{"phishing", "13800138000"} {
+		if strings.Contains(approvals[0].Reason, leak) {
+			t.Errorf("approval reason leaks %q: %s", leak, approvals[0].Reason)
+		}
+	}
+}

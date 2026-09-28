@@ -6,6 +6,7 @@ import (
 	"agent-runtime/internal/obs"
 	"agent-runtime/internal/trace"
 	"context"
+	"errors"
 	"fmt"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -15,10 +16,15 @@ import (
 // 它消费 RocketMQ 中的节点完成/失败事件，激活后继节点并在全部完成时收敛 Run。
 // Store/Queue 为接口类型，便于单元测试注入 fake。
 // Planner 用于多轮 Plan：ReplanRequested 事件触发时调用 Planner.Replan 续规划。
+//
+// Lifecycle 为 Run 生命周期钩子（同 Runtime.Lifecycle），为 nil 时不执行。
+// 只在此处调用 OnRunFinish 而不调用 OnRunStart：Run 的起点由 Runtime.CreateRun
+// 负责，Resumer 看到的是已经启动的 Run，重复触发起点钩子会让审计记录翻倍。
 type Resumer struct {
-	Store   Store
-	Queue   Queue
-	Planner Planner
+	Store     Store
+	Queue     Queue
+	Planner   Planner
+	Lifecycle RunLifecycle
 }
 
 // DecisionStore 持久化 Planner 决策，使 ReplanRequested 事件重投时复用原决策，
@@ -94,8 +100,16 @@ func (r *Resumer) process(ctx context.Context, e model.Event) error {
 	}
 	if e.Type == "AgentStepFailed" {
 		// Bug2 修复保持：run.Version 来自上方 GetRun，CAS 标记 FAILED。
-		_, err = r.Store.UpdateRunCAS(ctx, e.TenantID, e.RunID, run.Version, model.RunFailed, "", e.Error)
-		return err
+		ok, cerr := r.Store.UpdateRunCAS(ctx, e.TenantID, e.RunID, run.Version, model.RunFailed, "", e.Error)
+		if cerr != nil {
+			return cerr
+		}
+		// 只在 CAS 真正成功时触发结束钩子：并发场景下只有一个 Resumer 能把 Run
+		// 翻到终态，若对失败者也调用，同一次 Run 会记下多条结束审计。
+		if ok {
+			r.finishLifecycle(ctx, run, errors.New("node failed"))
+		}
+		return nil
 	}
 	children, err := r.Store.Children(ctx, e.TenantID, e.NodeID)
 	if err != nil {
@@ -147,6 +161,12 @@ func (r *Resumer) process(ctx context.Context, e model.Event) error {
 	// 关键日志：Run 收敛到终态，标志 DAG 全部节点结束，是 Runtime 最重要的一次状态跃迁。
 	obs.From(ctx).InfoContext(ctx, "run settled",
 		"run_id", e.RunID, "tenant_id", e.TenantID, "status", string(status), "trigger_node", e.NodeID)
+	// CAS 已成功，本次收敛由本 Resumer 独占，触发一次结束钩子。
+	var runErr error
+	if status == model.RunFailed {
+		runErr = errors.New(out)
+	}
+	r.finishLifecycle(ctx, run, runErr)
 	return nil
 }
 
@@ -172,7 +192,34 @@ func (r *Resumer) tryConvergeCancelled(ctx context.Context, e model.Event, run *
 	}
 	obs.From(ctx).InfoContext(ctx, "run cancelled",
 		"run_id", e.RunID, "tenant_id", e.TenantID, "trigger_node", e.NodeID)
+	r.finishLifecycle(ctx, run, errRunCancelled)
 	return nil
+}
+
+// errRunCancelled 标识"Run 因用户取消而结束"。
+// 单独定义而不是用内联 errors.New，是为了让审计侧能把它与"节点执行失败"区分开：
+// 取消是正常业务操作，失败才需要告警，混为一谈会让取消量大的租户看起来一直在出错。
+var errRunCancelled = errors.New("run cancelled by user")
+
+// finishLifecycle 触发 Run 生命周期结束钩子，是"最佳努力"语义。
+//
+// 刻意忽略返回值而不向上抛：此时 Run 已经 CAS 到终态，
+// 若因为审计钩子失败就让 Resumer 返回错误，事件会被重新投递 ——
+// 但 Inbox 已标记、CAS 也不会再命中，重投只是空转，
+// 更糟的是可能让调用方误判"这次推进失败了"。
+// 审计缺失应当作为可观测性告警被注意到，而不是让业务流程回滚。
+func (r *Resumer) finishLifecycle(ctx context.Context, run *model.Run, runErr error) {
+	if r.Lifecycle == nil {
+		return
+	}
+	// 从库里读出的 run 携带已认证身份（user_id / auth_method），
+	// 这正是身份必须落库的价值：Resumer 与 CreateRun 在不同进程、不同时刻，
+	// 靠持久化才能还原"当初是谁发起的"。
+	ec := runExecutionContext(run)
+	if err := r.Lifecycle.OnRunFinish(ctx, ec, runErr); err != nil {
+		obs.From(ctx).WarnContext(ctx, "run lifecycle finish hook failed",
+			"run_id", run.ID, "tenant_id", run.TenantID, "error", err)
+	}
 }
 
 // handleReplan 执行多轮 Plan 的续规流程：

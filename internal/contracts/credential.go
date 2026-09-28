@@ -13,11 +13,23 @@ import (
 type CredentialPurpose string
 
 const (
-	CredentialPurposeChat      CredentialPurpose = "chat"      // 对话补全网关
-	CredentialPurposeEmbedding CredentialPurpose = "embedding" // 向量化网关
-	CredentialPurposeVectorDB  CredentialPurpose = "vector_db" // 向量库读写
-	CredentialPurposeRedaction CredentialPurpose = "redaction" // 脱敏伪标识派生盐值
+	CredentialPurposeChat        CredentialPurpose = "chat"         // 对话补全网关
+	CredentialPurposeEmbedding   CredentialPurpose = "embedding"    // 向量化网关
+	CredentialPurposeVectorDB    CredentialPurpose = "vector_db"    // 向量库读写
+	CredentialPurposeRedaction   CredentialPurpose = "redaction"    // 脱敏伪标识派生盐值
+	CredentialPurposeAuthSigning CredentialPurpose = "auth_signing" // 身份认证验签密钥
 )
+
+// 关于 CredentialPurposeAuthSigning 的边界：
+//
+// 它与其他用途的方向**相反**。chat / embedding / vector_db 是"本服务对外调用"用的凭证，
+// 而 auth_signing 是"校验外部对本服务的调用"用的验签密钥。方向相反但都属密钥材料，
+// 因此复用同一套托管设施：验签密钥同样不该硬编码、不该散落在环境变量里，
+// 同样需要支持外部轮转而不重启进程。
+//
+// 轮转语义上它与 redaction 同属"长稳"一类，但原因不同：
+// 验签密钥轮转会立刻使所有在途 token 失效，代价是全体调用方 401；
+// 而盐值轮转的代价是关联断链。两者都应当低频轮转、只在疑似泄露时执行。
 
 // 关于 CredentialPurposeRedaction 的两个必须说清的边界：
 //

@@ -48,8 +48,19 @@ const (
 // MaxSteps 限制 DAG 节点总数（含多轮 Plan 追加的节点），防止 Planner 死循环。
 // MaxRounds 限制多轮 Plan 的续规轮次上限，0 表示不限制。
 // MaxTokens 限制 Run 累计 LLM token 消耗上限，0 表示不限制。
+//
+// UserID / AuthMethod 是**已认证**的发起者身份，由入口进程校验凭证后写入（见 migrations/014）。
+// 落库而非只在内存流转，是因为创建 Run 的进程与执行节点的进程是两个独立进程，
+// 中间隔着 MySQL 与 Redis；身份不持久化就传不到工具调用层，
+// 护栏三层防御的第 1 层"权限收窄"也就无从落地。
+//
+// AuthMethod 记录身份是被怎么认证的（jwt-hs256 / jwt-rs256 / static-token / ...）。
+// 它与 UserID 必须一起看：两者都为空表示未配置认证层，身份未经证明；
+// UserID 非空但 AuthMethod 为 static-token 表示弱机制放行，安全复盘时需要区别对待。
+// 依赖身份的授权判定应把空 UserID 当作拒绝，而不是当作"匿名但允许"。
 type Run struct {
 	ID, TenantID, ThreadID, AgentID string
+	UserID, AuthMethod              string
 	Status                          RunStatus
 	Version                         int64
 	Input, Output, CurrentNodeID    string

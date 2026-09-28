@@ -162,14 +162,89 @@ func TestCsvNames(t *testing.T) {
 	}
 }
 
-// TestSecurityBundle_DisabledByEnv 两个开关都关闭时不得装配任何链。
+// TestSecurityBundle_DisabledByEnv 三个安全开关都关闭时不得装配任何链。
+//
+// 内容护栏是第三维安全能力（另两维是注入防护与脱敏），
+// 它默认开启且会往 ModelChain 里追加一个中间件。
+// 若这个用例只关前两个开关，ModelChain 会因护栏而仍然非 nil，
+// 断言就会失败 —— 那不是 bug，而是"全部禁用"的定义随能力增加而扩大了。
 func TestSecurityBundle_DisabledByEnv(t *testing.T) {
 	t.Setenv(EnvGuardEnabled, "false")
 	t.Setenv(EnvRedactEnabled, "false")
+	t.Setenv(EnvModerationEnabled, "false")
 
 	b := newSecurityBundle(nil, nil, nil)
 	if b.ToolChain != nil || b.ModelChain != nil || b.EventChain != nil {
-		t.Errorf("expected no chains when both disabled, got tool=%v model=%v event=%v", b.ToolChain, b.ModelChain, b.EventChain)
+		t.Errorf("expected no chains when all three disabled, got tool=%v model=%v event=%v", b.ToolChain, b.ModelChain, b.EventChain)
+	}
+}
+
+// TestSecurityBundle_NilStoreDoesNotCrash 是崩溃回归测试。
+//
+// 背景：两道护栏的 Bypass 都直接调用 store 的放行查询，
+// 而单元测试常以 NewFromEnv(nil,nil,nil) / newSecurityBundle(nil,nil,nil) 装配。
+// store 为 nil 时那次调用会解引用空指针 —— 但它的表现不是 panic，
+// 而是进程被 SIGKILL、没有 panic 栈、goroutine dump 里只有
+// "running on other thread; stack unavailable"，排查时极易误判为 OOM 或死循环。
+//
+// 这个用例把"store 为 nil 也必须活着返回"钉成断言。
+// 它同时覆盖了那个曾经长期潜伏的缺陷：newGuard 的 Bypass 有同样的问题，
+// 只是过去所有相关测试都关掉了 guard，从未真正执行到那行。
+// 内容护栏默认开启，第一次把它暴露出来。
+func TestSecurityBundle_NilStoreDoesNotCrash(t *testing.T) {
+	// 三项安全能力全部默认开启（不设置任何环境变量），
+	// 这样两道护栏的 Bypass 都会被装配，任一处 nil 解引用都会让这个用例失败。
+	b := newSecurityBundle(nil, nil, nil)
+	if b.ToolChain == nil || b.ModelChain == nil {
+		t.Fatal("expected both guard and moderation chains to be assembled by default")
+	}
+	ec := contracts.ExecutionContext{TenantID: "t1", RunID: "r1", NodeID: "n1"}
+	ctx := context.Background()
+
+	// hasApproval 是两道护栏共用的唯一 store 访问点，直接测它即可覆盖两处。
+	// 期望值 false：store 不可用时按"未放行"处理（fail-closed），
+	// 宁可让人工再看一次，也不能静默放过违规内容。
+	if hasApproval(ctx, nil, ec, inputGuardReasonPrefix) {
+		t.Error("hasApproval must return false when store is nil (fail-closed)")
+	}
+	if hasApproval(ctx, nil, ec, contentGuardReasonPrefix) {
+		t.Error("hasApproval must return false when store is nil (fail-closed)")
+	}
+	// 空 NodeID 也必须返回 false：审批锚点缺失时无法定位放行记录，
+	// 而错误的锚点会让 ResumeRun 捞不到待恢复节点，Run 永久停在 WAITING_HUMAN。
+	if hasApproval(ctx, nil, contracts.ExecutionContext{TenantID: "t1", RunID: "r1"}, inputGuardReasonPrefix) {
+		t.Error("hasApproval must return false when NodeID is empty")
+	}
+}
+
+// TestSecurityBundle_ModerationAssembledByDefault 内容护栏默认开启，
+// 且必须真的能拦住违规输出 —— 只断言"链非 nil"证明不了它在工作。
+//
+// 这与 TestNewFromEnv_WiresModelChain 对脱敏的断言同理：
+// 装配存在不等于装配生效，断言必须落在可观测的行为上。
+func TestSecurityBundle_ModerationAssembledByDefault(t *testing.T) {
+	b := newSecurityBundle(nil, nil, nil)
+	if b.ModelChain == nil {
+		t.Fatal("expected model chain with content moderation by default")
+	}
+	ec := contracts.ExecutionContext{TenantID: "t1", RunID: "r1", NodeID: "n1"}
+
+	// 高危违规输出必须被拒绝，且错误要能被 worker 侧用 errors.Is 识别为
+	// "不可重试终态"。若被包成普通错误，worker 会反复重跑这个必然失败的节点。
+	_, err := b.ModelChain.After(context.Background(), ec, contracts.GenerateRequest{},
+		contracts.GenerateResponse{Message: contracts.Message{Content: "我要杀了你"}})
+	if !errors.Is(err, middleware.ErrBlocked) {
+		t.Fatalf("expected violent output to be blocked with ErrBlocked, got %v", err)
+	}
+
+	// 正常内容必须放行：护栏若把正常输出也拦了，业务直接不可用。
+	resp, err := b.ModelChain.After(context.Background(), ec, contracts.GenerateRequest{},
+		contracts.GenerateResponse{Message: contracts.Message{Content: "项目延期的原因是依赖未就绪"}})
+	if err != nil {
+		t.Fatalf("expected benign output to pass, got %v", err)
+	}
+	if resp.Message.Content != "项目延期的原因是依赖未就绪" {
+		t.Errorf("benign output was rewritten: %q", resp.Message.Content)
 	}
 }
 

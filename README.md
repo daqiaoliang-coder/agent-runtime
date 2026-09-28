@@ -230,15 +230,28 @@ Context 是跨 Provider / Executor / Middleware / Tool 的统一执行上下文�
 
 ```text
 ExecutionContext
-├── UserID
+├── UserID       # 已认证的发起者（来自 agent_run.user_id）
+├── AuthMethod   # 身份是被怎么认证的（jwt-hs256 / static-token / none）
+├── Scopes       # 权限范围（仅入口进程内有效，不落库）
 ├── TenantID
 ├── ThreadID
 ├── RunID
-├── JWT
+├── NodeID       # 人工闸门的审批锚点
 └── Trace
 ```
 
 避免不同 SDK 各自定义一套上下文，导致租户、用户、Trace 信息在调用链中丢失。
+
+> **JWT 刻意不在这里。** 原始凭证只在进程内的 `context.Context` 中传递
+> （见 `contracts.WithAuthToken` / `AuthTokenFrom`），因为 `ExecutionContext`
+> 会进审计记录、随 Run 落库、跨进程传递——凭证一旦进入这些通道就等于泄露，
+> 而凭证泄露最常见的途径恰恰是"被写进了某个日志字段"。
+> 走 ctx 传递把凭证的可见范围限制在单次请求的进程内调用栈，请求结束即丢弃。
+>
+> 身份认证的完整链路：入口进程用 `Authenticator` 校验凭证得到 `Identity`
+> → 身份写入 `agent_run.user_id` / `auth_method` → worker 在另一进程读库还原
+> → 注入 `ExecutionContext.UserID` → 工具调用据此做权限判定。
+> 身份必须落库，因为创建 Run 与执行节点隔着 MySQL 与 Redis，不落库就传不过去。
 
 ***
 

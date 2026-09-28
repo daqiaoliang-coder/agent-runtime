@@ -101,10 +101,18 @@ func (t Threat) String() string {
 // 定义为哨兵错误是为了让调用方用 errors.Is 精确识别，把它与"真的失败"区分开：
 // 前者应把节点置为 WAITING_HUMAN 并持久化中断记录（进程重启后审批态不丢、可续跑），
 // 后者才走重试与死信。混为一谈会让等待人工的节点被重试策略反复重跑。
-var ErrAwaitingApproval = errors.New("middleware: tool call awaiting human approval")
+//
+// 错误文本刻意保持中性（不写 "input guard"）：本哨兵被注入护栏与内容护栏
+// **共用**，worker 侧靠它统一路由到人工挂起。文本若绑定某一个护栏的名字，
+// 另一个护栏触发时错误信息就会指错方向 —— 运维看到 "blocked by input guard"
+// 会去查注入规则，而真正拦下它的是内容审核。
+// 具体是哪道护栏、什么原因，由各护栏在 wrap 时附加的上下文给出。
+var ErrAwaitingApproval = errors.New("middleware: awaiting human approval")
 
 // ErrBlocked 表示本次调用被防护层拒绝，不可重试。
-var ErrBlocked = errors.New("middleware: tool call blocked by input guard")
+//
+// 文本中性的理由同 ErrAwaitingApproval：两道护栏共用这一个哨兵。
+var ErrBlocked = errors.New("middleware: blocked by security policy")
 
 // ApprovalRequest 是转人工闸门时携带的最小上下文。
 //

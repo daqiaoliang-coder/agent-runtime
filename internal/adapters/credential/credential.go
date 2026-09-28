@@ -59,10 +59,11 @@ func pathsForDir(dir string) map[contracts.CredentialPurpose]string {
 		return strings.TrimSuffix(dir, "/") + "/" + name
 	}
 	return map[contracts.CredentialPurpose]string{
-		contracts.CredentialPurposeChat:      join("chat.key"),
-		contracts.CredentialPurposeEmbedding: join("embedding.key"),
-		contracts.CredentialPurposeVectorDB:  join("vector-db.key"),
-		contracts.CredentialPurposeRedaction: join("redaction.salt"),
+		contracts.CredentialPurposeChat:        join("chat.key"),
+		contracts.CredentialPurposeEmbedding:   join("embedding.key"),
+		contracts.CredentialPurposeVectorDB:    join("vector-db.key"),
+		contracts.CredentialPurposeRedaction:   join("redaction.salt"),
+		contracts.CredentialPurposeAuthSigning: join("auth-signing.key"),
 	}
 }
 
@@ -102,6 +103,10 @@ var defaultEnvVars = map[contracts.CredentialPurpose][]string{
 	contracts.CredentialPurposeEmbedding: {"EMBEDDING_API_KEY", "OPENAI_API_KEY"},
 	contracts.CredentialPurposeVectorDB:  {"QDRANT_API_KEY"},
 	contracts.CredentialPurposeRedaction: {"REDACTION_SALT"},
+	// 验签密钥给多个候选名：AUTH_SIGNING_KEY 是本服务的专用名（便于按用途最小授权），
+	// JWT_SIGNING_KEY / JWT_SECRET 是外部 IdP 与部署脚本中更常见的叫法，
+	// 兜住它们可以让既有部署零改动接入认证。
+	contracts.CredentialPurposeAuthSigning: {"AUTH_SIGNING_KEY", "JWT_SIGNING_KEY", "JWT_SECRET"},
 }
 
 var (
@@ -152,10 +157,11 @@ type FileProvider struct {
 }
 
 var defaultFilePaths = map[contracts.CredentialPurpose]string{
-	contracts.CredentialPurposeChat:      "/etc/agent-runtime/credentials/chat.key",
-	contracts.CredentialPurposeEmbedding: "/etc/agent-runtime/credentials/embedding.key",
-	contracts.CredentialPurposeVectorDB:  "/etc/agent-runtime/credentials/vector-db.key",
-	contracts.CredentialPurposeRedaction: "/etc/agent-runtime/credentials/redaction.salt",
+	contracts.CredentialPurposeChat:        "/etc/agent-runtime/credentials/chat.key",
+	contracts.CredentialPurposeEmbedding:   "/etc/agent-runtime/credentials/embedding.key",
+	contracts.CredentialPurposeVectorDB:    "/etc/agent-runtime/credentials/vector-db.key",
+	contracts.CredentialPurposeRedaction:   "/etc/agent-runtime/credentials/redaction.salt",
+	contracts.CredentialPurposeAuthSigning: "/etc/agent-runtime/credentials/auth-signing.key",
 }
 
 var _ contracts.CredentialProvider = (*FileProvider)(nil)

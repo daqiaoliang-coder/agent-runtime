@@ -2,9 +2,11 @@
 package main
 
 import (
+	"agent-runtime/internal/adapters/auth"
 	"agent-runtime/internal/adapters/credential"
 	"agent-runtime/internal/contracts"
 	"agent-runtime/internal/llm"
+	"agent-runtime/internal/middleware"
 	"agent-runtime/internal/queue"
 	"agent-runtime/internal/runtime"
 	"agent-runtime/internal/store"
@@ -50,13 +52,62 @@ func main() {
 		}
 	}
 	rt := &runtime.Runtime{Store: s, Queue: q, Planner: planner}
+
+	// 认证装配：AUTH_ENABLED=true 时校验入口凭证，并把身份写入 agent_run。
+	//
+	// 装配失败一律 log.Fatal 而不降级：认证开启却拿不到验签密钥是配置错误，
+	// 静默降级成"不认证"会让进程看起来正常运行、实际对所有请求放行 ——
+	// 那比启动失败危险得多，因为没人会注意到。
+	authCfg, err := auth.FromEnv(creds)
+	if err != nil {
+		log.Fatalf("runtime: authentication misconfigured: %v", err)
+	}
+	rt.Authenticator = authCfg.Authenticator
+	rt.RequireIdentity = authCfg.RequireIdentity
+	// 生命周期钩子承担租户交叉校验与持久化审计。
+	// 装配它的进程是 Run 的创建方，因此 OnRunStart 在这里执行；
+	// OnRunFinish 由 cmd/resume 侧执行（Run 收敛发生在另一个进程）。
+	rt.Lifecycle = newAuthLifecycle(authCfg)
+	if authCfg.Enabled {
+		log.Printf("runtime: authentication enabled method=%s require_identity=%v",
+			authCfg.Method, authCfg.RequireIdentity)
+	} else {
+		// 未开启认证必须留下痕迹：这是"这个集群的所有 Run 都没有已认证身份"
+		// 的唯一可观测证据。安全复盘时若发现 agent_run.auth_method 全为空，
+		// 这条日志能直接说明原因，而不必去猜是配置丢了还是代码没接。
+		log.Println("runtime: authentication disabled (AUTH_ENABLED is not set); runs will carry no authenticated identity")
+	}
+
 	// THREAD_ID 标识会话维度：同一 Thread 下的多个 Run 共享长期记忆。
 	// 留空表示无会话隔离，记忆检索将跳过 thread_id 过滤。
-	run, err := rt.CreateRun(ctx, "default", "demo", "why is project delayed?", env("THREAD_ID", ""))
+	//
+	// AUTH_TOKEN 是本进程的凭证来源：CLI 场景下由调用方通过环境变量传入，
+	// 注入 ctx 后由 Runtime.CreateRun 取出校验。刻意不进 ExecutionContext ——
+	// EC 会落库并进入审计日志，凭证一旦进去就等于泄露（见 contracts/auth.go）。
+	ctx = contracts.WithAuthToken(ctx, env("AUTH_TOKEN", ""))
+	run, err := rt.CreateRun(ctx, env("AUTH_TENANT", "default"), "demo", "why is project delayed?", env("THREAD_ID", ""))
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("created run:", run.ID, "thread:", run.ThreadID)
+	fmt.Println("created run:", run.ID, "thread:", run.ThreadID, "user:", run.UserID)
+}
+
+// newAuthLifecycle 构造 Run 生命周期的认证审计环节。
+//
+// 无论认证是否开启都返回非 nil 实例：开启时它执行策略校验，
+// 未开启时它仍会记录"这次 Run 没有已认证身份"（AuthMethod="none"），
+// 让未接认证的部署在审计里可见，而不是静默地什么都不留。
+func newAuthLifecycle(cfg auth.Config) runtime.RunLifecycle {
+	lc := &middleware.AuthLifecycle{RequireIdentity: cfg.RequireIdentity}
+	lc.OnAudit = func(_ context.Context, rec middleware.AuditRecord) {
+		// 审计输出不含凭证与被拦内容，只有身份维度与原因标识（见 AuditRecord 注释）。
+		if rec.Denied {
+			log.Printf("warn: %s", rec.AuditString())
+			return
+		}
+		log.Print(rec.AuditString())
+	}
+	return middleware.NewLifecycleChain(lc)
 }
 func env(k, d string) string {
 	if v := os.Getenv(k); v != "" {

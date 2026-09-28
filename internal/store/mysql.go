@@ -36,15 +36,18 @@ func (s *MySQL) Close() { _ = s.DB.Close() }
 
 // CreateRun 插入一条 Run 记录，初始状态为 PENDING。租户由 r.TenantID 携带，
 // 会话维度由 r.ThreadID 携带（空串表示无会话隔离）。
+//
+// r.UserID / r.AuthMethod 是入口进程认证后写入的发起者身份，允许为空
+// （未配置认证层时为存量行为）；身份的可信度判定由调用方负责，本层只如实持久化。
 func (s *MySQL) CreateRun(ctx context.Context, r *model.Run) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO agent_run(run_id,tenant_id,thread_id,agent_id,status,version,input,max_steps,max_rounds,max_tokens) VALUES(?,?,?,?,?,?,?,?,?,?)`, r.ID, r.TenantID, r.ThreadID, r.AgentID, r.Status, r.Version, r.Input, r.MaxSteps, r.MaxRounds, r.MaxTokens)
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO agent_run(run_id,tenant_id,thread_id,agent_id,user_id,auth_method,status,version,input,max_steps,max_rounds,max_tokens) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.TenantID, r.ThreadID, r.AgentID, r.UserID, r.AuthMethod, r.Status, r.Version, r.Input, r.MaxSteps, r.MaxRounds, r.MaxTokens)
 	return err
 }
 
 // GetRun 按 tenant + run_id 读取 Run，租户不匹配则返回 sql.ErrNoRows。
 func (s *MySQL) GetRun(ctx context.Context, tenant, id string) (*model.Run, error) {
 	r := &model.Run{}
-	err := s.DB.QueryRowContext(ctx, `SELECT run_id,tenant_id,thread_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,max_rounds,max_tokens,created_at,updated_at FROM agent_run WHERE run_id=? AND tenant_id=?`, id, tenant).Scan(&r.ID, &r.TenantID, &r.ThreadID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.MaxRounds, &r.MaxTokens, &r.CreatedAt, &r.UpdatedAt)
+	err := s.DB.QueryRowContext(ctx, `SELECT run_id,tenant_id,thread_id,agent_id,user_id,auth_method,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,max_rounds,max_tokens,created_at,updated_at FROM agent_run WHERE run_id=? AND tenant_id=?`, id, tenant).Scan(&r.ID, &r.TenantID, &r.ThreadID, &r.AgentID, &r.UserID, &r.AuthMethod, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.MaxRounds, &r.MaxTokens, &r.CreatedAt, &r.UpdatedAt)
 	return r, err
 }
 
@@ -755,6 +758,36 @@ func (s *MySQL) HasResolvedApproval(ctx context.Context, tenant, runID, nodeID s
 	return n > 0, nil
 }
 
+// HasResolvedApprovalFor 报告某节点是否已获**指定来源**的人工放行。
+//
+// 与 HasResolvedApproval 的区别只在于多了一个来源维度，而这个维度是必需的：
+// 一个节点上可能同时挂着注入护栏（Guard）与内容护栏（ContentGuard）两道防护，
+// 两者的审批记录都落在 run_interrupt 同一张表里。若只按节点查询，
+// 「人工批准了这次注入告警」会连带让内容审核也被跳过 ——
+// 运维点的是一次注入确认，得到的却是两类防护同时失效，
+// 而且完全没有任何提示。这种交叉豁免是审批机制接上第二道护栏后才会出现的问题。
+//
+// source 匹配 reason 的前缀。各护栏在构造 ApprovalRequest.Reason 时
+// 写入自己的标识（"input guard: ..." / "content moderation ..."），
+// 因此无需给 run_interrupt 加列即可区分来源。
+//
+// 取舍说明：用 reason 前缀匹配而非新增列，是因为 reason 本就要承载拦截原因、
+// 且人工在审批界面上看到的就是它，来源信息放在这里对运维是自解释的。
+// 代价是匹配依赖字符串前缀，若将来某护栏改了 reason 措辞就会失配 ——
+// 失配的方向是「查不到放行记录 → 重新转人工」，属于安全侧的失败，可接受。
+func (s *MySQL) HasResolvedApprovalFor(ctx context.Context, tenant, runID, nodeID, source string) (bool, error) {
+	if nodeID == "" || source == "" {
+		return false, nil
+	}
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_interrupt WHERE tenant_id=? AND run_id=? AND node_id=? AND status='RESOLVED' AND reason LIKE ?`,
+		tenant, runID, nodeID, source+"%").Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // CancelRun 在单事务中将 Run 从 RUNNING 切换到 CANCEL_REQUESTED，同时把该 Run 下
 // 所有 PENDING/READY 节点置为 CANCELLED，防止 worker 在取消后继续认领新节点。
 // RUNNING 节点不被触及：它们要么自然完成（Resumer 据此收敛），要么租约过期后被
@@ -783,7 +816,7 @@ func (s *MySQL) CancelRun(ctx context.Context, tenant, runID, reason string, ver
 // 收敛：取消遗留的 PENDING/READY 节点，并在全部节点终态时 CAS 到 CANCELLED。
 // 系统级扫描（不限定租户），返回的 Run 携带 tenant_id 以便后续操作做租户隔离。
 func (s *MySQL) CancelRequestedRuns(ctx context.Context, limit int) ([]model.Run, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT run_id,tenant_id,thread_id,agent_id,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,max_rounds,max_tokens,created_at,updated_at FROM agent_run WHERE status=? LIMIT ?`, model.RunCancelRequested, limit)
+	rows, err := s.DB.QueryContext(ctx, `SELECT run_id,tenant_id,thread_id,agent_id,user_id,auth_method,status,version,input,COALESCE(output,''),COALESCE(current_node_id,''),max_steps,steps,max_rounds,max_tokens,created_at,updated_at FROM agent_run WHERE status=? LIMIT ?`, model.RunCancelRequested, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -791,7 +824,7 @@ func (s *MySQL) CancelRequestedRuns(ctx context.Context, limit int) ([]model.Run
 	var out []model.Run
 	for rows.Next() {
 		var r model.Run
-		if err := rows.Scan(&r.ID, &r.TenantID, &r.ThreadID, &r.AgentID, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.MaxRounds, &r.MaxTokens, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.TenantID, &r.ThreadID, &r.AgentID, &r.UserID, &r.AuthMethod, &r.Status, &r.Version, &r.Input, &r.Output, &r.CurrentNodeID, &r.MaxSteps, &r.Steps, &r.MaxRounds, &r.MaxTokens, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

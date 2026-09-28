@@ -223,14 +223,23 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	// 注入执行上下文：Executor 接口只认节点不认身份，而防护链的每一次拦截
 	// 都需要租户维度做审计、需要节点标识做人工闸门锚点。走 ctx 传递而非改接口，
 	// 避免波及全部 Executor 实现（详见 contracts/context.go 的取舍说明）。
-	// UserID 目前只能为空：agent_run / agent_node 均未持久化发起者用户，
-	// 该字段要等接入认证层（Lifecycle.OnRunStart 校验凭证）后才有可靠来源。
+	//
+	// UserID / AuthMethod 取自 run（即 agent_run.user_id / auth_method）：
+	// 身份由入口进程校验凭证后落库，worker 在另一个进程里读库还原。
+	// 这正是身份必须持久化的原因 —— 创建 Run 与执行节点隔着 MySQL 与 Redis，
+	// 不落库就传不过来，护栏三层防御的第 1 层"权限收窄"（Tool 调用带发起者身份
+	// 而非全局服务账号）也就无从落地。
+	//
+	// 空 UserID 表示该 Run 创建时未经过认证层（未配置 Authenticator，或存量数据）。
+	// 空值的语义是"身份未经证明"，依赖身份的授权判定应当拒绝而不是当作匿名放行。
 	ctx = contracts.WithExecutionContext(ctx, contracts.ExecutionContext{
-		TenantID: n.TenantID,
-		ThreadID: run.ThreadID,
-		RunID:    n.RunID,
-		NodeID:   n.ID,
-		TraceID:  oteltrace.SpanContextFromContext(ctx).TraceID().String(),
+		TenantID:   n.TenantID,
+		UserID:     run.UserID,
+		AuthMethod: run.AuthMethod,
+		ThreadID:   run.ThreadID,
+		RunID:      n.RunID,
+		NodeID:     n.ID,
+		TraceID:    oteltrace.SpanContextFromContext(ctx).TraceID().String(),
 	})
 
 	// 执行节点：替换原先的占位字符串拼接，真正发起 LLM 推理或工具调用。

@@ -22,11 +22,24 @@ import (
 // 默认**开启**：安全能力默认关闭等于没有。若默认关闭，部署方多半永远不会打开，
 // 那这套防护就只剩测试里的绿色勾。需要关闭时用显式的环境变量，留下可审计的决定。
 const (
-	EnvGuardEnabled  = "SECURITY_GUARD_ENABLED"   // 不可信输入防护开关，默认 true
-	EnvRedactEnabled = "SECURITY_REDACT_ENABLED"  // 数据脱敏开关，默认 true
-	EnvRedactLevel   = "SECURITY_REDACT_LEVEL"    // 脱敏生效门槛，默认 internal
-	EnvHighRiskTools = "SECURITY_HIGH_RISK_TOOLS" // 高危工具名单（逗号分隔），从严处置
-	EnvAllowedTools  = "SECURITY_ALLOWED_TOOLS"   // 豁免工具名单（逗号分隔），完全不扫描
+	EnvGuardEnabled      = "SECURITY_GUARD_ENABLED"      // 不可信输入防护开关，默认 true
+	EnvRedactEnabled     = "SECURITY_REDACT_ENABLED"     // 数据脱敏开关，默认 true
+	EnvRedactLevel       = "SECURITY_REDACT_LEVEL"       // 脱敏生效门槛，默认 internal
+	EnvHighRiskTools     = "SECURITY_HIGH_RISK_TOOLS"    // 高危工具名单（逗号分隔），从严处置
+	EnvAllowedTools      = "SECURITY_ALLOWED_TOOLS"      // 豁免工具名单（逗号分隔），完全不扫描
+	EnvModerationEnabled = "SECURITY_MODERATION_ENABLED" // 内容安全护栏开关，默认 true
+	// EnvModerationOnError 决定外部审核服务不可用时的处置：
+	// fallback_local（默认）/ fail_closed / fail_open。
+	// 默认降级到本地规则而非二选一，理由见 middleware.OnServiceError 的注释。
+	EnvModerationOnError = "SECURITY_MODERATION_ON_ERROR"
+	// EnvModerationInput / EnvModerationOutput 分别控制输入侧与输出侧审核，默认都开。
+	// 拆开的理由：输入侧拦的是用户自己写的内容，误报直接表现为产品不可用，
+	// 有些业务会想只审输出。见 middleware.Stage 的注释。
+	EnvModerationInput  = "SECURITY_MODERATION_INPUT"
+	EnvModerationOutput = "SECURITY_MODERATION_OUTPUT"
+	// EnvModerationStrictInput 为 true 时，输入侧改用与输出侧相同的严格分流
+	// （中危转人工而非放行）。默认 false，即输入侧更宽松。
+	EnvModerationStrictInput = "SECURITY_MODERATION_STRICT_INPUT"
 )
 
 // SecurityBundle 是装配好的一组安全中间件，供 Worker 与 Dispatcher 分别取用。
@@ -50,7 +63,7 @@ type SecurityBundle struct {
 // 传 nil 也可以：此时只是 Resume 后不主动投递，由 recovery 扫描兜底。
 func newSecurityBundle(s *store.MySQL, q runtime.Queue, creds contracts.CredentialProvider) *SecurityBundle {
 	b := &SecurityBundle{}
-	if !envBool(EnvGuardEnabled, true) && !envBool(EnvRedactEnabled, true) {
+	if !envBool(EnvGuardEnabled, true) && !envBool(EnvRedactEnabled, true) && !envBool(EnvModerationEnabled, true) {
 		log.Println("worker: security middleware disabled by configuration")
 		return b
 	}
@@ -91,6 +104,18 @@ func newSecurityBundle(s *store.MySQL, q runtime.Queue, creds contracts.Credenti
 		models = append(models, &middleware.ModelRedactor{Redactor: redactor})
 	}
 
+	if envBool(EnvModerationEnabled, true) {
+		guard := newContentGuard(s, q)
+		// 顺序是关键：ModelChain.After 是**倒序**执行的（见 middleware.ModelChain）。
+		// 护栏必须排在脱敏之后追加，才能在倒序中**先**执行 ——
+		// 于是护栏审的是模型的原始输出，脱敏随后才改写它。
+		// 顺序反过来，护栏看到的就只有被打码的文本，审核质量被静默降低，
+		// 而且这种退化不会报错，只会表现为"护栏几乎从不命中"。
+		models = append(models, guard)
+		log.Printf("worker: content moderation enabled input=%v output=%v on_error=%s",
+			guard.ModerateInput, guard.ModerateOutput, guard.Policy.OnServiceError)
+	}
+
 	if len(tools) > 0 {
 		b.ToolChain = middleware.NewToolChain(tools...)
 	}
@@ -127,18 +152,10 @@ func newGuard(s *store.MySQL, q runtime.Queue) *middleware.Guard {
 		return rt.Interrupt(ctx, req.TenantID, req.RunID, req.NodeID, req.Reason)
 	}))
 	g.Bypass = func(ctx context.Context, ec contracts.ExecutionContext, _ contracts.ToolCallRequest) bool {
-		if ec.NodeID == "" {
-			return false
-		}
-		ok, err := s.HasResolvedApproval(ctx, ec.TenantID, ec.RunID, ec.NodeID)
-		if err != nil {
-			// 查询失败按"未放行"处理：放行判定宁可误拦不可误放，
-			// 误拦的代价是人工再看一次，误放的代价是攻击载荷直接执行。
-			log.Printf("warn: approval lookup failed tenant=%s run=%s node=%s: %v (treating as not approved)",
-				ec.TenantID, ec.RunID, ec.NodeID, err)
-			return false
-		}
-		return ok
+		// 按来源收窄到"注入护栏"的审批记录（reason 以 inputGuardReasonPrefix 开头）。
+		// 用不限来源的 HasResolvedApproval 会让内容护栏的一次放行
+		// 连带豁免掉注入防护 —— 运维点的是一次内容确认，得到的却是两类防护同时失效。
+		return hasApproval(ctx, s, ec, inputGuardReasonPrefix)
 	}
 	g.OnThreat = func(_ context.Context, a middleware.AuditContext, toolName string, action middleware.Action, threats []middleware.Threat) {
 		// 只记规则名与位置长度，不记载荷原文，理由同 redactor.OnRedact。
@@ -156,6 +173,136 @@ func newGuard(s *store.MySQL, q runtime.Queue) *middleware.Guard {
 		g.Policy.AllowedTools = al
 	}
 	return g
+}
+
+// 审批记录的来源前缀。
+//
+// run_interrupt 只有一张表，而一个节点上可能同时挂着注入护栏与内容护栏两道防护。
+// 放行判定必须能区分「人工批准的是哪一类告警」，否则一次确认会连带豁免另一类
+// （详见 store.HasResolvedApprovalFor 的注释）。
+//
+// 这里定义的前缀必须与各护栏构造 ApprovalRequest.Reason 时的开头**逐字一致**：
+// Guard 写 "input guard: ..."，ContentGuard 写 "content moderation (...)..."。
+// 前缀失配的后果是查不到放行记录、节点被反复转人工（审批收敛不了），
+// 属于安全侧的失败而非放行侧，但同样会让业务卡死，因此改动任一侧措辞时必须同步这里。
+const (
+	inputGuardReasonPrefix   = "input guard"
+	contentGuardReasonPrefix = "content moderation"
+)
+
+// hasApproval 是两道护栏共用的放行判定，也是本文件唯一的 store 访问点。
+//
+// 单独抽出来而不各自内联，是为了让一个**曾经真实发生过**的崩溃只有一处可能发生：
+// store 为 nil 时（单元测试用 NewFromEnv(nil,nil,nil) 装配、或装配顺序错误），
+// 直接调用 s.HasResolvedApprovalFor 会解引用空指针。
+// 这类崩溃的表现极具误导性 —— 进程被 SIGKILL 掉、没有 panic 栈、
+// goroutine dump 里只看到 "running on other thread"，
+// 排查时很容易误判成 OOM 或死循环（本次就误判过一轮）。
+//
+// 处置方向是 fail-closed：store 不可用时返回 false（视为"未放行"），
+// 于是内容会被重新转人工而不是被静默放过。误拦的代价是人工再看一次，
+// 误放的代价是违规内容直接出域 —— 两者不对等，必须偏向前者。
+func hasApproval(ctx context.Context, s *store.MySQL, ec contracts.ExecutionContext, source string) bool {
+	if s == nil || ec.NodeID == "" {
+		return false
+	}
+	ok, err := s.HasResolvedApprovalFor(ctx, ec.TenantID, ec.RunID, ec.NodeID, source)
+	if err != nil {
+		// 查询失败同样按"未放行"处理，理由同上。
+		log.Printf("warn: approval lookup failed tenant=%s run=%s node=%s source=%q: %v (treating as not approved)",
+			ec.TenantID, ec.RunID, ec.NodeID, source, err)
+		return false
+	}
+	return ok
+}
+
+// newContentGuard 构造内容安全护栏，接上人工闸门与放行判定。
+//
+// 与 newGuard 的结构刻意对称：两者都是"检测 + 三分流 + 人工闸门 + 放行查询"，
+// 装配方式保持一致才能让运维对两道护栏形成稳定预期。
+//
+// 一个重要的差异：**输出侧不装配 Bypass**。
+// ContentGuard.OutputBypass 要求绑定内容指纹，而 run_interrupt 没有可存指纹的列，
+// 硬用节点级放行会让「一次豁免」变成「该节点此后所有输出的永久豁免通道」
+// （模型输出是非确定性的，重跑生成的是另一段内容）。
+// 因此这里保持 nil，让每段输出都重新审核 —— 安全默认，代价只是人工多看几次。
+// 需要指纹绑定的部署应当先给 run_interrupt 加列，再装配 OutputBypass。
+func newContentGuard(s *store.MySQL, q runtime.Queue) *middleware.ContentGuard {
+	rt := &runtime.Runtime{Store: s, Queue: q}
+	g := middleware.NewContentGuard(nil, middleware.ApproverFunc(func(ctx context.Context, req middleware.ApprovalRequest) error {
+		// 与 newGuard 同理：没有节点上下文就无法把审批落到正确锚点，
+		// 宁可 fail-closed 成拒绝，也不要制造一个 ResumeRun 捞不到的挂起态。
+		if req.NodeID == "" {
+			return errors.New("worker: cannot request content approval without node context")
+		}
+		return rt.Interrupt(ctx, req.TenantID, req.RunID, req.NodeID, req.Reason)
+	}))
+
+	// Moderator 传 nil：仓库暂无外部内容安全服务的适配器，
+	// 此时 ContentGuard 只用内置本地规则（能力边界见 middleware.LocalModerator）。
+	// 接入真实服务时在此处装配，上层策略与三分流无需改动。
+	g.ModerateInput = envBool(EnvModerationInput, true)
+	g.ModerateOutput = envBool(EnvModerationOutput, true)
+	g.Policy.OnServiceError = parseServiceError(envString(EnvModerationOnError, ""))
+	if envBool(EnvModerationStrictInput, false) {
+		// 严格模式：输入侧改用与输出侧相同的分流（中危转人工而非放行）。
+		// 默认宽松的理由见 middleware.defaultInputActionBySeverity 的注释。
+		g.Policy.ActionBySeverityInput = map[middleware.Severity]middleware.Action{
+			middleware.SeverityLow:    middleware.ActionAllow,
+			middleware.SeverityMedium: middleware.ActionRequireApproval,
+			middleware.SeverityHigh:   middleware.ActionBlock,
+		}
+	}
+	// 色情类无论严重度如何都直接拒绝：内置规则里该类别只收明确的露骨请求
+	// 与未成年相关内容，不存在"转人工再看一眼"的余地。
+	g.Policy.ActionByCategory = map[middleware.ContentCategory]middleware.Action{
+		middleware.CategoryPorn: middleware.ActionBlock,
+	}
+
+	g.Bypass = func(ctx context.Context, ec contracts.ExecutionContext, stage middleware.Stage) bool {
+		// 输出侧一律不跳过：内容非确定，节点级放行会变成永久豁免通道（见函数注释）。
+		if stage != middleware.StageInput {
+			return false
+		}
+		return hasApproval(ctx, s, ec, contentGuardReasonPrefix)
+	}
+
+	g.OnFinding = func(_ context.Context, a middleware.AuditContext, stage middleware.Stage, action middleware.Action, findings []middleware.ContentFinding) {
+		// 只记类别与规则名，**绝不记违规原文**：理由同 redactor.OnRedact ——
+		// 审计日志会进日志系统与可观测平台，把违规内容抄进去等于二次传播，
+		// 而传播违规内容正是这道护栏要防的事。
+		//
+		// 输出 user 而不是 node：AuditContext 只承载 TenantID/UserID/RunID 三个身份维度，
+		// 节点标识不在其中。节点级定位应当从人工闸门写入的 run_interrupt 记录里查，
+		// 那里有权威的 node_id；在这条日志里硬凑一个节点字段只会打出错误的值。
+		cats := make([]string, 0, len(findings))
+		for _, f := range findings {
+			cats = append(cats, string(f.Category)+"/"+f.Rule)
+		}
+		log.Printf("content moderation tenant=%s run=%s user=%s stage=%s action=%s findings=%d rules=%s",
+			a.TenantID, a.RunID, a.UserID, stage, action, len(findings), strings.Join(cats, ","))
+	}
+	g.OnServiceFailure = func(_ context.Context, a middleware.AuditContext, stage middleware.Stage, err error) {
+		// 降级必须可观测：否则"外部审核服务已经挂了几天、期间一直在用本地弱规则"
+		// 完全不可见，而降级后的审计输出与正常工作时看起来一模一样。
+		log.Printf("warn: content moderation service unavailable tenant=%s run=%s stage=%s: %v (policy=%s)",
+			a.TenantID, a.RunID, stage, err, g.Policy.OnServiceError)
+	}
+	return g
+}
+
+// parseServiceError 把配置字符串解析为服务故障处置策略。
+// 无法识别时回退 fallback_local（降级但不裸奔）—— 配置写错时向"仍有防护"降级，
+// 而不是向 fail_open 降级，否则一个拼写错误会静默关掉整道护栏。
+func parseServiceError(s string) middleware.OnServiceError {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "fail_closed", "fail-closed":
+		return middleware.ServiceErrorFailClosed
+	case "fail_open", "fail-open":
+		return middleware.ServiceErrorFailOpen
+	default:
+		return middleware.ServiceErrorFallbackLocal
+	}
 }
 
 // parseSensitivity 把配置字符串解析为敏感度门槛。

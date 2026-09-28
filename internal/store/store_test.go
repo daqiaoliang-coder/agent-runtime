@@ -28,8 +28,8 @@ func TestGetRun_IncludesTenantFilter(t *testing.T) {
 	s, mock, cleanup := newMockStore(t)
 	defer cleanup()
 	now := time.Now()
-	rows := sqlmock.NewRows([]string{"run_id", "tenant_id", "thread_id", "agent_id", "status", "version", "input", "output", "current_node_id", "max_steps", "steps", "max_rounds", "max_tokens", "created_at", "updated_at"}).
-		AddRow("run-1", "tenant-A", "thread-1", "agent-1", model.RunRunning, 1, "in", "", "", 50, 0, 10, 0, now, now)
+	rows := sqlmock.NewRows([]string{"run_id", "tenant_id", "thread_id", "agent_id", "user_id", "auth_method", "status", "version", "input", "output", "current_node_id", "max_steps", "steps", "max_rounds", "max_tokens", "created_at", "updated_at"}).
+		AddRow("run-1", "tenant-A", "thread-1", "agent-1", "user-9", "jwt-hs256", model.RunRunning, 1, "in", "", "", 50, 0, 10, 0, now, now)
 	// 查询必须包含 tenant_id（regexp 部分匹配），且参数为 (run_id, tenant)。
 	mock.ExpectQuery("tenant_id").
 		WithArgs("run-1", "tenant-A").
@@ -43,6 +43,14 @@ func TestGetRun_IncludesTenantFilter(t *testing.T) {
 	}
 	if r.ThreadID != "thread-1" {
 		t.Errorf("expected thread_id to be read back, got %q", r.ThreadID)
+	}
+	// 发起者身份必须能被读回：worker 靠它把已认证的 UserID 注入 ExecutionContext，
+	// 读不回来就意味着身份在跨进程传递时丢了，护栏的"权限收窄"退化为空谈。
+	if r.UserID != "user-9" {
+		t.Errorf("expected user_id to be read back, got %q", r.UserID)
+	}
+	if r.AuthMethod != "jwt-hs256" {
+		t.Errorf("expected auth_method to be read back, got %q", r.AuthMethod)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("expectations not met: %v", err)
