@@ -138,8 +138,12 @@ func (rs *RuleSet) vectorBest(tool string, tokens []string, includeAllow bool) (
 //	放行依据）；非 shell 工具只有一个 segment。
 //
 // 聚合口径（两级）：
-//  1. 每段取 vectorBest（特异性优先）——具体 allow 可压过同段的泛化 ask，
-//     这是"后者可细化前者"（§3.1）的落点；inner 段只取非 allow 命中；
+//  1. 每段先做 deny 免竞争检查——一条更具体的 allow/ask 不是"细化"deny
+//     的合法手段（§3.1"跨来源聚合仍按 deny > ask > allow"；P2 租户规则
+//     落地后，允许 tenant 用具体 allow 中和部署级 deny 等于配置提权）；
+//     无 deny 时，ask ↔ allow 按特异性竞争——具体 allow 可压过同段的
+//     泛化 ask，这是"后者可细化前者"（§3.1）的落点；inner 段只取
+//     deny/ask 命中；
 //  2. 跨段取最严——任一段 deny 即整体 deny；任一段 ask 即整体 ask；
 //     全部段的最优命中都是 allow 且 allowEligible 时整体 allow
 //     （"一段未识别，整体不放行"，§4 防线 2）。
@@ -151,26 +155,29 @@ func (rs *RuleSet) Aggregate(tool string, segments, inner [][]string, allowEligi
 	hasDeny, hasAsk := false, false
 	allAllow := allowEligible && len(segments) > 0
 	for _, seg := range segments {
+		if d, ok := rs.bestDeny(tool, seg); ok {
+			allAllow = false
+			if !hasDeny || specificityGE(d, denyRule) {
+				denyRule, hasDeny = d, true
+			}
+			continue
+		}
 		r, ok := rs.vectorBest(tool, seg, true)
 		if !ok || r.Effect != Allow {
 			allAllow = false
-		}
-		switch {
-		case ok && r.Effect == Deny && (!hasDeny || specificityGE(r, denyRule)):
-			denyRule, hasDeny = r, true
-		case ok && r.Effect == RequireApproval && !hasDeny && (!hasAsk || specificityGE(r, askRule)):
-			askRule, hasAsk = r, true
+			if ok && r.Effect == RequireApproval && !hasDeny && (!hasAsk || specificityGE(r, askRule)) {
+				askRule, hasAsk = r, true
+			}
 		}
 	}
 	for _, in := range inner {
-		r, ok := rs.vectorBest(tool, in, false)
-		if !ok {
+		if d, ok := rs.bestDeny(tool, in); ok {
+			if !hasDeny || specificityGE(d, denyRule) {
+				denyRule, hasDeny = d, true
+			}
 			continue
 		}
-		switch {
-		case r.Effect == Deny && (!hasDeny || specificityGE(r, denyRule)):
-			denyRule, hasDeny = r, true
-		case r.Effect == RequireApproval && !hasDeny && (!hasAsk || specificityGE(r, askRule)):
+		if r, ok := rs.vectorBest(tool, in, false); ok && r.Effect == RequireApproval && !hasDeny && (!hasAsk || specificityGE(r, askRule)) {
 			askRule, hasAsk = r, true
 		}
 	}
@@ -184,6 +191,33 @@ func (rs *RuleSet) Aggregate(tool string, segments, inner [][]string, allowEligi
 		return Allow, r, true
 	}
 	return Allow, Rule{}, false
+}
+
+// bestDeny 返回匹配该词向量的最具体 deny 规则。deny 不参与与 ask/allow
+// 的特异性竞争（见 Aggregate 的聚合口径）——vectorBest 会按特异性把一条
+// 更具体的 allow 排在 deny 之前，那等于给"用具体 allow 细化掉 deny"开了
+// 口子。
+func (rs *RuleSet) bestDeny(tool string, tokens []string) (Rule, bool) {
+	tool = strings.ToLower(strings.TrimSpace(tool))
+	var best Rule
+	found := false
+	var bestConcrete, bestWildcards int
+	for _, r := range rs.rules {
+		if r.Effect != Deny {
+			continue
+		}
+		if r.Tool != "*" && !strings.EqualFold(r.Tool, tool) {
+			continue
+		}
+		if !matchRule(r, tokens) {
+			continue
+		}
+		concrete, wildcards := specificity(r)
+		if !found || concrete > bestConcrete || (concrete == bestConcrete && wildcards < bestWildcards) {
+			best, found, bestConcrete, bestWildcards = r, true, concrete, wildcards
+		}
+	}
+	return best, found
 }
 
 // specificityGE 报告 r 的特异性不低于 other（用于同效果命中的代表性选择）：

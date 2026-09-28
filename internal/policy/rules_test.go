@@ -103,6 +103,19 @@ func TestRuleSetAggregate(t *testing.T) {
 		}
 	})
 
+	t.Run("specific allow cannot refine deny", func(t *testing.T) {
+		// 更具体的 allow 不是"细化"deny 的合法手段：链式输入下 L1 裸分词
+		// 不命中 deny 前缀，段内 allow（concrete 5）曾会压制 builtin deny
+		// （concrete 3）——deny 免竞争后必须仍然拦截。
+		rs2 := NewRuleSet(append(BuiltinRules(),
+			Rule{Tool: "*", Pattern: "rm -rf / --no-preserve-root", Effect: Allow, Source: "env"},
+		))
+		d, _, ok := rs2.Aggregate("shell", [][]string{toks("ls"), toks("rm -rf / --no-preserve-root")}, nil, true)
+		if !ok || d != Deny {
+			t.Fatalf("deny must not be refinable by a more specific allow, got %v ok=%v", d, ok)
+		}
+	})
+
 	t.Run("same pattern most severe wins", func(t *testing.T) {
 		rs2 := NewRuleSet([]Rule{
 			{Tool: "*", Pattern: "ls", Effect: Allow, Source: "builtin"},
