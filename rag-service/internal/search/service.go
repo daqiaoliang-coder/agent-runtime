@@ -16,19 +16,22 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/daqiaoliang-coder/rag-service/internal/embed"
+	"github.com/daqiaoliang-coder/rag-service/internal/rerank"
 	"github.com/daqiaoliang-coder/rag-service/internal/sparse"
 	"github.com/daqiaoliang-coder/rag-service/internal/vector"
 )
 
 // 降级原因常量，出现在 Response.Degraded 中供调用方决策（如回退直连 Qdrant）。
 const (
-	DegradedEmbedFailed  = "embed_failed"  // embedding 网关错误（超时/限流/5xx）
-	DegradedEmbedEmpty   = "embed_empty"   // 网关返回空向量（配置错误的典型症状）
-	DegradedVectorFailed = "vector_failed" // 向量库错误
-	DegradedSparseEmpty  = "sparse_empty"  // docs profile：查询无法编码出稀疏向量
+	DegradedEmbedFailed  = "embed_failed"     // embedding 网关错误（超时/限流/5xx）
+	DegradedEmbedEmpty   = "embed_empty"      // 网关返回空向量（配置错误的典型症状）
+	DegradedVectorFailed = "vector_failed"    // 向量库错误
+	DegradedSparseEmpty  = "sparse_empty"     // docs profile：查询无法编码出稀疏向量
+	DegradedRerankSkipped = "rerank_skipped" // docs profile：重排失败/超时，保持 RRF 序
 )
 
 // 默认检索参数，与 runtime providers.DefaultMemory* 一致。
@@ -39,8 +42,12 @@ const (
 	DefaultCollection = "agent_memory"
 	// DefaultDocsCollection 是 docs profile 的目标集合（命名 dense+sparse 布局）。
 	DefaultDocsCollection = "rag_documents"
-	// DefaultDocsBudget 是 docs profile 的延迟预算（dense+sparse+RRF 单次往返）。
+	// DefaultDocsBudget 是 docs profile 的延迟预算（dense+sparse+RRF+可选重排）。
 	DefaultDocsBudget = 1500 * time.Millisecond
+	// DefaultDocsOverfetch 是 docs profile 的子块过采样倍数：混合召回的头部
+	// 结果可能同文档扎堆（一篇文档多个子块命中），取 overfetch×topK 个子块
+	// 经 doc_id 去重后才能凑满 topK 篇不同文档。
+	DefaultDocsOverfetch = 4
 )
 
 // Request 是一次检索请求。Profile 由 httpapi 层校验后传入。
@@ -55,7 +62,8 @@ type Request struct {
 }
 
 // Result 是一条召回结果。相比 runtime 的 contracts.Message（仅 Role/Content），
-// 额外透出溯源信息，供调用方审计与去重。
+// 额外透出溯源信息，供调用方审计与去重。DocID/ChunkSeq 是 docs profile 的
+// 子块定位字段（命中子块所属文档与序号），memory 路径恒为零值。
 type Result struct {
 	Role      string    `json:"role"`
 	Content   string    `json:"content"`
@@ -63,12 +71,15 @@ type Result struct {
 	RunID     string    `json:"run_id"`
 	Score     float32   `json:"score"`
 	CreatedAt time.Time `json:"created_at"`
+	DocID     string    `json:"doc_id,omitempty"`
+	ChunkSeq  int       `json:"chunk_seq,omitempty"`
 }
 
 // StageTimings 记录各阶段耗时（毫秒），供延迟预算观测与 SLO 对账。
 type StageTimings struct {
 	EmbedMS  float64 `json:"embed_ms"`
 	SearchMS float64 `json:"search_ms"`
+	RerankMS float64 `json:"rerank_ms"` // docs profile：cross-encoder 重排耗时（未启用/降级为 0）
 	TotalMS  float64 `json:"total_ms"`
 }
 
@@ -95,6 +106,11 @@ type Service struct {
 	DocsMinScore float32
 	Budget       time.Duration // memory profile 总预算，<=0 不设限（仅测试）
 	DocsBudget   time.Duration // docs profile 总预算，<=0 回退 DefaultDocsBudget
+	// Reranker 是 docs profile 的 cross-encoder 重排器；nil 表示关闭
+	// （保持 RRF 融合序，零外部依赖）。失败/超时降级 rerank_skipped。
+	Reranker rerank.Reranker
+	// DocsOverfetch 是子块过采样倍数（缺省 4），见 DefaultDocsOverfetch。
+	DocsOverfetch int
 }
 
 // Search 按 profile 分发检索。两个 profile 共享同一降级契约：
@@ -109,11 +125,17 @@ func (s *Service) Search(ctx context.Context, req Request) Response {
 	}
 }
 
-// searchDocs 执行 docs profile 检索：embed + sparse 编码 → 混合召回（RRF）。
-// 与 memory 的两点刻意差异：
-//   - 排序保持相关性（融合分降序），不按 created_at 重排——
+// searchDocs 执行 docs profile 检索（Phase 3 管道）：
+//
+//	embed + sparse → HybridSearch(overfetch×topK 子块)
+//	  → rerank(子块)（可选；失败降级 rerank_skipped 保持 RRF 序）
+//	  → 按 doc_id 去重（每篇文档保留最高分子块）→ 截断 topK
+//	  → Content = parent_text（子块命中，父块作上下文返回）
+//
+// 与 memory 的刻意差异：
+//   - 排序保持相关性（重排分或融合分降序），不按 created_at 重排——
 //     文档检索的目标是命中，不是还原对话顺序；
-//   - MinScore 缺省 0：RRF 分数量级与余弦相似度不可比。
+//   - MinScore 缺省 0：RRF 分与 rerank 分均与余弦相似度不可比。
 func (s *Service) searchDocs(ctx context.Context, req Request) Response {
 	start := time.Now()
 	resp := Response{Results: []Result{}, Degraded: []string{}}
@@ -139,6 +161,14 @@ func (s *Service) searchDocs(ctx context.Context, req Request) Response {
 	}
 	if topK <= 0 {
 		topK = DefaultTopK
+	}
+	overfetch := s.DocsOverfetch
+	if overfetch <= 0 {
+		overfetch = DefaultDocsOverfetch
+	}
+	fetchLimit := topK * overfetch
+	if fetchLimit < topK {
+		fetchLimit = topK
 	}
 	minScore := s.DocsMinScore
 	if req.MinScore != nil {
@@ -176,7 +206,7 @@ func (s *Service) searchDocs(ctx context.Context, req Request) Response {
 		TenantID:     req.TenantID,
 		ThreadID:     req.ThreadID,
 		ExcludeRunID: req.ExcludeRunID,
-	}, topK)
+	}, fetchLimit)
 	searchMS := msSince(searchStart)
 	if err != nil {
 		s.degrade(DegradedVectorFailed, err, req)
@@ -186,24 +216,120 @@ func (s *Service) searchDocs(ctx context.Context, req Request) Response {
 		resp.Timings.TotalMS = msSince(start)
 		return resp
 	}
+
+	// 空文本子块丢弃，其余进入重排/去重管道。
+	children := make([]vector.Hit, 0, len(hits))
 	for _, h := range hits {
-		if minScore > 0 && h.Score < minScore {
-			continue
-		}
 		if h.Text == "" {
 			continue
 		}
+		children = append(children, h)
+	}
+
+	// 可选 cross-encoder 重排：替换 RRF 融合序。任何失败（网络/超时/
+	// 协议异常）降级 rerank_skipped 并保持 RRF 序——读路径契约：重排是
+	// 增强项，它的故障只能让结果"退回次优"，不能让检索失败。
+	rerankMS := float64(0)
+	reranked := false
+	if s.Reranker != nil && len(children) > 1 {
+		rerankStart := time.Now()
+		texts := make([]string, len(children))
+		for i, c := range children {
+			texts[i] = c.Text
+		}
+		rr, rerr := s.Reranker.Rerank(ctx, req.Query, texts, len(texts))
+		rerankMS = msSince(rerankStart)
+		if rerr != nil {
+			s.degrade(DegradedRerankSkipped, rerr, req)
+			resp.Degraded = append(resp.Degraded, DegradedRerankSkipped)
+		} else if aerr := applyRerank(children, rr); aerr != nil {
+			s.degrade(DegradedRerankSkipped, aerr, req)
+			resp.Degraded = append(resp.Degraded, DegradedRerankSkipped)
+		} else {
+			reranked = true
+		}
+	}
+
+	// 阈值过滤。分数语义随重排与否切换：rerank 分与 RRF 分不可比，
+	// 重排生效时只有请求显式携带的 min_score 才参与过滤（服务端缺省
+	// 阈值是按 RRF 分语义配置的，套在 rerank 分上会误杀）。
+	filterScore := minScore
+	if reranked && req.MinScore == nil {
+		filterScore = 0
+	}
+	kept := make([]vector.Hit, 0, len(children))
+	for _, c := range children {
+		if filterScore > 0 && c.Score < filterScore {
+			continue
+		}
+		kept = append(kept, c)
+	}
+
+	// 按 doc_id 去重：kept 已按分数降序，首见即该文档最高分子块。
+	// 无 doc_id 的点（Phase 2 遗留整文档点）按点 ID 自成一类。
+	seenDocs := make(map[string]struct{}, len(kept))
+	deduped := make([]vector.Hit, 0, topK)
+	for _, c := range kept {
+		key := c.DocID
+		if key == "" {
+			key = "point:" + strconv.FormatUint(c.PointID, 10)
+		}
+		if _, dup := seenDocs[key]; dup {
+			continue
+		}
+		seenDocs[key] = struct{}{}
+		deduped = append(deduped, c)
+		if len(deduped) == topK {
+			break
+		}
+	}
+
+	for _, c := range deduped {
+		content := c.ParentText
+		if content == "" {
+			// Phase 2 遗留整文档点无父块概念，退回自身全文。
+			content = c.Text
+		}
 		resp.Results = append(resp.Results, Result{
-			Role:      roleOrUser(h.Role),
-			Content:   h.Text,
-			NodeID:    h.NodeID,
-			RunID:     h.RunID,
-			Score:     h.Score,
-			CreatedAt: h.CreatedAt,
+			Role:      roleOrUser(c.Role),
+			Content:   content,
+			NodeID:    c.NodeID,
+			RunID:     c.RunID,
+			Score:     c.Score,
+			CreatedAt: c.CreatedAt,
+			DocID:     c.DocID,
+			ChunkSeq:  c.ChunkSeq,
 		})
 	}
-	resp.Timings = StageTimings{EmbedMS: embedMS, SearchMS: searchMS, TotalMS: msSince(start)}
+	resp.Timings = StageTimings{EmbedMS: embedMS, SearchMS: searchMS, RerankMS: rerankMS, TotalMS: msSince(start)}
 	return resp
+}
+
+// applyRerank 用重排结果就地重排 children 并覆写分数。
+// rr 必须恰好构成 children 下标的一次完整排列（本管道显式传 topN=
+// len(texts)，后端返回残缺即协议异常），否则报错由调用方降级。
+// 排序不信任后端：自行按分数降序，保证"首见即最高分"的去重前提。
+func applyRerank(children []vector.Hit, rr []rerank.Result) error {
+	if len(rr) != len(children) {
+		return fmt.Errorf("rerank returned %d results for %d texts", len(rr), len(children))
+	}
+	seen := make([]bool, len(children))
+	for _, r := range rr {
+		if r.Index < 0 || r.Index >= len(children) || seen[r.Index] {
+			return fmt.Errorf("rerank result is not a permutation: bad index %d", r.Index)
+		}
+		seen[r.Index] = true
+	}
+	sorted := make([]rerank.Result, len(rr))
+	copy(sorted, rr)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Score > sorted[j].Score })
+	out := make([]vector.Hit, len(children))
+	for i, r := range sorted {
+		out[i] = children[r.Index]
+		out[i].Score = r.Score
+	}
+	copy(children, out)
+	return nil
 }
 
 // searchMemory 执行 memory profile 检索，执行顺序与 runtime VectorMemory.Search 一致：

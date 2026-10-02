@@ -1,0 +1,34 @@
+{"query": "ReAct 引擎的执行循环是怎么工作的？", "expected_doc_ids": ["runtime-react-engine"]}
+{"query": "Plan-and-Execute 的计划 JSON 有哪些字段？", "expected_doc_ids": ["runtime-plan-execute"]}
+{"query": "ContextLoader 如何加载祖先节点重建上下文？", "expected_doc_ids": ["memory-context-loader"]}
+{"query": "开发环境的 docker-compose 编排了哪些服务？", "expected_doc_ids": ["deploy-compose"]}
+{"query": "Bearer 鉴权豁免了哪些端点？", "expected_doc_ids": ["security-auth", "security-probe"]}
+{"query": "recall、MRR、nDCG 这些指标是怎么定义的？", "expected_doc_ids": ["eval-metrics"]}
+{"query": "父块和子块的大小上限分别是多少 rune？", "expected_doc_ids": ["chunk-parent-child"]}
+{"query": "写路径为什么不能把错误吞掉装成功？", "expected_doc_ids": ["write-error-contract"]}
+{"query": "记忆检索失败的时候调用方会看到什么？", "expected_doc_ids": ["rag-degrade-contract", "memory-budget"]}
+{"query": "跨会话还记得之前聊过什么，这是怎么实现的？", "expected_doc_ids": ["memory-vector"]}
+{"query": "重排服务宕机了文档检索还能用吗？", "expected_doc_ids": ["rerank-degrade"]}
+{"query": "同一篇文档提交两次会不会重复消耗嵌入配额？", "expected_doc_ids": ["write-content-hash"]}
+{"query": "换了增强用的模型之后存量文档要重新处理吗？", "expected_doc_ids": ["chunk-ctx-version"]}
+{"query": "子块命中检索后返回给调用方的正文是什么？", "expected_doc_ids": ["chunk-parent-child", "doc-dedup"]}
+{"query": "K8s 的探针为什么必须绕过鉴权？", "expected_doc_ids": ["security-probe"]}
+{"query": "影子对比怎么确认远端真的写成功了？", "expected_doc_ids": ["shadow-compare"]}
+{"query": "评测分数比上一次降低了怎么拦截？", "expected_doc_ids": ["eval-regression"]}
+{"query": "同一个工具调用被重放两次会发生什么？", "expected_doc_ids": ["tool-idempotent"]}
+{"query": "索引器批间休眠五百毫秒是为了配合什么？", "expected_doc_ids": ["write-indexer"]}
+{"query": "点 ID 派生取 SHA-256 的前八字节再怎么转换？", "expected_doc_ids": ["write-point-id"]}
+{"query": "纯符号的查询编不出稀疏词项时如何处理？", "expected_doc_ids": ["hybrid-sparse-dense"]}
+{"query": "指标回退超过两个百分点会怎样？", "expected_doc_ids": ["eval-regression"]}
+{"query": "读路径和写路径的错误处理方向有什么不同？", "expected_doc_ids": ["rag-degrade-contract", "write-error-contract"]}
+{"query": "memory profile 和 docs profile 的延迟预算分别是多少？", "expected_doc_ids": ["rag-memory-profile", "rag-docs-profile"]}
+{"query": "记忆集合和文档集合的向量布局有什么区别？", "expected_doc_ids": ["deploy-qdrant"]}
+{"query": "LLM 上下文增强失败了写入会怎样？", "expected_doc_ids": ["chunk-contextual-enhance"]}
+{"query": "cross-encoder 的分数和 RRF 融合分能直接比较吗？", "expected_doc_ids": ["rerank-score-semantics"]}
+{"query": "docs 检索的服务端分数阈值为什么默认是零？", "expected_doc_ids": ["rag-rrf-fusion"]}
+{"query": "缺少租户信息的文档能写入吗？", "expected_doc_ids": ["security-tenant-isolation"]}
+{"query": "集合维度与配置不一致时启动会发生什么？", "expected_doc_ids": ["embed-dim"]}
+{"query": "影子对比日志里出现 MISMATCH 该按什么顺序排查？", "expected_doc_ids": ["faq-troubleshooting"]}
+{"query": "迁移验收的顺序和每一步的关卡是什么？", "expected_doc_ids": ["guide-migration"]}
+{"query": "值班时发现检索质量下降先做什么？", "expected_doc_ids": ["handbook-oncall"]}
+{"query": "记忆集合的布局为什么不能改成命名向量？", "expected_doc_ids": ["spec-collection-layout"]}

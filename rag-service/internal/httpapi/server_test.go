@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daqiaoliang-coder/rag-service/internal/chunk"
 	"github.com/daqiaoliang-coder/rag-service/internal/ingest"
 	"github.com/daqiaoliang-coder/rag-service/internal/search"
 	"github.com/daqiaoliang-coder/rag-service/internal/sparse"
@@ -97,6 +98,18 @@ func (f *fakeStore) Delete(_ context.Context, c string, ids ...uint64) error {
 	return nil
 }
 
+func (f *fakeStore) DeleteByDocID(_ context.Context, c, tenantID, docID string) error {
+	if f.err != nil {
+		return f.err
+	}
+	for id, p := range f.points[c] {
+		if p.TenantID == tenantID && p.DocID == docID {
+			delete(f.points[c], id)
+		}
+	}
+	return nil
+}
+
 func (f *fakeStore) Retrieve(_ context.Context, c string, ids []uint64) (map[uint64]vector.RetrievedDoc, error) {
 	if f.err != nil {
 		return nil, f.err
@@ -107,6 +120,7 @@ func (f *fakeStore) Retrieve(_ context.Context, c string, ids []uint64) (map[uin
 			out[id] = vector.RetrievedDoc{
 				ID: p.ID, TenantID: p.TenantID, Text: p.Text, ContentHash: p.ContentHash,
 				CreatedAt: p.CreatedAt, Role: p.Role, NodeID: p.NodeID, RunID: p.RunID, ThreadID: p.ThreadID,
+				DocID: p.DocID, ChunkSeq: p.ChunkSeq, ParentText: p.ParentText,
 			}
 		}
 	}
@@ -270,8 +284,8 @@ func TestSearchDocsProfileKeepsRelevanceOrder(t *testing.T) {
 	// 融合分降序构造：分数高的文档 created_at 更旧。
 	// docs profile 必须保持相关性顺序，不按时间重排（与 memory 的关键差异）。
 	hy := &stubHybridSearcher{hits: []vector.Hit{
-		{Text: "most relevant", Role: "assistant", NodeID: "n2", Score: 0.031, CreatedAt: now.Add(-time.Hour)},
-		{Text: "less relevant", Role: "user", NodeID: "n1", Score: 0.016, CreatedAt: now},
+		{PointID: 1, Text: "most relevant", Role: "assistant", NodeID: "n2", Score: 0.031, CreatedAt: now.Add(-time.Hour)},
+		{PointID: 2, Text: "less relevant", Role: "user", NodeID: "n1", Score: 0.016, CreatedAt: now},
 	}}
 	h := New(newTestService(&stubSearcher{}, hy), newTestIngest(), "", stubHealth{})
 	rec := do(h, http.MethodPost, "/v1/search", "", `{
@@ -449,5 +463,59 @@ func TestDeleteDocumentIdempotent(t *testing.T) {
 	// 未知集合 → 404。
 	if rec := do(h, http.MethodDelete, "/v1/collections/other/documents/1", "", ""); rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown collection: want 404, got %d", rec.Code)
+	}
+}
+
+// ==== docs 集合端点分发（Phase 3） ====
+
+// TestDocsDocumentEndpoints docs 集合的 GET/DELETE 走逻辑 ID + tenant_id
+// 参数分发：缺租户 400（子块点 ID 派生缺它不可）；带租户正常；
+// 跨租户查询 found:false（隔离，探测不到他租户文档存在性）。
+func TestDocsDocumentEndpoints(t *testing.T) {
+	h := newTestHandler("", &stubSearcher{})
+	// docs ID 是任意非空逻辑标识（此处 "faq-deploy"），无需十进制。
+	if rec := do(h, http.MethodPost, "/v1/collections/rag_documents/documents", "", upsertDoc("faq-deploy", "部署手册内容。")); rec.Code != http.StatusOK {
+		t.Fatalf("seed docs upsert: %d: %s", rec.Code, rec.Body.String())
+	}
+	// GET 缺 tenant_id → 400。
+	if rec := do(h, http.MethodGet, "/v1/collections/rag_documents/documents/faq-deploy", "", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("GET without tenant_id: want 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// GET 带正确租户 → found:true。
+	if rec := do(h, http.MethodGet, "/v1/collections/rag_documents/documents/faq-deploy?tenant_id=t1", "", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"found":true`) {
+		t.Fatalf("GET with tenant: want 200 found:true, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// 跨租户 → found:false。
+	if rec := do(h, http.MethodGet, "/v1/collections/rag_documents/documents/faq-deploy?tenant_id=other", "", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"found":false`) {
+		t.Fatalf("cross-tenant GET: want 200 found:false, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// DELETE 缺 tenant_id → 400。
+	if rec := do(h, http.MethodDelete, "/v1/collections/rag_documents/documents/faq-deploy", "", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("DELETE without tenant_id: want 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// DELETE 带租户 → deleted:true；重复删除 → 幂等 deleted:false。
+	if rec := do(h, http.MethodDelete, "/v1/collections/rag_documents/documents/faq-deploy?tenant_id=t1", "", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"deleted":true`) {
+		t.Fatalf("DELETE with tenant: want 200 deleted:true, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := do(h, http.MethodDelete, "/v1/collections/rag_documents/documents/faq-deploy?tenant_id=t1", "", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"deleted":false`) {
+		t.Fatalf("repeated DELETE: want 200 deleted:false, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// 删除后再 GET → found:false。
+	if rec := do(h, http.MethodGet, "/v1/collections/rag_documents/documents/faq-deploy?tenant_id=t1", "", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"found":false`) {
+		t.Fatalf("GET after delete: want 200 found:false, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestUpsertDocsTooManyChunks 单请求子块数超上限 → 400（同步管道时长护栏
+// 是请求侧可修正的错误，而非后端故障）。
+func TestUpsertDocsTooManyChunks(t *testing.T) {
+	ing := newTestIngest()
+	ing.MaxChunksPerRequest = 1
+	// 小块上限让短内容也产出多子块。
+	ing.ChunkConfig = chunk.Config{ParentSize: 30, ChildSize: 10}
+	h := New(newTestService(&stubSearcher{}, nil), ing, "", stubHealth{})
+	body := `{"documents": [{"id": "long-doc", "content": "第一段内容。第二段内容。第三段内容。", "metadata": {"tenant_id": "t1"}}]}`
+	if rec := do(h, http.MethodPost, "/v1/collections/rag_documents/documents", "", body); rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 for too many chunks, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

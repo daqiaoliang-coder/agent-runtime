@@ -187,7 +187,9 @@ func (q *Qdrant) EnsureDocsCollection(ctx context.Context, collection string, di
 		if p, ok := params[VectorNameDense]; ok && int(p.GetSize()) != dim {
 			return fmt.Errorf("vector: collection %q dense dim %d != RAG_EMBED_DIM %d; align config or rebuild the index", collection, p.GetSize(), dim)
 		}
-		return q.ensurePayloadIndexes(ctx, collection)
+		// 既有集合也补 doc_id 索引：Phase 2 建的 docs 集合没有它，
+		// 升级后首个 EnsureDocsCollection 调用会幂等补齐（已是预期状态则吞掉）。
+		return q.ensurePayloadIndexes(ctx, collection, PayloadDocID)
 	}
 	if err := q.client.CreateCollection(ctx, &qdrant.CreateCollection{
 		CollectionName: collection,
@@ -200,12 +202,15 @@ func (q *Qdrant) EnsureDocsCollection(ctx context.Context, collection string, di
 	}); err != nil {
 		return fmt.Errorf("vector: create docs collection %q: %w", collection, err)
 	}
-	return q.ensurePayloadIndexes(ctx, collection)
+	// doc_id 索引：DeleteByDocID 的过滤删除依赖它（Phase 3 子块布局）。
+	return q.ensurePayloadIndexes(ctx, collection, PayloadDocID)
 }
 
 // ensurePayloadIndexes 为隔离键建 keyword 索引；"已存在"错误被吞掉（预期状态）。
-func (q *Qdrant) ensurePayloadIndexes(ctx context.Context, collection string) error {
-	for _, field := range []string{PayloadTenantID, PayloadThreadID, PayloadRunID, PayloadNodeID} {
+// extra 用于集合专属键（docs 布局的 doc_id：filter 删除依赖该索引）。
+func (q *Qdrant) ensurePayloadIndexes(ctx context.Context, collection string, extra ...string) error {
+	fields := append([]string{PayloadTenantID, PayloadThreadID, PayloadRunID, PayloadNodeID}, extra...)
+	for _, field := range fields {
 		ft := qdrant.FieldType_FieldTypeKeyword
 		if _, err := q.client.CreateFieldIndex(ctx, &qdrant.CreateFieldIndexCollection{
 			CollectionName: collection,
@@ -226,8 +231,10 @@ func isAlreadyIndexed(err error) bool {
 func boolPtr(b bool) *bool { return &b }
 
 // docPayload 展开 DocPoint 的 payload：runtime 契约键 + content_hash。
+// Phase 3 子块键（doc_id/chunk_seq/parent_text）仅在 DocID 非空时写入，
+// memory 路径的 payload 与 runtime 直连写入完全一致（影子对比前提）。
 func docPayload(p DocPoint) map[string]any {
-	return map[string]any{
+	m := map[string]any{
 		PayloadTenantID:    p.TenantID,
 		PayloadThreadID:    p.ThreadID,
 		PayloadRunID:       p.RunID,
@@ -237,6 +244,12 @@ func docPayload(p DocPoint) map[string]any {
 		PayloadCreatedAt:   p.CreatedAt.UnixNano(),
 		PayloadContentHash: p.ContentHash,
 	}
+	if p.DocID != "" {
+		m[PayloadDocID] = p.DocID
+		m[PayloadChunkSeq] = int64(p.ChunkSeq)
+		m[PayloadParentText] = p.ParentText
+	}
+	return m
 }
 
 // UpsertDefault 以未命名向量写入（memory 布局），wait=true 保证
@@ -346,9 +359,33 @@ func (q *Qdrant) Retrieve(ctx context.Context, collection string, ids []uint64) 
 			Text:        p[PayloadText].GetStringValue(),
 			CreatedAt:   time.Unix(0, p[PayloadCreatedAt].GetIntegerValue()),
 			ContentHash: p[PayloadContentHash].GetStringValue(),
+			DocID:       p[PayloadDocID].GetStringValue(),
+			ChunkSeq:    int(p[PayloadChunkSeq].GetIntegerValue()),
+			ParentText:  p[PayloadParentText].GetStringValue(),
 		}
 	}
 	return out, nil
+}
+
+// DeleteByDocID 按 (tenant, docID) 过滤删除该文档的全部子块点。
+// 与 Delete 的区别：文档更新后子块数量可能变化，按 ID 删除会留下
+// 序号超出新块数的孤儿点，必须按 doc_id 整删。幂等（无匹配也成功）。
+func (q *Qdrant) DeleteByDocID(ctx context.Context, collection, tenantID, docID string) error {
+	if docID == "" {
+		return fmt.Errorf("vector: delete by empty doc_id")
+	}
+	flt := &qdrant.Filter{Must: []*qdrant.Condition{
+		qdrant.NewMatchKeyword(PayloadTenantID, tenantID),
+		qdrant.NewMatchKeyword(PayloadDocID, docID),
+	}}
+	if _, err := q.client.Delete(ctx, &qdrant.DeletePoints{
+		CollectionName: collection,
+		Wait:           boolPtr(true),
+		Points:         qdrant.NewPointsSelectorFilter(flt),
+	}); err != nil {
+		return fmt.Errorf("vector: delete by doc_id %q from %q: %w", docID, collection, err)
+	}
+	return nil
 }
 
 // HybridSearch 混合检索：dense 与 sparse 各自 prefetch，服务端 RRF 融合。
@@ -404,15 +441,18 @@ func (q *Qdrant) HybridSearch(ctx context.Context, collection string, dense []fl
 		}
 		p := h.GetPayload()
 		out = append(out, Hit{
-			Score:     h.GetScore(),
-			PointID:   pointIDFromPB(h.GetId()),
-			TenantID:  p[PayloadTenantID].GetStringValue(),
-			ThreadID:  p[PayloadThreadID].GetStringValue(),
-			RunID:     p[PayloadRunID].GetStringValue(),
-			NodeID:    p[PayloadNodeID].GetStringValue(),
-			Role:      p[PayloadRole].GetStringValue(),
-			Text:      p[PayloadText].GetStringValue(),
-			CreatedAt: time.Unix(0, p[PayloadCreatedAt].GetIntegerValue()),
+			Score:      h.GetScore(),
+			PointID:    pointIDFromPB(h.GetId()),
+			TenantID:   p[PayloadTenantID].GetStringValue(),
+			ThreadID:   p[PayloadThreadID].GetStringValue(),
+			RunID:      p[PayloadRunID].GetStringValue(),
+			NodeID:     p[PayloadNodeID].GetStringValue(),
+			Role:       p[PayloadRole].GetStringValue(),
+			Text:       p[PayloadText].GetStringValue(),
+			CreatedAt:  time.Unix(0, p[PayloadCreatedAt].GetIntegerValue()),
+			DocID:      p[PayloadDocID].GetStringValue(),
+			ChunkSeq:   int(p[PayloadChunkSeq].GetIntegerValue()),
+			ParentText: p[PayloadParentText].GetStringValue(),
 		})
 	}
 	return out, nil

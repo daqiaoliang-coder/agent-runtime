@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/daqiaoliang-coder/rag-service/internal/embed"
+	"github.com/daqiaoliang-coder/rag-service/internal/rerank"
 	"github.com/daqiaoliang-coder/rag-service/internal/sparse"
 	"github.com/daqiaoliang-coder/rag-service/internal/vector"
 )
@@ -238,9 +239,9 @@ func newTestDocsService(e embed.Embedder, h vector.HybridSearcher) *Service {
 func TestSearchDocsKeepsRelevanceOrder(t *testing.T) {
 	now := time.Now()
 	hy := &fakeHybridSearcher{hits: []vector.Hit{
-		{Text: "best match", Role: "assistant", NodeID: "n9", Score: 0.031, CreatedAt: now.Add(-2 * time.Hour)},
-		{Text: "second", Role: "user", NodeID: "n5", Score: 0.025, CreatedAt: now.Add(-time.Hour)},
-		{Text: "third", Role: "user", NodeID: "n1", Score: 0.016, CreatedAt: now},
+		{PointID: 1, Text: "best match", Role: "assistant", NodeID: "n9", Score: 0.031, CreatedAt: now.Add(-2 * time.Hour)},
+		{PointID: 2, Text: "second", Role: "user", NodeID: "n5", Score: 0.025, CreatedAt: now.Add(-time.Hour)},
+		{PointID: 3, Text: "third", Role: "user", NodeID: "n1", Score: 0.016, CreatedAt: now},
 	}}
 	svc := newTestDocsService(fakeEmbedder{vecs: [][]float32{{0.1}}}, hy)
 	resp := svc.Search(context.Background(), Request{Profile: ProfileDocs, Query: "部署手册", TenantID: "t1"})
@@ -272,7 +273,8 @@ func TestSearchDocsMinScoreDefaultsToZero(t *testing.T) {
 	}
 }
 
-// TestSearchDocsPassesFilterAndTopK 隔离过滤与 topK 必须透传到混合检索层，
+// TestSearchDocsPassesFilterAndTopK 隔离过滤必须透传到混合检索层；
+// 检索条数是过采样语义（topK×overfetch，Phase 3 去重管道的前提），
 // sparse 查询向量必须已编码（非空）。
 func TestSearchDocsPassesFilterAndTopK(t *testing.T) {
 	hy := &fakeHybridSearcher{}
@@ -290,8 +292,10 @@ func TestSearchDocsPassesFilterAndTopK(t *testing.T) {
 	if hy.lastFilter.TenantID != "t1" || hy.lastFilter.ThreadID != "th1" || hy.lastFilter.ExcludeRunID != "run-current" {
 		t.Fatalf("filter not passed through: %+v", hy.lastFilter)
 	}
-	if hy.lastTopK != 5 {
-		t.Fatalf("want topK=5, got %d", hy.lastTopK)
+	// DocsOverfetch 未配置 → 缺省 4：混合检索取 5×4=20 个子块，
+	// 去重后才截断为 topK=5 篇文档。
+	if hy.lastTopK != 20 {
+		t.Fatalf("want fetch limit 20 (topK=5 × overfetch=4), got %d", hy.lastTopK)
 	}
 	if len(hy.lastDense) != 2 {
 		t.Fatalf("dense vector not passed through, got %v", hy.lastDense)
@@ -371,5 +375,286 @@ func TestSearchDocsNotConfiguredReturnsEmpty(t *testing.T) {
 	resp := svc.Search(context.Background(), Request{Profile: ProfileDocs, Query: "q", TenantID: "t1"})
 	if len(resp.Results) != 0 || len(resp.Degraded) != 0 {
 		t.Fatalf("want empty response, got %+v", resp)
+	}
+}
+
+// ==== docs profile（Phase 3：rerank + 父块去重） ====
+
+// fakeReranker 记录透传参数，可注入错误、自定义打分或自定义结果集
+// （结果集非 nil 时直接透传，用于构造协议异常）。
+type fakeReranker struct {
+	err     error
+	scores  []float32 // 与输入 texts 下标对应；nil 时按输入序恒等排列
+	results []rerank.Result
+	calls     int
+	lastQuery string
+	lastTexts []string
+	lastTopN  int
+}
+
+func (f *fakeReranker) Rerank(_ context.Context, query string, texts []string, topN int) ([]rerank.Result, error) {
+	f.calls++
+	f.lastQuery = query
+	f.lastTexts = texts
+	f.lastTopN = topN
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.results != nil {
+		return f.results, nil
+	}
+	out := make([]rerank.Result, len(texts))
+	for i := range texts {
+		s := float32(len(texts) - i)
+		if f.scores != nil {
+			s = f.scores[i]
+		}
+		out[i] = rerank.Result{Index: i, Score: s}
+	}
+	return out, nil
+}
+
+// TestSearchDocsRerankReorders cross-encoder 分替换 RRF 融合序：低 RRF 分
+// 子块可被提到首位，Score 覆写为 rerank 分。重排输入必须是子块文本
+// （small-to-big：child 命中检索，parent 只作出上下文返回时的内容）。
+func TestSearchDocsRerankReorders(t *testing.T) {
+	now := time.Now()
+	hy := &fakeHybridSearcher{hits: []vector.Hit{
+		{PointID: 1, Text: "chunk a", DocID: "doc-a", ChunkSeq: 0, Score: 0.031, CreatedAt: now},
+		{PointID: 2, Text: "chunk b", DocID: "doc-b", ChunkSeq: 0, Score: 0.025, CreatedAt: now},
+		{PointID: 3, Text: "chunk c", DocID: "doc-c", ChunkSeq: 0, Score: 0.016, CreatedAt: now},
+	}}
+	// rerank 视角：b 最相关，a 最不相关——与 RRF 序完全相反。
+	rr := &fakeReranker{scores: []float32{0.1, 0.9, 0.5}}
+	svc := newTestDocsService(fakeEmbedder{vecs: [][]float32{{1}}}, hy)
+	svc.Reranker = rr
+	resp := svc.Search(context.Background(), Request{Profile: ProfileDocs, Query: "部署手册", TenantID: "t1"})
+	if len(resp.Degraded) != 0 {
+		t.Fatalf("want no degradation, got %v", resp.Degraded)
+	}
+	want := []struct {
+		content string
+		score   float32
+	}{
+		{"chunk b", 0.9},
+		{"chunk c", 0.5},
+		{"chunk a", 0.1},
+	}
+	if len(resp.Results) != len(want) {
+		t.Fatalf("want %d results, got %d: %+v", len(want), len(resp.Results), resp.Results)
+	}
+	for i, w := range want {
+		if resp.Results[i].Content != w.content || resp.Results[i].Score != w.score {
+			t.Fatalf("result[%d]: want (%s,%v), got (%s,%v)",
+				i, w.content, w.score, resp.Results[i].Content, resp.Results[i].Score)
+		}
+	}
+	if rr.calls != 1 {
+		t.Fatalf("want exactly 1 rerank call, got %d", rr.calls)
+	}
+	if rr.lastQuery != "部署手册" {
+		t.Fatalf("query not passed through: %q", rr.lastQuery)
+	}
+	if len(rr.lastTexts) != 3 || rr.lastTexts[0] != "chunk a" {
+		t.Fatalf("rerank input must be child texts: %v", rr.lastTexts)
+	}
+	if rr.lastTopN != 3 {
+		t.Fatalf("topN must cover all candidates, got %d", rr.lastTopN)
+	}
+}
+
+// TestSearchDocsRerankFailureDegrades rerank 传输错误与协议异常（残缺排列）
+// 均降级 rerank_skipped，保持 RRF 融合序与原始分数——重排是增强项，
+// 其故障只能退回次优，不能让检索失败。
+func TestSearchDocsRerankFailureDegrades(t *testing.T) {
+	now := time.Now()
+	hits := []vector.Hit{
+		{PointID: 1, Text: "a", DocID: "doc-a", Score: 0.031, CreatedAt: now},
+		{PointID: 2, Text: "b", DocID: "doc-b", Score: 0.025, CreatedAt: now},
+	}
+	cases := []struct {
+		name string
+		rr   *fakeReranker
+	}{
+		{"transport error", &fakeReranker{err: errors.New("tei timeout")}},
+		{"incomplete permutation", &fakeReranker{results: []rerank.Result{{Index: 0, Score: 0.9}}}},
+	}
+	for _, tc := range cases {
+		hy := &fakeHybridSearcher{hits: hits}
+		svc := newTestDocsService(fakeEmbedder{vecs: [][]float32{{1}}}, hy)
+		svc.Reranker = tc.rr
+		resp := svc.Search(context.Background(), Request{Profile: ProfileDocs, Query: "部署手册", TenantID: "t1"})
+		if len(resp.Degraded) != 1 || resp.Degraded[0] != DegradedRerankSkipped {
+			t.Fatalf("%s: want degraded=[rerank_skipped], got %v", tc.name, resp.Degraded)
+		}
+		if len(resp.Results) != 2 || resp.Results[0].Content != "a" || resp.Results[1].Content != "b" {
+			t.Fatalf("%s: RRF order must be preserved, got %+v", tc.name, resp.Results)
+		}
+		if resp.Results[0].Score != 0.031 {
+			t.Fatalf("%s: original RRF score must be kept, got %v", tc.name, resp.Results[0].Score)
+		}
+	}
+}
+
+// TestSearchDocsRerankerNilDisabled Reranker=nil 表示关闭重排：零外部
+// 调用（nil 装配本身保证），结果保持 RRF 序、无 rerank 降级与耗时。
+func TestSearchDocsRerankerNilDisabled(t *testing.T) {
+	now := time.Now()
+	hy := &fakeHybridSearcher{hits: []vector.Hit{
+		{PointID: 1, Text: "a", DocID: "doc-a", Score: 0.031, CreatedAt: now},
+		{PointID: 2, Text: "b", DocID: "doc-b", Score: 0.025, CreatedAt: now},
+	}}
+	svc := newTestDocsService(fakeEmbedder{vecs: [][]float32{{1}}}, hy)
+	svc.Reranker = nil
+	resp := svc.Search(context.Background(), Request{Profile: ProfileDocs, Query: "部署手册", TenantID: "t1"})
+	if len(resp.Degraded) != 0 {
+		t.Fatalf("want no degradation with rerank disabled, got %v", resp.Degraded)
+	}
+	if len(resp.Results) != 2 || resp.Results[0].Content != "a" {
+		t.Fatalf("RRF order must be preserved, got %+v", resp.Results)
+	}
+	if resp.Timings.RerankMS != 0 {
+		t.Fatalf("rerank_ms must be 0 when disabled, got %v", resp.Timings.RerankMS)
+	}
+}
+
+// TestSearchDocsRerankSkipsSingleCandidate 单子块重排无意义，不触发外部调用。
+func TestSearchDocsRerankSkipsSingleCandidate(t *testing.T) {
+	now := time.Now()
+	hy := &fakeHybridSearcher{hits: []vector.Hit{
+		{PointID: 1, Text: "only", DocID: "doc-a", Score: 0.031, CreatedAt: now},
+	}}
+	rr := &fakeReranker{}
+	svc := newTestDocsService(fakeEmbedder{vecs: [][]float32{{1}}}, hy)
+	svc.Reranker = rr
+	resp := svc.Search(context.Background(), Request{Profile: ProfileDocs, Query: "部署手册", TenantID: "t1"})
+	if rr.calls != 0 {
+		t.Fatalf("single candidate must skip rerank, got %d calls", rr.calls)
+	}
+	if len(resp.Results) != 1 || len(resp.Degraded) != 0 {
+		t.Fatalf("want 1 non-degraded result, got %+v", resp)
+	}
+}
+
+// TestSearchDocsParentDedup 同文档多子块只保留最高分子块，Content 替换为
+// 父块全文（small-to-big）；topK 截断的是去重后的文档数，不是子块数。
+func TestSearchDocsParentDedup(t *testing.T) {
+	now := time.Now()
+	hy := &fakeHybridSearcher{hits: []vector.Hit{
+		// doc-1 两个子块（seq0/seq1）：RRF 序在前的 seq0 是该文档最高分。
+		{PointID: 11, Text: "doc1 child0", ParentText: "doc1 parent full text", DocID: "doc-1", ChunkSeq: 0, Score: 0.031, CreatedAt: now},
+		{PointID: 21, Text: "doc2 child0", ParentText: "doc2 parent full text", DocID: "doc-2", ChunkSeq: 0, Score: 0.025, CreatedAt: now},
+		{PointID: 12, Text: "doc1 child1", ParentText: "doc1 parent full text", DocID: "doc-1", ChunkSeq: 1, Score: 0.02, CreatedAt: now},
+		// 空文本子块丢弃，不参与去重。
+		{PointID: 99, Text: "", ParentText: "blank", DocID: "doc-9", ChunkSeq: 0, Score: 0.019, CreatedAt: now},
+		{PointID: 31, Text: "doc3 child0", ParentText: "doc3 parent full text", DocID: "doc-3", ChunkSeq: 0, Score: 0.01, CreatedAt: now},
+	}}
+	svc := newTestDocsService(fakeEmbedder{vecs: [][]float32{{1}}}, hy)
+	resp := svc.Search(context.Background(), Request{Profile: ProfileDocs, Query: "部署手册", TenantID: "t1"})
+	want := []struct {
+		docID   string
+		content string
+		seq     int
+	}{
+		{"doc-1", "doc1 parent full text", 0},
+		{"doc-2", "doc2 parent full text", 0},
+		{"doc-3", "doc3 parent full text", 0},
+	}
+	if len(resp.Results) != len(want) {
+		t.Fatalf("want %d deduped results, got %d: %+v", len(want), len(resp.Results), resp.Results)
+	}
+	for i, w := range want {
+		got := resp.Results[i]
+		if got.DocID != w.docID || got.Content != w.content || got.ChunkSeq != w.seq {
+			t.Fatalf("result[%d]: want (%s,%s,%d), got (%s,%s,%d)",
+				i, w.docID, w.content, w.seq, got.DocID, got.Content, got.ChunkSeq)
+		}
+	}
+	// topK=2：截断为前 2 篇不同文档。
+	resp = svc.Search(context.Background(), Request{Profile: ProfileDocs, Query: "部署手册", TenantID: "t1", TopK: 2})
+	if len(resp.Results) != 2 || resp.Results[0].DocID != "doc-1" || resp.Results[1].DocID != "doc-2" {
+		t.Fatalf("topK=2 must keep 2 distinct docs, got %+v", resp.Results)
+	}
+}
+
+// TestSearchDocsRerankThenDedup 重排与去重的组合语义：doc-1 的最高分子块
+// 经 rerank 从 seq0 变为 seq1，去重必须保留 rerank 视角的最高分（seq1）。
+func TestSearchDocsRerankThenDedup(t *testing.T) {
+	now := time.Now()
+	hy := &fakeHybridSearcher{hits: []vector.Hit{
+		{PointID: 11, Text: "d1c0", ParentText: "d1 parent", DocID: "doc-1", ChunkSeq: 0, Score: 0.031, CreatedAt: now},
+		{PointID: 21, Text: "d2c0", ParentText: "d2 parent", DocID: "doc-2", ChunkSeq: 0, Score: 0.025, CreatedAt: now},
+		{PointID: 12, Text: "d1c1", ParentText: "d1 parent", DocID: "doc-1", ChunkSeq: 1, Score: 0.02, CreatedAt: now},
+	}}
+	// rerank 分：doc-1/seq1 最高（0.95），doc-1/seq0 最低（0.2）。
+	rr := &fakeReranker{scores: []float32{0.2, 0.5, 0.95}}
+	svc := newTestDocsService(fakeEmbedder{vecs: [][]float32{{1}}}, hy)
+	svc.Reranker = rr
+	resp := svc.Search(context.Background(), Request{Profile: ProfileDocs, Query: "部署手册", TenantID: "t1"})
+	if len(resp.Results) != 2 {
+		t.Fatalf("want 2 distinct docs, got %d: %+v", len(resp.Results), resp.Results)
+	}
+	if resp.Results[0].DocID != "doc-1" || resp.Results[0].ChunkSeq != 1 || resp.Results[0].Score != 0.95 {
+		t.Fatalf("doc-1 must keep rerank-best child (seq1), got %+v", resp.Results[0])
+	}
+	if resp.Results[1].DocID != "doc-2" {
+		t.Fatalf("second result must be doc-2, got %+v", resp.Results[1])
+	}
+}
+
+// TestSearchDocsOverfetchBoundary 过采样倍数边界：显式配置生效；
+// DocsOverfetch=1 退化为 topK（无过采样）；未配置回退缺省 4。
+func TestSearchDocsOverfetchBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		overfetch int
+		topK      int
+		wantLimit int
+	}{
+		{overfetch: 1, topK: 5, wantLimit: 5},
+		{overfetch: 2, topK: 5, wantLimit: 10},
+		{overfetch: 0, topK: 5, wantLimit: 20}, // 未配置 → DefaultDocsOverfetch=4
+	} {
+		hy := &fakeHybridSearcher{}
+		svc := newTestDocsService(fakeEmbedder{vecs: [][]float32{{1}}}, hy)
+		svc.DocsOverfetch = tc.overfetch
+		svc.Search(context.Background(), Request{Profile: ProfileDocs, Query: "部署手册", TenantID: "t1", TopK: tc.topK})
+		if hy.lastTopK != tc.wantLimit {
+			t.Fatalf("overfetch=%d topK=%d: want fetch limit %d, got %d",
+				tc.overfetch, tc.topK, tc.wantLimit, hy.lastTopK)
+		}
+	}
+}
+
+// TestSearchDocsRerankScoreSemantics 重排生效时分数语义切换：rerank 分与
+// RRF 分不可比，服务端 DocsMinScore（按 RRF 语义配置）不得套用在 rerank
+// 分上；只有请求显式携带的 min_score 才参与过滤。
+func TestSearchDocsRerankScoreSemantics(t *testing.T) {
+	now := time.Now()
+	hits := []vector.Hit{
+		{PointID: 1, Text: "a", DocID: "doc-a", Score: 0.031, CreatedAt: now},
+		{PointID: 2, Text: "b", DocID: "doc-b", Score: 0.025, CreatedAt: now},
+	}
+	// rerank 分刻意压到远低于 DocsMinScore 的量级：若误套服务端阈值会清空结果。
+	rr := &fakeReranker{scores: []float32{0.001, 0.002}}
+
+	// 未显式传 min_score：DocsMinScore=0.02 不套用，低 rerank 分保留。
+	hy := &fakeHybridSearcher{hits: hits}
+	svc := newTestDocsService(fakeEmbedder{vecs: [][]float32{{1}}}, hy)
+	svc.Reranker = rr
+	svc.DocsMinScore = 0.02
+	resp := svc.Search(context.Background(), Request{Profile: ProfileDocs, Query: "部署手册", TenantID: "t1"})
+	if len(resp.Results) != 2 {
+		t.Fatalf("server-side DocsMinScore must not apply to rerank scores, got %d results: %+v", len(resp.Results), resp.Results)
+	}
+
+	// 显式传 min_score：按请求语义过滤（0.0015 介于两个 rerank 分之间）。
+	hy2 := &fakeHybridSearcher{hits: hits}
+	svc2 := newTestDocsService(fakeEmbedder{vecs: [][]float32{{1}}}, hy2)
+	svc2.Reranker = rr
+	svc2.DocsMinScore = 0.02
+	explicit := float32(0.0015)
+	resp2 := svc2.Search(context.Background(), Request{Profile: ProfileDocs, Query: "部署手册", TenantID: "t1", MinScore: &explicit})
+	if len(resp2.Results) != 1 || resp2.Results[0].Content != "b" {
+		t.Fatalf("explicit min_score must filter rerank scores, got %+v", resp2.Results)
 	}
 }

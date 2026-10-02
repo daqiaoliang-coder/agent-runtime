@@ -3,10 +3,13 @@ package ingest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/daqiaoliang-coder/rag-service/internal/chunk"
 	"github.com/daqiaoliang-coder/rag-service/internal/sparse"
 	"github.com/daqiaoliang-coder/rag-service/internal/vector"
 )
@@ -15,11 +18,12 @@ import (
 type fakeWriter struct {
 	collections map[string]map[uint64]vector.DocPoint
 
-	defaultCalls int
-	hybridCalls  int
-	retrieveErr  error
-	upsertErr    error
-	deleteErr    error
+	defaultCalls       int
+	hybridCalls        int
+	deleteByDocIDCalls int
+	retrieveErr        error
+	upsertErr          error
+	deleteErr          error
 }
 
 func newFakeWriter() *fakeWriter {
@@ -66,6 +70,20 @@ func (f *fakeWriter) Delete(_ context.Context, c string, ids ...uint64) error {
 	return nil
 }
 
+// deleteByDocIDCalls 统计过滤删除调用（docs 路径删除走这里而非按 ID 删）。
+func (f *fakeWriter) DeleteByDocID(_ context.Context, c, tenantID, docID string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.deleteByDocIDCalls++
+	for id, p := range f.collections[c] {
+		if p.TenantID == tenantID && p.DocID == docID {
+			delete(f.collections[c], id)
+		}
+	}
+	return nil
+}
+
 func (f *fakeWriter) Retrieve(_ context.Context, c string, ids []uint64) (map[uint64]vector.RetrievedDoc, error) {
 	if f.retrieveErr != nil {
 		return nil, f.retrieveErr
@@ -76,7 +94,8 @@ func (f *fakeWriter) Retrieve(_ context.Context, c string, ids []uint64) (map[ui
 			out[id] = vector.RetrievedDoc{
 				ID: p.ID, TenantID: p.TenantID, ThreadID: p.ThreadID, RunID: p.RunID,
 				NodeID: p.NodeID, Role: p.Role, Text: p.Text, CreatedAt: p.CreatedAt,
-				ContentHash: p.ContentHash,
+				ContentHash: p.ContentHash, DocID: p.DocID, ChunkSeq: p.ChunkSeq,
+				ParentText: p.ParentText,
 			}
 		}
 	}
@@ -87,6 +106,7 @@ func (f *fakeWriter) Retrieve(_ context.Context, c string, ids []uint64) (map[ui
 type countingEmbedder struct {
 	calls int
 	lastN int
+	sizes []int // 每次 Embed 调用的文本数（子批断言用）
 	err   error
 	empty bool // 返回与入参不等长的向量，模拟网关异常
 }
@@ -94,6 +114,7 @@ type countingEmbedder struct {
 func (e *countingEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
 	e.calls++
 	e.lastN = len(texts)
+	e.sizes = append(e.sizes, len(texts))
 	if e.err != nil {
 		return nil, e.err
 	}
@@ -203,9 +224,20 @@ func TestUpsert_DocsLayoutIsHybrid(t *testing.T) {
 	if w.hybridCalls != 1 || w.defaultCalls != 0 {
 		t.Fatalf("docs collection must use hybrid layout, got default=%d hybrid=%d", w.defaultCalls, w.hybridCalls)
 	}
-	p := w.collections["rag_documents"][9]
+	// Phase 3：docs 集合是 parent-child 分块，点 ID 由 (tenant|docID|seq)
+	// 派生，不再是文档自身的 uint64 ID。
+	p, ok := w.collections["rag_documents"][childPointID("t1", "9", 0)]
+	if !ok {
+		t.Fatalf("child0 point not found at derived id %d", childPointID("t1", "9", 0))
+	}
 	if p.Sparse == nil || len(p.Sparse.Indices) == 0 {
 		t.Fatal("docs layout must carry sparse vector")
+	}
+	if p.DocID != "9" || p.ChunkSeq != 0 || p.ParentText != "部署文档 数据库" {
+		t.Fatalf("chunk payload wrong: doc_id=%q chunk_seq=%d parent=%q", p.DocID, p.ChunkSeq, p.ParentText)
+	}
+	if p.ContentHash == "" {
+		t.Fatal("doc-level content_hash must be stored")
 	}
 }
 
@@ -300,17 +332,44 @@ func TestDelete_Idempotent(t *testing.T) {
 func TestGet(t *testing.T) {
 	w := newFakeWriter()
 	svc := newTestService(w, &countingEmbedder{})
-	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{doc(5, "文档内容")}); err != nil {
+	if _, err := svc.Upsert(context.Background(), "agent_memory", []Document{doc(5, "文档内容")}); err != nil {
 		t.Fatal(err)
 	}
-	got, found, err := svc.Get(context.Background(), "rag_documents", 5)
+	got, found, err := svc.Get(context.Background(), "agent_memory", 5)
 	if err != nil || !found {
 		t.Fatalf("want found, got (%v,%v)", found, err)
 	}
 	if got.Text != "文档内容" || got.TenantID != "t1" || got.ContentHash == "" {
 		t.Fatalf("unexpected doc: %+v", got)
 	}
-	if _, found, err := svc.Get(context.Background(), "rag_documents", 999); err != nil || found {
+	if _, found, err := svc.Get(context.Background(), "agent_memory", 999); err != nil || found {
+		t.Fatalf("missing doc: want (false,nil), got (%v,%v)", found, err)
+	}
+}
+
+func TestGetDoc(t *testing.T) {
+	w := newFakeWriter()
+	svc := newTestService(w, &countingEmbedder{})
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{doc(5, "文档内容")}); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := svc.GetDoc(context.Background(), "rag_documents", "t1", "5")
+	if err != nil || !found {
+		t.Fatalf("want found, got (%v,%v)", found, err)
+	}
+	if got.Text != "文档内容" || got.TenantID != "t1" || got.DocID != "5" || got.ChunkSeq != 0 {
+		t.Fatalf("unexpected doc: %+v", got)
+	}
+	// 缺 tenant：无法派生 child ID → ErrTenantRequired（httpapi 映射 400）。
+	if _, _, err := svc.GetDoc(context.Background(), "rag_documents", "", "5"); !errors.Is(err, ErrTenantRequired) {
+		t.Fatalf("want ErrTenantRequired, got %v", err)
+	}
+	// 租户隔离：别的租户派生出不同 ID → 查不到。
+	if _, found, err := svc.GetDoc(context.Background(), "rag_documents", "other", "5"); err != nil || found {
+		t.Fatalf("other tenant: want (false,nil), got (%v,%v)", found, err)
+	}
+	// 未写入的文档 → found=false。
+	if _, found, err := svc.GetDoc(context.Background(), "rag_documents", "t1", "999"); err != nil || found {
 		t.Fatalf("missing doc: want (false,nil), got (%v,%v)", found, err)
 	}
 }
@@ -332,5 +391,247 @@ func TestUpsert_PartialSkip(t *testing.T) {
 	}
 	if resp.Indexed != 1 || resp.Skipped != 1 {
 		t.Fatalf("want indexed=1 skipped=1, got %+v", resp)
+	}
+}
+
+// ==== docs 路径（Phase 3：分块 + 上下文增强） ====
+
+// spyEnhancer 记录调用并可注入错误。
+type spyEnhancer struct {
+	calls int
+	err   error
+}
+
+func (s *spyEnhancer) Enhance(_ context.Context, _ Document, _ chunk.Chunk) (string, error) {
+	s.calls++
+	if s.err != nil {
+		return "", s.err
+	}
+	return "PREFIX-" + strconv.Itoa(s.calls), nil
+}
+
+func TestUpsert_DocsChunking(t *testing.T) {
+	w := newFakeWriter()
+	svc := newTestService(w, &countingEmbedder{})
+	// 多父块多子块：60 句 ≈ 1300+ rune → 2 个 parent、多个 child。
+	var sb strings.Builder
+	for i := 0; i < 60; i++ {
+		fmt.Fprintf(&sb, "这是第 %d 句话，用来把文档撑到跨父块与多子块的规模。", i)
+	}
+	content := sb.String()
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{doc(1, content)}); err != nil {
+		t.Fatal(err)
+	}
+	points := w.collections["rag_documents"]
+	if len(points) < 3 {
+		t.Fatalf("want multi-chunk doc, got %d chunks", len(points))
+	}
+	// 全部子块共享文档级 hash（child0 是幂等锚）；seq 从 0 连续编号；
+	// 点 ID 与派生规则一致；parent_text 非空。
+	var firstHash string
+	seqs := map[int]bool{}
+	parents := map[string]bool{}
+	for id, p := range points {
+		if p.DocID != "1" {
+			t.Fatalf("unexpected doc_id %q", p.DocID)
+		}
+		if firstHash == "" {
+			firstHash = p.ContentHash
+		} else if p.ContentHash != firstHash {
+			t.Fatalf("all chunks must share doc-level hash, got %q vs %q", p.ContentHash, firstHash)
+		}
+		if want := childPointID("t1", "1", p.ChunkSeq); id != want {
+			t.Fatalf("point id %d != derived %d for seq %d", id, want, p.ChunkSeq)
+		}
+		if p.ParentText == "" {
+			t.Fatal("parent_text must be stored on every child")
+		}
+		parents[p.ParentText] = true
+		seqs[p.ChunkSeq] = true
+	}
+	for i := 0; i < len(seqs); i++ {
+		if !seqs[i] {
+			t.Fatalf("chunk seq %d missing, got %v", i, seqs)
+		}
+	}
+	if len(parents) < 2 {
+		t.Fatalf("want multi-parent doc, got %d parents", len(parents))
+	}
+}
+
+func TestUpsert_DocsIdempotentSkip(t *testing.T) {
+	w := newFakeWriter()
+	e := &countingEmbedder{}
+	svc := newTestService(w, e)
+	d := doc(1, "值得记住的一句话。")
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{d}); err != nil {
+		t.Fatal(err)
+	}
+	// 同文档重放：不重嵌、不触发删除。
+	resp, err := svc.Upsert(context.Background(), "rag_documents", []Document{d})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.calls != 1 {
+		t.Fatalf("replay must skip embedding, got %d calls", e.calls)
+	}
+	if w.deleteByDocIDCalls != 0 {
+		t.Fatalf("replay must not delete, got %d calls", w.deleteByDocIDCalls)
+	}
+	if resp.Skipped != 1 || resp.Indexed != 0 {
+		t.Fatalf("want skipped=1 indexed=0, got %+v", resp)
+	}
+}
+
+func TestUpsert_DocsContentChangeCleansOrphans(t *testing.T) {
+	w := newFakeWriter()
+	svc := newTestService(w, &countingEmbedder{})
+	// v1 多子块 → v2 单子块：新子块数少于旧子块，必须整删后重写。
+	long := strings.Repeat("一句用于撑长文档的话。", 60)
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{doc(1, long)}); err != nil {
+		t.Fatal(err)
+	}
+	if before := len(w.collections["rag_documents"]); before < 2 {
+		t.Fatalf("want multi-chunk v1, got %d", before)
+	}
+	resp, err := svc.Upsert(context.Background(), "rag_documents", []Document{doc(1, "短文本。")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.deleteByDocIDCalls != 1 {
+		t.Fatalf("stale doc must be deleted by doc_id, got %d calls", w.deleteByDocIDCalls)
+	}
+	if after := len(w.collections["rag_documents"]); after != 1 {
+		t.Fatalf("orphan chunks must be cleaned, want 1 point, got %d", after)
+	}
+	if resp.Indexed != 1 || resp.Chunks != 1 {
+		t.Fatalf("want indexed=1 chunks=1, got %+v", resp)
+	}
+}
+
+func TestUpsert_DocsCtxVersionForcesReembed(t *testing.T) {
+	w := newFakeWriter()
+	e := &countingEmbedder{}
+	svc := newTestService(w, e)
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{doc(1, "同样的内容。")}); err != nil {
+		t.Fatal(err)
+	}
+	// 改分块参数：ctxVersion 变 → 文档级 hash 变 → 同内容强制重嵌。
+	svc.ChunkConfig = chunk.Config{ParentSize: 600, ChildSize: 200}
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{doc(1, "同样的内容。")}); err != nil {
+		t.Fatal(err)
+	}
+	if e.calls != 2 {
+		t.Fatalf("ctx version change must force re-embed, got %d calls", e.calls)
+	}
+}
+
+func TestUpsert_DocsEnhancement(t *testing.T) {
+	w := newFakeWriter()
+	e := &countingEmbedder{}
+	en := &spyEnhancer{}
+	svc := newTestService(w, e)
+	svc.Enhancer = en
+	svc.CtxVersion = "test-model"
+
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{doc(1, "需要上下文定位的内容。")}); err != nil {
+		t.Fatal(err)
+	}
+	if en.calls == 0 {
+		t.Fatal("enhancer must be called for every chunk")
+	}
+	for _, p := range w.collections["rag_documents"] {
+		// 点文本 = 摘要前缀 + 子块正文（嵌入文本与存储文本同构）。
+		if !strings.HasPrefix(p.Text, "PREFIX-") || !strings.HasSuffix(p.Text, "需要上下文定位的内容。") {
+			t.Fatalf("point text must carry enhance prefix, got %q", p.Text)
+		}
+	}
+}
+
+func TestUpsert_DocsEnhanceFailureFails(t *testing.T) {
+	w := newFakeWriter()
+	svc := newTestService(w, &countingEmbedder{})
+	svc.Enhancer = &spyEnhancer{err: errors.New("llm down")}
+	// 增强失败 = 整批失败（写路径契约），不得写入任何点。
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{doc(1, "内容。")}); err == nil {
+		t.Fatal("enhance failure must fail the batch")
+	}
+	if len(w.collections["rag_documents"]) != 0 {
+		t.Fatalf("no points must be written on failure, got %d", len(w.collections["rag_documents"]))
+	}
+}
+
+func TestUpsert_DocsTooManyChunks(t *testing.T) {
+	svc := newTestService(newFakeWriter(), &countingEmbedder{})
+	svc.MaxChunksPerRequest = 2
+	long := strings.Repeat("填充句子。", 300) // 1500 rune → 4 子块 > 上限 2
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{doc(1, long)}); !errors.Is(err, ErrTooManyChunks) {
+		t.Fatalf("want ErrTooManyChunks, got %v", err)
+	}
+}
+
+func TestUpsert_DocsBlankContent(t *testing.T) {
+	svc := newTestService(newFakeWriter(), &countingEmbedder{})
+	d := Document{ID: "1", Content: "  \n  ", Metadata: DocumentMetadata{TenantID: "t1"}}
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{d}); !errors.Is(err, ErrInvalidDocument) {
+		t.Fatalf("blank content must be invalid, got %v", err)
+	}
+}
+
+func TestUpsert_DocsValidation(t *testing.T) {
+	svc := newTestService(newFakeWriter(), &countingEmbedder{})
+	// 空 ID：docs 的 ID 是逻辑标识，但不可为空。
+	d := Document{ID: "", Content: "c", Metadata: DocumentMetadata{TenantID: "t1"}}
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{d}); !errors.Is(err, ErrInvalidDocument) {
+		t.Fatalf("empty id: want ErrInvalidDocument, got %v", err)
+	}
+	// 非数字 ID 合法（与 memory 路径的关键差异）：点 ID 由内部派生。
+	d2 := Document{ID: "faq-deploy", Content: "c", Metadata: DocumentMetadata{TenantID: "t1"}}
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{d2}); err != nil {
+		t.Fatalf("logical doc id must be accepted, got %v", err)
+	}
+}
+
+func TestUpsert_DocsSubBatchEmbed(t *testing.T) {
+	w := newFakeWriter()
+	e := &countingEmbedder{}
+	svc := newTestService(w, e)
+	// ~91 子块（>64 子批、<256 上限）：嵌入必须拆分为 64+27 两批。
+	long := strings.Repeat("word. ", 6000) // 36000 rune → 91 子块
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{doc(1, long)}); err != nil {
+		t.Fatal(err)
+	}
+	wantCalls := (len(w.collections["rag_documents"]) + defaultChunkEmbedBatch - 1) / defaultChunkEmbedBatch
+	if e.calls != wantCalls || wantCalls < 2 {
+		t.Fatalf("want %d embed calls, got %d (sizes=%v)", wantCalls, e.calls, e.sizes)
+	}
+	if e.sizes[0] != defaultChunkEmbedBatch {
+		t.Fatalf("first sub-batch must be %d, got %v", defaultChunkEmbedBatch, e.sizes)
+	}
+}
+
+func TestDeleteDoc(t *testing.T) {
+	w := newFakeWriter()
+	svc := newTestService(w, &countingEmbedder{})
+	if _, err := svc.Upsert(context.Background(), "rag_documents", []Document{doc(7, strings.Repeat("一句话。", 150))}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(w.collections["rag_documents"]); n < 2 {
+		t.Fatalf("want multi-chunk doc, got %d", n)
+	}
+	deleted, err := svc.DeleteDoc(context.Background(), "rag_documents", "t1", "7")
+	if err != nil || !deleted {
+		t.Fatalf("want (true,nil), got (%v,%v)", deleted, err)
+	}
+	if n := len(w.collections["rag_documents"]); n != 0 {
+		t.Fatalf("all chunks must be deleted, got %d", n)
+	}
+	// 幂等：重复删除 deleted=false。
+	if deleted, err = svc.DeleteDoc(context.Background(), "rag_documents", "t1", "7"); err != nil || deleted {
+		t.Fatalf("idempotent delete: want (false,nil), got (%v,%v)", deleted, err)
+	}
+	// 缺 tenant → ErrTenantRequired。
+	if _, err := svc.DeleteDoc(context.Background(), "rag_documents", "", "7"); !errors.Is(err, ErrTenantRequired) {
+		t.Fatalf("want ErrTenantRequired, got %v", err)
 	}
 }

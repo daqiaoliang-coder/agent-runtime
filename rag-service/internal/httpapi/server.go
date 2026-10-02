@@ -5,8 +5,8 @@
 //   - GET    /readyz                               就绪探针（检查 Qdrant 可达）
 //   - POST   /v1/search                            memory / docs profile 检索
 //   - POST   /v1/collections/{name}/documents      批量 upsert（同步 ingest）
-//   - GET    /v1/collections/{name}/documents/{id} 文档状态查询
-//   - DELETE /v1/collections/{name}/documents/{id} 文档删除（幂等）
+//   - GET    /v1/collections/{name}/documents/{id} 文档状态查询（docs 集合需 ?tenant_id=）
+//   - DELETE /v1/collections/{name}/documents/{id} 文档删除（幂等；docs 集合需 ?tenant_id=）
 //
 // 读路径降级语义：/v1/search 恒返回 200（除 400/401 的请求侧错误）——
 // 检索失败表现为空 results + degraded 标记，与 runtime (nil, nil)
@@ -29,6 +29,7 @@ import (
 
 	"github.com/daqiaoliang-coder/rag-service/internal/ingest"
 	"github.com/daqiaoliang-coder/rag-service/internal/search"
+	"github.com/daqiaoliang-coder/rag-service/internal/vector"
 )
 
 // HealthChecker 供就绪探针检查后端依赖（Qdrant）。
@@ -122,12 +123,13 @@ type upsertRequest struct {
 }
 
 // mapIngestError 把 ingest 错误映射为 HTTP 状态码。
-// 请求侧错误（校验/未知集合）→ 4xx；其余（embed 网关/Qdrant 故障）→ 503。
+// 请求侧错误（校验/未知集合/缺租户/超块数上限）→ 4xx；其余（embed 网关/Qdrant 故障）→ 503。
 func mapIngestError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ingest.ErrUnknownCollection):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
-	case errors.Is(err, ingest.ErrInvalidDocument), errors.Is(err, ingest.ErrTooManyDocs):
+	case errors.Is(err, ingest.ErrInvalidDocument), errors.Is(err, ingest.ErrTooManyDocs),
+		errors.Is(err, ingest.ErrTooManyChunks), errors.Is(err, ingest.ErrTenantRequired):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 	default:
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
@@ -162,26 +164,43 @@ func handleGetDocument(ing *ingest.Service) http.HandlerFunc {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ingest not configured"})
 			return
 		}
+		name := r.PathValue("name")
+		// docs 集合：ID 是逻辑标识（任意非空字符串），子块点 ID 由
+		// (tenant, docID) 派生，必须从查询参数取 tenant_id（缺省 400）。
+		if ing.IsDocsCollection(name) {
+			doc, found, err := ing.GetDoc(r.Context(), name, r.URL.Query().Get("tenant_id"), r.PathValue("id"))
+			if err != nil {
+				mapIngestError(w, err)
+				return
+			}
+			writeDocStatus(w, doc, found)
+			return
+		}
 		id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "document id must be a decimal uint64"})
 			return
 		}
-		doc, found, err := ing.Get(r.Context(), r.PathValue("name"), id)
+		doc, found, err := ing.Get(r.Context(), name, id)
 		if err != nil {
 			mapIngestError(w, err)
 			return
 		}
-		// found:false 也返回 200：这是状态查询而非资源获取，
-		// 轮询方需要区分"已删除/尚未写入"（found=false）与"服务故障"（5xx）。
-		var body any
-		if found {
-			body = documentStatus{Found: true, Document: doc}
-		} else {
-			body = documentStatus{Found: false}
-		}
-		writeJSON(w, http.StatusOK, body)
+		writeDocStatus(w, doc, found)
 	}
+}
+
+// writeDocStatus 统一输出文档状态查询结果。found:false 也返回 200：
+// 这是状态查询而非资源获取，轮询方需要区分"已删除/尚未写入"
+// （found=false）与"服务故障"（5xx）。
+func writeDocStatus(w http.ResponseWriter, doc vector.RetrievedDoc, found bool) {
+	var body any
+	if found {
+		body = documentStatus{Found: true, Document: doc}
+	} else {
+		body = documentStatus{Found: false}
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func handleDeleteDocument(ing *ingest.Service) http.HandlerFunc {
@@ -190,12 +209,24 @@ func handleDeleteDocument(ing *ingest.Service) http.HandlerFunc {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ingest not configured"})
 			return
 		}
+		name := r.PathValue("name")
+		// docs 集合：删除按 (tenant, docID) 整文档清理全部子块，
+		// tenant_id 查询参数必填（缺省 400）。
+		if ing.IsDocsCollection(name) {
+			deleted, err := ing.DeleteDoc(r.Context(), name, r.URL.Query().Get("tenant_id"), r.PathValue("id"))
+			if err != nil {
+				mapIngestError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]bool{"deleted": deleted})
+			return
+		}
 		id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "document id must be a decimal uint64"})
 			return
 		}
-		deleted, err := ing.Delete(r.Context(), r.PathValue("name"), id)
+		deleted, err := ing.Delete(r.Context(), name, id)
 		if err != nil {
 			mapIngestError(w, err)
 			return

@@ -44,6 +44,21 @@ type Config struct {
 	DefaultMinScore float32       // 请求未指定 min_score 时的默认值（memory profile）
 	Budget          time.Duration // memory profile 单次检索总预算（含 embed + 向量检索）
 	DocsBudget      time.Duration // docs profile 总预算（dense+sparse+RRF）
+
+	// Phase 3：docs profile 的分块/增强/重排配置。
+	ChunkParentSize   int // parent 块上限（rune），缺省 1200；<=0 由 chunk 包兜底
+	ChunkChildSize    int // child 块上限（rune），缺省 400
+	MaxChunksPerReq   int // 单请求 docs 子块总数上限（同步管道时长护栏），缺省 256
+	DocsOverfetch     int // 子块过采样倍数（去重前），缺省 4；<=0 由 search 包兜底
+
+	ContextualEnabled     bool          // LLM 上下文增强开关，缺省关闭（写路径零 LLM 依赖）
+	ContextualBaseURL     string        // OpenAI 兼容 chat 网关；开启增强时必填
+	ContextualAPIKey      string        // 空 = 网关匿名可访问
+	ContextualModel       string        // 增强用的模型名；开启增强时必填（参与 content_hash 派生）
+	ContextualConcurrency int           // 子块增强并发信号量，缺省 4
+	RerankBaseURL         string        // TEI /rerank 兼容端点；空 = 关闭重排（保持 RRF 序）
+	RerankModel           string        // 空 = TEI 单模型部署（请求不携带 model 字段）
+	RerankTimeout         time.Duration // 单次重排预算，缺省 500ms；须显著小于 DocsBudget
 }
 
 // FromEnv 读取并校验配置。
@@ -66,12 +81,35 @@ func FromEnv() (Config, error) {
 		DefaultMinScore:   float32(getenvFloat("RAG_MIN_SCORE", 0.7)),
 		Budget:            time.Duration(getenvInt("RAG_BUDGET_MS", 400)) * time.Millisecond,
 		DocsBudget:        time.Duration(getenvInt("RAG_DOCS_BUDGET_MS", 1500)) * time.Millisecond,
+
+		ChunkParentSize:       getenvInt("RAG_CHUNK_PARENT_SIZE", 1200),
+		ChunkChildSize:        getenvInt("RAG_CHUNK_CHILD_SIZE", 400),
+		MaxChunksPerReq:       getenvInt("RAG_MAX_CHUNKS_PER_REQUEST", 256),
+		DocsOverfetch:         getenvInt("RAG_DOCS_OVERFETCH", 4),
+		ContextualEnabled:     getenvBool("RAG_CONTEXTUAL_ENABLED"),
+		ContextualBaseURL:     os.Getenv("RAG_CONTEXTUAL_BASE_URL"),
+		ContextualAPIKey:      os.Getenv("RAG_CONTEXTUAL_API_KEY"),
+		ContextualModel:       os.Getenv("RAG_CONTEXTUAL_MODEL"),
+		ContextualConcurrency: getenvInt("RAG_CONTEXTUAL_CONCURRENCY", 4),
+		RerankBaseURL:         os.Getenv("RAG_RERANK_BASE_URL"),
+		RerankModel:           os.Getenv("RAG_RERANK_MODEL"),
+		RerankTimeout:         time.Duration(getenvInt("RAG_RERANK_TIMEOUT_MS", 500)) * time.Millisecond,
 	}
 	if cfg.EmbedBaseURL == "" {
 		return cfg, fmt.Errorf("RAG_EMBED_BASE_URL is required: rag-api cannot answer any query without an embedding gateway")
 	}
 	if cfg.EmbedDim <= 0 {
 		return cfg, fmt.Errorf("RAG_EMBED_DIM must be positive, got %d", cfg.EmbedDim)
+	}
+	// 增强开启但网关/模型缺失 → fail-fast：否则带着残缺依赖启动，
+	// 第一次 docs 写入才失败，把配置错误伪装成后端故障。
+	if cfg.ContextualEnabled {
+		if cfg.ContextualBaseURL == "" {
+			return cfg, fmt.Errorf("RAG_CONTEXTUAL_BASE_URL is required when RAG_CONTEXTUAL_ENABLED=true")
+		}
+		if cfg.ContextualModel == "" {
+			return cfg, fmt.Errorf("RAG_CONTEXTUAL_MODEL is required when RAG_CONTEXTUAL_ENABLED=true")
+		}
 	}
 	return cfg, nil
 }
@@ -99,4 +137,13 @@ func getenvFloat(key string, def float64) float64 {
 		}
 	}
 	return def
+}
+
+func getenvBool(key string) bool {
+	switch os.Getenv(key) {
+	case "1", "true", "TRUE", "True", "yes":
+		return true
+	default:
+		return false
+	}
 }

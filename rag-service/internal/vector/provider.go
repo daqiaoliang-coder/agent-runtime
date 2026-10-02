@@ -27,6 +27,12 @@ const (
 	// 读路径不消费它，因此对 runtime 侧的影子对比无影响；它使"同 ID 同内容
 	// 的重复提交"在 rag-api 侧被识别并跳过重嵌入，保护 embedding 网关配额。
 	PayloadContentHash = "content_hash"
+
+	// 以下三个键是 Phase 3 parent-child 分块的 docs 集合专属键，
+	// memory 路径不写入（runtime 直连写入的点也不含），对影子对比零影响。
+	PayloadDocID      = "doc_id"       // 子块所属文档 ID（十进制 uint64 字符串）
+	PayloadChunkSeq   = "chunk_seq"    // 子块在文档内的序号（0 起）
+	PayloadParentText = "parent_text"  // 所属父块全文（检索命中 child 后直接返回）
 )
 
 // docs 集合的命名向量名。memory 集合用默认（未命名）向量，与 runtime
@@ -38,8 +44,10 @@ const (
 )
 
 // Hit 是带相似度分数的检索结果，字段语义与 runtime vector.Hit 一致。
-// 相比 contracts.Message（只有 Role/Content），这里额外透出 NodeID/RunID/Score，
+// 相比 contracts.Message（仅 Role/Content），这里额外透出 NodeID/RunID/Score，
 // 供调用方做溯源与去重——这是独立服务相对进程内实现的增强，不是行为变更。
+// DocID/ChunkSeq/ParentText 是 Phase 3 parent-child 字段，仅 docs 集合填充；
+// memory 检索路径保持零值，不参与任何逻辑。
 type Hit struct {
 	PointID   uint64
 	TenantID  string
@@ -50,6 +58,9 @@ type Hit struct {
 	Text      string
 	CreatedAt time.Time
 	Score     float32
+	DocID     string
+	ChunkSeq  int
+	ParentText string
 }
 
 // Filter 是检索时的强制隔离条件（fail-closed）。
@@ -89,7 +100,8 @@ type HybridSearcher interface {
 // DocPoint 是一条待写入的文档向量。布局由写入方法决定：
 // UpsertDefault 只写 Dense（memory 集合，未命名向量）；UpsertHybrid 同时写
 // Dense 与 Sparse（docs 集合，命名向量）。ID 必须由调用方确定性派生——
-// memory 集合沿用 runtime 的 vector.PointID，docs 集合用 hash(tenant,doc,seq)。
+// memory 集合沿用 runtime 的 vector.PointID，docs 集合用 hash(tenant, doc, seq)。
+// DocID/ChunkSeq/ParentText 是 Phase 3 子块字段（docs 布局专用）。
 type DocPoint struct {
 	ID          uint64
 	Dense       []float32
@@ -102,6 +114,9 @@ type DocPoint struct {
 	Text        string
 	CreatedAt   time.Time
 	ContentHash string
+	DocID       string
+	ChunkSeq    int
+	ParentText  string
 }
 
 // RetrievedDoc 是按 ID 取回的文档（GET status 与幂等检查用）。
@@ -115,6 +130,9 @@ type RetrievedDoc struct {
 	Text        string
 	CreatedAt   time.Time
 	ContentHash string
+	DocID       string
+	ChunkSeq    int
+	ParentText  string
 }
 
 // Writer 是写路径的向量库能力集。EnsureMemoryCollection 的语义与
@@ -132,6 +150,10 @@ type Writer interface {
 	UpsertHybrid(ctx context.Context, collection string, points []DocPoint) error
 	// Delete 按 ID 删除点，幂等（不存在的 ID 也算成功）。
 	Delete(ctx context.Context, collection string, ids ...uint64) error
+	// DeleteByDocID 按 (tenant, docID) 过滤删除一个文档的全部子块点
+	// （docs 布局专用：文档被更新时旧子块数量可能多于新子块，
+	// 按 ID 逐个删会留下孤儿，必须按 doc_id 过滤整删）。
+	DeleteByDocID(ctx context.Context, collection, tenantID, docID string) error
 	// Retrieve 按 ID 批量取回点及其 payload；不存在的 ID 不出现在结果里。
 	Retrieve(ctx context.Context, collection string, ids []uint64) (map[uint64]RetrievedDoc, error)
 }
