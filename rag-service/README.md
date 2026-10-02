@@ -337,3 +337,16 @@ golden set（`eval/golden/`）：54 篇中文语料取材于真实项目文档�
 跨文档干扰（近似主题区分）与多目标召回。语料与查询都是 JSONL 纯文本，
 任何变更都有 diff 可审。
 
+### 本地验证 rerank（TEI，可选）
+
+`docker compose --profile rerank up` 启动 TEI 重排器。两个本地档位注意点：
+
+- **模型**：`deploy/models/bge-reranker-base/` 不入 git（HF 单连接限速
+  ~300KB/s，可用分段并行下载加速）；v2-m3（568M 参数）在 8GB Docker VM
+  内 OOM，base（278M）是本地验证档位。
+- **预算**：candle CPU 后端对 20 候选×300字打分实测 ~40s，`RAG_DOCS_BUDGET_MS`
+  与 `RAG_RERANK_TIMEOUT_MS` 需临时调大（compose 内有注释标明档位）；
+  生产 GPU 环境回 1500 / 500。评测前先 curl 一次 embedding 预热 ollama
+  （冷加载 ~7s，keep_alive 默认 5 分钟闲置即卸载）。
+
+

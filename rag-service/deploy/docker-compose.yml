@@ -15,17 +15,18 @@ services:
       - qdrant-data:/qdrant/storage
 
   tei-reranker:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
     profiles: ["rerank"]
     ports:
       - "8090:8090"
     environment:
-      # bge-reranker-v2-m3 是 cross-encoder：加载后 /rerank 端点可用。
-      MODEL_ID: BAAI/bge-reranker-v2-m3
+      # bge-reranker-base 是 cross-encoder：加载后 /rerank 端点可用。
+      # 指向本地挂载的模型目录（HF 单连接限速，deploy/models/ 平行分段下载）。
+      # v2-m3（568M 参数）在 8GB Docker VM 内会 OOM；base（278M）为本地验证档位。
+      MODEL_ID: /models/bge-reranker-base
       PORT: "8090"
     volumes:
-      # 模型缓存卷避免每次重建容器都重新下载。
-      - tei-models:/data
+      - ./models/bge-reranker-base:/models/bge-reranker-base:ro
 
   rag-api:
     build: ..
@@ -40,19 +41,24 @@ services:
       RAG_DOCS_COLLECTION: rag_documents
       RAG_EMBED_BASE_URL: http://host.docker.internal:11434/v1
       RAG_EMBED_MODEL: bge-m3
+      RAG_EMBED_DIM: "1024" # bge-m3 输出 1024 维；缺省 1536 仅适用于 OpenAI text-embedding 系列
+      RAG_EMBED_TIMEOUT_MS: "30000" # ollama CPU 批量嵌入较慢；生产网关可回 3000
       RAG_BUDGET_MS: "400"
       RAG_TOPK: "10"
       RAG_MIN_SCORE: "0.7"
       # Phase 3：docs profile（缺省值即下方注释，显式声明便于对照）。
-      RAG_DOCS_BUDGET_MS: "1500"
+      # 100000 是本地 CPU 慢环境档位：TEI candle CPU 后端对 20 候选×300字
+      # 打分实测 ~40s，1500ms 生产预算下 rerank 必然超时降级（验证 rerank
+      # 质量需临时放大预算）。GPU/生产网关环境请回 1500。
+      RAG_DOCS_BUDGET_MS: "100000"
       RAG_DOCS_OVERFETCH: "4"
       RAG_CHUNK_PARENT_SIZE: "1200"
       RAG_CHUNK_CHILD_SIZE: "400"
       RAG_MAX_CHUNKS_PER_REQUEST: "256"
       # 重排：仅在 docker compose --profile rerank up 时取消注释
       # （nil=关闭；误配置会让每次 docs 检索空等 500ms 超时后才降级）。
-      # RAG_RERANK_BASE_URL: http://tei-reranker:8090
-      RAG_RERANK_TIMEOUT_MS: "500"
+      RAG_RERANK_BASE_URL: http://tei-reranker:8090
+      RAG_RERANK_TIMEOUT_MS: "90000" # 本地 CPU 对 20 候选×300字打分实测 ~40s；GPU 生产可回 500
       # 上下文增强（可选；开启时必须配置 LLM 网关）。
       RAG_CONTEXTUAL_ENABLED: "false"
       # RAG_CONTEXTUAL_BASE_URL: http://host.docker.internal:11434/v1
@@ -63,4 +69,3 @@ services:
 
 volumes:
   qdrant-data:
-  tei-models:

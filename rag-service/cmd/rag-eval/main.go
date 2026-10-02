@@ -117,7 +117,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("rag-eval: %v", err)
 	}
-	client := &client{base: *api, token: *token, http: &http.Client{Timeout: 60 * time.Second}}
+	// 客户端超时须不小于被测服务端最大预算（本地 CPU 档位 DocsBudget 可达 100s）。
+	client := &client{base: *api, token: *token, http: &http.Client{Timeout: 150 * time.Second}}
 
 	if !*noIngest {
 		if err := client.ingestCorpus(*collection, *tenant, docs); err != nil {

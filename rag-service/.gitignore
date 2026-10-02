@@ -1,2 +1,6 @@
 rag-api
 *.env
+# 评测报告（本地生成，含环境相关延迟数据）
+eval-report*.json
+# 本地挂载的重排模型（deploy/docker-compose.yml 的 tei-reranker 卷）
+deploy/models/
