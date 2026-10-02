@@ -16,8 +16,8 @@ func (r *scriptedRunner) RunLLM(_ context.Context, req contracts.GenerateRequest
 	if r.calls == 1 {
 		// 断言：如果有 ContextLoader 加载的历史，它应该在 messages 前面。
 		return contracts.GenerateResponse{
-			Message:    contracts.Message{Role: contracts.RoleAssistant, Content: "ok"},
-			ToolCalls:  []contracts.ToolCall{{ID: "call-1", Name: "search", Arguments: "q"}},
+			Message:   contracts.Message{Role: contracts.RoleAssistant, Content: "ok"},
+			ToolCalls: []contracts.ToolCall{{ID: "call-1", Name: "search", Arguments: "q"}},
 		}, nil
 	}
 	return contracts.GenerateResponse{Message: contracts.Message{Role: contracts.RoleAssistant, Content: "done"}}, nil
@@ -131,9 +131,9 @@ func TestEngine_MasksToolResult_OverMaxRunes(t *testing.T) {
 	longOutput := strings.Repeat("x", 100)
 	r2 := &longToolRunner{output: longOutput}
 	eng := &Engine{
-		Runner:            r2,
-		MaxIterations:     3,
-		ToolMasking:       true,
+		Runner:             r2,
+		MaxIterations:      3,
+		ToolMasking:        true,
 		ToolOutputMaxRunes: 10,
 	}
 	res, err := eng.Run(context.Background(), Input{

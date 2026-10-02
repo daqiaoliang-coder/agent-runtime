@@ -1,0 +1,32 @@
+# 本地开发环境：Qdrant + rag-api。
+# embedding 网关是外部设施（OpenAI 兼容即可），不在本 compose 内；
+# 下例指向宿主机的 ollama，换成真实网关地址即可。
+services:
+  qdrant:
+    image: qdrant/qdrant:latest # 生产环境请固定版本
+    ports:
+      - "6333:6333" # REST / Web UI
+      - "6334:6334" # gRPC（rag-api 使用这个端口）
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+  rag-api:
+    build: ..
+    ports:
+      - "8080:8080"
+    environment:
+      RAG_ADDR: ":8080"
+      RAG_API_TOKEN: "" # 本地不鉴权；生产必须设置
+      RAG_QDRANT_HOST: qdrant
+      RAG_QDRANT_PORT: "6334"
+      RAG_COLLECTION: agent_memory # 直接读 runtime 索引器投影的现有集合
+      RAG_EMBED_BASE_URL: http://host.docker.internal:11434/v1
+      RAG_EMBED_MODEL: bge-m3
+      RAG_BUDGET_MS: "400"
+      RAG_TOPK: "10"
+      RAG_MIN_SCORE: "0.7"
+    depends_on:
+      - qdrant
+
+volumes:
+  qdrant-data:

@@ -112,10 +112,10 @@ func node(id, tenant, thread, runID, input, output string) model.MemoryNode {
 	}
 }
 
-// newTestIndexer 构造基于内存替身的索引器。
+// newTestIndexer 构造基于内存替身的索引器（local 后端：embed+直连 fake 向量库）。
 // BatchDelay 设为极小正值：既避开默认 500ms 限速拖慢测试，又仍走批次间隔分支。
 func newTestIndexer(st *fakeStore, vs *recordingVectors, emb llm.Embedder) *Indexer {
-	return New(emb, st, vs, Config{
+	return New(&LocalWriter{Embedder: emb, Vectors: vs}, st, Config{
 		Collection: "agent_memory",
 		Dim:        8,
 		BatchSize:  16,
@@ -499,7 +499,7 @@ func TestIndexer_Batching(t *testing.T) {
 
 // TestNew_AppliesDefaults 零值配置必须回退到安全默认值。
 func TestNew_AppliesDefaults(t *testing.T) {
-	ix := New(llm.StubEmbedder{}, &fakeStore{}, vector.NewFake(), Config{})
+	ix := New(&LocalWriter{Embedder: llm.StubEmbedder{}, Vectors: vector.NewFake()}, &fakeStore{}, Config{})
 	if ix.Config.Collection != DefaultCollection {
 		t.Errorf("collection default: %q", ix.Config.Collection)
 	}
@@ -532,12 +532,17 @@ func TestNew_AppliesDefaults(t *testing.T) {
 
 // TestIndexer_NilDependencies RunOnce 必须报配置错误而非静默跳过。
 // 索引器是独立进程，装配遗漏要在启动时立刻暴露。
+// Writer 内部依赖（embedder/vectors）的缺失在写入时暴露，
+// 因此这两个 case 必须带节点数据让流程真正走到 Write。
 func TestIndexer_NilDependencies(t *testing.T) {
 	ctx := context.Background()
+	cfg := Config{Collection: "c", PollInterval: time.Second}
+	pending := &fakeStore{nodes: []model.MemoryNode{node("n1", "t", "th", "r", "in", "out")}}
 	cases := map[string]*Indexer{
-		"nil embedder": {Store: &fakeStore{}, Vectors: newRecordingFake(t), Config: Config{Collection: "c", PollInterval: time.Second}},
-		"nil store":    {Embedder: llm.StubEmbedder{}, Vectors: newRecordingFake(t), Config: Config{Collection: "c", PollInterval: time.Second}},
-		"nil vectors":  {Embedder: llm.StubEmbedder{}, Store: &fakeStore{}, Config: Config{Collection: "c", PollInterval: time.Second}},
+		"nil writer":   {Store: &fakeStore{}, Config: cfg},
+		"nil store":    {Writer: &LocalWriter{Embedder: llm.StubEmbedder{}, Vectors: newRecordingFake(t)}, Config: cfg},
+		"nil embedder": {Writer: &LocalWriter{Vectors: newRecordingFake(t)}, Store: pending, Config: cfg},
+		"nil vectors":  {Writer: &LocalWriter{Embedder: llm.StubEmbedder{}}, Store: pending, Config: cfg},
 	}
 	for name, ix := range cases {
 		if ix.failures == nil {
@@ -590,7 +595,7 @@ func TestIndexer_ContextCancelled(t *testing.T) {
 // TestIndexer_EnsureCollectionRequiresDim 维度未配置必须报错。
 // 否则会以 0 维建集合，后续写入全部失败且错误信息难以定位。
 func TestIndexer_EnsureCollectionRequiresDim(t *testing.T) {
-	ix := New(llm.StubEmbedder{}, &fakeStore{}, newRecordingFake(t), Config{Collection: "c"})
+	ix := New(&LocalWriter{Embedder: llm.StubEmbedder{}, Vectors: newRecordingFake(t)}, &fakeStore{}, Config{Collection: "c"})
 	if err := ix.EnsureCollection(context.Background()); err == nil {
 		t.Fatal("expected error when dimension is not configured")
 	}
@@ -598,7 +603,7 @@ func TestIndexer_EnsureCollectionRequiresDim(t *testing.T) {
 
 // TestIndexer_EnsureCollectionIdempotent 重复调用不应报错（每次启动都会调）。
 func TestIndexer_EnsureCollectionIdempotent(t *testing.T) {
-	ix := New(llm.StubEmbedder{}, &fakeStore{}, newRecordingFake(t), Config{Collection: "agent_memory", Dim: 8})
+	ix := New(&LocalWriter{Embedder: llm.StubEmbedder{}, Vectors: newRecordingFake(t)}, &fakeStore{}, Config{Collection: "agent_memory", Dim: 8})
 	for i := 0; i < 3; i++ {
 		if err := ix.EnsureCollection(context.Background()); err != nil {
 			t.Fatalf("call #%d: %v", i, err)
@@ -608,7 +613,7 @@ func TestIndexer_EnsureCollectionIdempotent(t *testing.T) {
 
 // TestIndexer_EnsureCollectionNilVectors 向量库未装配时报明确错误。
 func TestIndexer_EnsureCollectionNilVectors(t *testing.T) {
-	ix := New(llm.StubEmbedder{}, &fakeStore{}, nil, Config{Collection: "c", Dim: 8})
+	ix := New(&LocalWriter{Embedder: llm.StubEmbedder{}}, &fakeStore{}, Config{Collection: "c", Dim: 8})
 	if err := ix.EnsureCollection(context.Background()); err == nil {
 		t.Fatal("expected error when vector store is nil")
 	}
@@ -622,7 +627,7 @@ func TestIndexer_EnsureCollectionNilVectors(t *testing.T) {
 // 直接测量墙钟差会引入纳秒级抖动，在退避进入平台期后会被误判为"退避变小"。
 func TestIndexer_BackoffGrows(t *testing.T) {
 	poll := time.Second
-	ix := New(llm.StubEmbedder{}, &fakeStore{}, newRecordingFake(t), Config{PollInterval: poll})
+	ix := New(&LocalWriter{Embedder: llm.StubEmbedder{}, Vectors: newRecordingFake(t)}, &fakeStore{}, Config{PollInterval: poll})
 
 	var prev time.Duration
 	for i := 1; i <= 10; i++ {

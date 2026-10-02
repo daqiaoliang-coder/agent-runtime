@@ -13,7 +13,6 @@ package memory
 import (
 	"agent-runtime/internal/adapters/vector"
 	"agent-runtime/internal/contracts"
-	"agent-runtime/internal/llm"
 	"agent-runtime/internal/model"
 	"context"
 	"errors"
@@ -77,13 +76,14 @@ type Config struct {
 
 // Indexer 把已完成节点投影为向量记忆。
 //
-// Embedder 与 Store 是必需依赖；两者任一为 nil 时 Run 会返回配置错误而非静默跳过，
+// Writer 与 Store 是必需依赖；任一为 nil 时 Run 会返回配置错误而非静默跳过，
 // 因为索引器是独立进程，装配遗漏必须在启动时立刻暴露。
+// Writer 按 INDEXER_BACKEND 装配为 local（embed+直连 Qdrant）、remote
+// （rag-api HTTP）或 shadow（双写对比），索引循环本身对后端无感知。
 type Indexer struct {
-	Embedder llm.Embedder
-	Store    Store
-	Vectors  vector.VectorStore
-	Config   Config
+	Writer Writer
+	Store  Store
+	Config Config
 
 	// failures 记录各节点的连续失败次数与下次可重试时间，用于指数退避。
 	//
@@ -99,7 +99,7 @@ type failure struct {
 }
 
 // New 构造索引器并填充默认配置。
-func New(embedder llm.Embedder, st Store, vs vector.VectorStore, cfg Config) *Indexer {
+func New(w Writer, st Store, cfg Config) *Indexer {
 	if cfg.Collection == "" {
 		cfg.Collection = DefaultCollection
 	}
@@ -121,24 +121,24 @@ func New(embedder llm.Embedder, st Store, vs vector.VectorStore, cfg Config) *In
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = DefaultPollInterval
 	}
-	return &Indexer{Embedder: embedder, Store: st, Vectors: vs, Config: cfg, failures: make(map[string]failure)}
+	return &Indexer{Writer: w, Store: st, Config: cfg, failures: make(map[string]failure)}
 }
 
-// EnsureCollection 在开始投影前确保向量集合存在（Cosine + 指定维度 + payload 索引）。
-// 幂等，可每次启动调用。
+// EnsureCollection 在开始投影前确保写入后端就绪（local：建集合；
+// remote：rag-api 探活；shadow：两者都确认）。幂等，可每次启动调用。
 func (ix *Indexer) EnsureCollection(ctx context.Context) error {
-	if ix.Vectors == nil {
-		return fmt.Errorf("memory: vector store not configured")
+	if ix.Writer == nil {
+		return fmt.Errorf("memory: writer not configured")
 	}
 	if ix.Config.Dim <= 0 {
 		return fmt.Errorf("memory: embedding dimension must be set (EMBEDDING_DIM)")
 	}
-	return ix.Vectors.EnsureCollection(ctx, ix.Config.Collection, ix.Config.Dim)
+	return ix.Writer.EnsureCollection(ctx, ix.Config.Collection, ix.Config.Dim)
 }
 
 // RunOnce 执行一轮投影，返回本轮成功投影的节点数。
 //
-// 流程：扫描未索引节点 → 过滤退避中的节点 → 分批 embed → Upsert → MarkMemoryIndexed。
+// 流程：扫描未索引节点 → 过滤退避中的节点 → 分批写入（Writer）→ MarkMemoryIndexed。
 //
 // 错误语义是刻意的分层：
 //   - 扫描失败 → 立即返回 error（无法继续，本轮作废）；
@@ -148,8 +148,8 @@ func (ix *Indexer) EnsureCollection(ctx context.Context) error {
 // 中断整轮会让一个坏节点阻塞所有好节点。之所以仍要汇总上报：
 // 调用方（Run 循环）需要知道本轮出过错，否则故障只会沉在日志里、指标上看不到。
 func (ix *Indexer) RunOnce(ctx context.Context) (int, error) {
-	if ix.Embedder == nil || ix.Store == nil || ix.Vectors == nil {
-		return 0, fmt.Errorf("memory: indexer not fully configured (embedder/store/vectors required)")
+	if ix.Writer == nil || ix.Store == nil {
+		return 0, fmt.Errorf("memory: indexer not fully configured (writer/store required)")
 	}
 	// 扫描上限与 embedding 批大小是两个独立参数：一次扫描的结果会被切成多批，
 	// 批次之间才插得进限速间隔。
@@ -176,11 +176,17 @@ func (ix *Indexer) RunOnce(ctx context.Context) (int, error) {
 
 	indexed := 0
 	var batchErrs []error
-	for start := 0; start < len(candidates); start += ix.Config.BatchSize {
+	// 步长防御：绕过 New 直构的 Config 可能缺省，0 步长会让分批循环
+	// 永不前进（无限循环比崩溃更难察觉）。
+	batchSize := ix.Config.BatchSize
+	if batchSize <= 0 {
+		batchSize = DefaultBatchSize
+	}
+	for start := 0; start < len(candidates); start += batchSize {
 		if ctx.Err() != nil {
 			return indexed, errors.Join(append(batchErrs, ctx.Err())...)
 		}
-		end := start + ix.Config.BatchSize
+		end := start + batchSize
 		if end > len(candidates) {
 			end = len(candidates)
 		}
@@ -241,11 +247,12 @@ type pendingItem struct {
 
 // projectBatch 投影一批节点，返回成功投影的节点数。
 //
-// 顺序至关重要：**先 Upsert 成功，再 MarkMemoryIndexed**。
+// 顺序至关重要：**先写入成功（Writer 返回 nil），再 MarkMemoryIndexed**。
 // 若顺序颠倒，崩溃会让进度表领先于实际向量数据，
 // 该节点此后永远不会被重新扫描，记忆静默丢失且无法察觉。
-// 反之，Upsert 成功但标记失败时，下一轮会重扫并重新 Upsert——
-// 因 point ID 确定性而幂等，只是多花一次 embedding 调用。
+// 反之，写入成功但标记失败时，下一轮会重扫并重新写入——
+// 因 point ID 确定性而幂等，只是多一次写入调用（remote 模式下
+// rag-api 的 content_hash 会识别重复提交并跳过重嵌入）。
 func (ix *Indexer) projectBatch(ctx context.Context, nodes []model.MemoryNode) (int, error) {
 	// 1. 收集待向量化的文本，并记录每段文本对应哪个节点/角色。
 	var items []pendingItem
@@ -286,46 +293,30 @@ func (ix *Indexer) projectBatch(ctx context.Context, nodes []model.MemoryNode) (
 		return 0, nil
 	}
 
-	// 3. 批量 embedding。一次调用覆盖整批，摊薄网关往返。
-	vecs, err := ix.Embedder.Embed(ctx, texts)
-	if err != nil {
-		// 整批退避：embedding 失败通常是网关级问题（限流/超时/鉴权），
-		// 逐个重试只会加剧限流。
-		ix.backoffAll(nodes)
-		return 0, fmt.Errorf("embed %d texts: %w", len(texts), err)
-	}
-	if len(vecs) != len(texts) {
-		ix.backoffAll(nodes)
-		return 0, fmt.Errorf("embed returned %d vectors for %d texts", len(vecs), len(texts))
-	}
-
-	// 4. 组装 points。texts[i] 与 vecs[i] 严格对应，与 items[i] 同源，故按下标对齐。
-	points := make([]vector.Point, 0, len(items))
-	for i, it := range items {
-		if len(vecs[i]) == 0 {
-			return 0, fmt.Errorf("embed returned empty vector for node %s role %s", it.node.NodeID, it.role)
-		}
-		points = append(points, vector.Point{
-			ID: vector.PointID(it.node.TenantID, it.node.ThreadID, it.node.NodeID, string(it.role)),
-			// 向量本身不存进 payload：Qdrant 已持有，重复存储只会放大内存占用。
-			Vector:    vecs[i],
+	// 3. 组装文档。ID 由 (tenant, thread, node, role) 确定性派生，
+	//    是重放幂等的唯一屏障；embedding 与落库由 Writer 按后端模式执行
+	//    （local：embed+直连 upsert；remote：rag-api HTTP；shadow：双写）。
+	docs := make([]Document, 0, len(items))
+	for _, it := range items {
+		docs = append(docs, Document{
+			ID:        vector.PointID(it.node.TenantID, it.node.ThreadID, it.node.NodeID, string(it.role)),
+			Text:      it.text,
+			Role:      string(it.role),
 			TenantID:  it.node.TenantID,
 			ThreadID:  it.node.ThreadID,
 			RunID:     it.node.RunID,
 			NodeID:    it.node.NodeID,
-			Role:      string(it.role),
-			Text:      it.text,
 			CreatedAt: it.node.FinishedAt,
 		})
 	}
 
-	// 5. 先写入向量库。
-	if err := ix.Vectors.Upsert(ctx, ix.Config.Collection, points); err != nil {
+	// 4. 写入向量库（Writer 保证返回 nil 时整批已确认落库）。
+	if err := ix.Writer.Write(ctx, ix.Config.Collection, docs); err != nil {
 		ix.backoffAll(nodes)
-		return 0, fmt.Errorf("upsert %d points: %w", len(points), err)
+		return 0, fmt.Errorf("write %d docs: %w", len(docs), err)
 	}
 
-	// 6. 向量确认落地后才标记进度。
+	// 5. 写入确认落地后才标记进度。
 	indexed := 0
 	for _, n := range nodes {
 		if !hasText(items, n.NodeID) {

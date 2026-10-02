@@ -296,11 +296,13 @@ Runtime 对外暴露稳定的 Provider Port，具体 SDK 通过 Adapter 接入�
 （范式同 store 层的 `s.(CancelStore)`）：
 
 ```text
-写入路径（cmd/memory-indexer，独立进程）
-  agent_node(SUCCESS) → Embedder → Qdrant
+写入路径（cmd/memory-indexer，独立进程，INDEXER_BACKEND 选择后端）
+  agent_node(SUCCESS) → Writer ─┬─ local（缺省）：进程内 Embedder → Qdrant
+                                ├─ remote：rag-api 文档 API（content_hash 幂等跳过重嵌入）
+                                └─ shadow：双写对比（直连为准，差异只打日志）
         └─ memory_indexed 表记录投影进度（INSERT IGNORE 幂等）
 
-读取路径（worker 的 ContextLoader）
+读取路径（worker 的 ContextLoader，MEMORY_BACKEND 选择后端）
   当前 Run 提问 → Embedder → Qdrant(按 tenant+thread 过滤) → 前置到对话历史
 ```
 
@@ -320,6 +322,11 @@ Runtime 对外暴露稳定的 Provider Port，具体 SDK 通过 Adapter 接入�
 | 变量                   | 默认值                  | 说明                                    |
 | :------------------- | :------------------- | :------------------------------------ |
 | `MEMORY_ENABLED`     | `false`              | 显式开启后才装配长期记忆                          |
+| `MEMORY_BACKEND`     | `local`              | 读取路径后端：`local` 直连 Qdrant；`remote` 经 rag-api 检索；`shadow` 双跑对比（结果恒以直连为准，差异只打日志） |
+| `RAG_API_URL`        | 空                   | rag-api 地址（如 `http://rag-api:8080`），读取（`MEMORY_BACKEND`）与写入（`INDEXER_BACKEND`）的 `remote`/`shadow` 模式必填 |
+| `RAG_API_TOKEN`      | 空（不鉴权）              | rag-api 服务间 Bearer 令牌                 |
+| `MEMORY_REMOTE_FALLBACK` | `true`            | `remote` 后端下远程失败/降级时回退直连 Qdrant（需本地依赖可用） |
+| `INDEXER_BACKEND`    | `local`              | 写入路径后端（`cmd/memory-indexer`）：`local` 进程内 embed + 直连 Qdrant；`remote` 经 rag-api 文档 API 写入（免 embedding 凭证与 Qdrant 连接）；`shadow` 双写对比（直连为准，远程失败仅告警）。非法值或缺 `RAG_API_URL` 时 warn 并回退 `local` |
 | `QDRANT_HOST`        | `localhost`          | 向量库地址                                 |
 | `QDRANT_PORT`        | `6334`               | gRPC 端口（**不是** REST 的 6333）           |
 | `QDRANT_COLLECTION`  | `agent_memory`       | 集合名                                   |
@@ -1023,6 +1030,19 @@ go run ./cmd/worker
 ```
 
 未设置 `MEMORY_ENABLED` 时，worker 与索引器都不会触达向量库，行为与接入记忆前一致。
+
+读取路径默认直连 Qdrant（`MEMORY_BACKEND=local`）。部署 rag-service 后，可先以
+`MEMORY_BACKEND=shadow` + `RAG_API_URL=...` 双跑对比验证两路召回等价（worker 日志
+输出 `memory(shadow): match/mismatch`，注入 LLM 的上下文恒以直连为准），验收一致后
+切换 `MEMORY_BACKEND=remote` 把 embedding 与检索整体外移（此时 worker 不再需要
+embedding 凭证与 Qdrant 连接，远程失败可按 `MEMORY_REMOTE_FALLBACK` 回退直连）。
+
+写入路径有对应的 `INDEXER_BACKEND`（`cmd/memory-indexer`）：`local`（缺省）进程内
+embed + 直连 Qdrant；`remote` 经 rag-api 文档 API 写入（索引器不再需要 embedding
+凭证与 Qdrant 连接，部署面收敛为 MySQL + rag-api URL）；`shadow` 双写对比（直连为
+准，远程失败仅告警，日志输出 `memory(shadow-write): match`），是读路径切换
+`remote` 后迁移写入的等价性验收手段。两路验收顺序：先 `MEMORY_BACKEND=shadow`
+验证读等价 → `INDEXER_BACKEND=shadow` 验证写等价 → 双双切换 `remote`。
 
 完整数据流：
 

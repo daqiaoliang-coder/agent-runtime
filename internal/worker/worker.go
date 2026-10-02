@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -427,24 +428,111 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 
 // newMemoryOptionsFromEnv 按环境变量装配读取路径的记忆能力。
 //
-// 装配条件是"三者齐备"：MEMORY_ENABLED 显式开启、向量库地址可达配置、
-// 托管层能取到 embedding 凭证。任一缺失即返回 Memory=nil，
-// 使 ContextLoader 退化为接入前的行为——**现有部署与测试零感知**。
+// 后端选择（MEMORY_BACKEND，读路径外移 rag-api 的迁移开关）：
+//   - local（缺省）：直连 Qdrant 的 VectorMemory，与历史行为完全一致；
+//   - remote：经 rag-api 检索（RemoteMemory）。MEMORY_REMOTE_FALLBACK=true
+//     （缺省）且本地依赖可用时，远程失败/降级自动回退直连（FallbackMemory）；
+//   - shadow：双跑对比（ShadowMemory）——本地与远程并行执行，结果恒以直连
+//     为准，差异只打日志，用于切换前的等价性验收（Phase 1 影子对比）。
 //
-// 刻意不在此处 log.Fatal：记忆是可选增强，配置不全时应当降级运行，
-// 而不是让整个 worker 起不来。
+// 装配条件沿用"缺啥降啥"：MEMORY_ENABLED 未开启即整体关闭；本地侧
+// （embedding 凭证 / Qdrant）缺失时降级为本地不可用；remote 侧要求
+// RAG_API_URL。任何缺失都只 warn，绝不让 worker 起不来。
 func newMemoryOptionsFromEnv(creds contracts.CredentialProvider) MemoryOptions {
 	if !envBool("MEMORY_ENABLED", false) {
 		return MemoryOptions{}
 	}
+	backend := envString("MEMORY_BACKEND", "local")
+	switch backend {
+	case "local", "remote", "shadow":
+	default:
+		obs.From(context.Background()).WarnContext(context.Background(), "unknown MEMORY_BACKEND; falling back to local",
+			"backend", backend)
+		backend = "local"
+	}
+	fallback := envBool("MEMORY_REMOTE_FALLBACK", true)
+	timeout := envDuration("MEMORY_SEARCH_TIMEOUT", DefaultMemorySearchTimeout)
+
+	// 本地直连仅在需要时装配：remote 且不回退时完全跳过，
+	// worker 随之摆脱 embedding 凭证与 Qdrant 依赖（已外移到 rag-api）。
+	needLocal := backend == "local" || backend == "shadow" || (backend == "remote" && fallback)
+	var local providers.MemoryProvider
+	if needLocal {
+		local = newLocalVectorMemoryFromEnv(creds)
+	}
+
+	var remote providers.MemoryProvider
+	if backend == "remote" || backend == "shadow" {
+		if url := envString("RAG_API_URL", ""); url != "" {
+			remote = &providers.RemoteMemory{
+				BaseURL: url,
+				// 服务间共享令牌：Phase 1 与 rag-api 同信任域部署，直接读 env；
+				// 后续接入专属 CredentialPurpose 时改走托管层即可。
+				Token:    envString("RAG_API_TOKEN", ""),
+				Client:   &http.Client{Timeout: timeout}, // ctx 预算之外的兜底
+				TopK:     envInt("MEMORY_TOP_K", providers.DefaultMemoryTopK),
+				MinScore: envFloat32("MEMORY_MIN_SCORE", providers.DefaultMemoryMinScore),
+			}
+		} else {
+			obs.From(context.Background()).WarnContext(context.Background(), "MEMORY_BACKEND requests rag-api but RAG_API_URL is empty; remote side disabled",
+				"backend", backend)
+		}
+	}
+
+	var mem providers.MemoryProvider
+	switch backend {
+	case "remote":
+		switch {
+		case remote == nil:
+			// 远程未配置：降级为本地行为（local 可能为 nil，即记忆关闭）。
+			mem = local
+		case fallback && local != nil:
+			mem = &providers.FallbackMemory{Primary: remote, Fallback: local}
+		default:
+			mem = remote
+		}
+	case "shadow":
+		switch {
+		case local == nil && remote == nil:
+			mem = nil
+		case local == nil:
+			// 影子没有基准线（直连）就失去对比意义：退化为纯远程并大声告警。
+			obs.From(context.Background()).WarnContext(context.Background(), "shadow memory without local baseline; degrading to remote-only")
+			mem = remote
+		default:
+			// Secondary 允许为 nil：Search 内部退化为纯本地，行为不劣化。
+			mem = &providers.ShadowMemory{Primary: local, Secondary: remote}
+		}
+	default: // local
+		mem = local
+	}
+	if mem == nil {
+		return MemoryOptions{}
+	}
+	obs.From(context.Background()).InfoContext(context.Background(), "long-term memory enabled",
+		"backend", backend, "top_k", envInt("MEMORY_TOP_K", providers.DefaultMemoryTopK),
+		"min_score", envFloat32("MEMORY_MIN_SCORE", providers.DefaultMemoryMinScore),
+		"timeout", timeout.String())
+	return MemoryOptions{
+		Memory:           mem,
+		SearchTimeout:    timeout,
+		MaxMessages:      envInt("MEMORY_MAX_MESSAGES", DefaultMaxMemoryMessages),
+		MaxContextTokens: envInt("MEMORY_MAX_CONTEXT_TOKENS", DefaultMaxContextTokens),
+	}
+}
+
+// newLocalVectorMemoryFromEnv 装配直连 Qdrant 的本地记忆。
+// embedding 凭证缺失或 Qdrant 构造失败时返回 nil（本地侧降级为不可用），
+// 由调用方决定降级语义——记忆是增强项，缺依赖不该让 worker 起不来。
+func newLocalVectorMemoryFromEnv(creds contracts.CredentialProvider) providers.MemoryProvider {
 	// 探测 embedding 凭证是否可用。这里只看"取不取得到"，不取明文 ——
 	// 明文由 embedder 在每次请求时经 port 现取，密钥不进本函数的任何变量。
 	if _, err := creds.Credential(context.Background(), contracts.CredentialPurposeEmbedding); err != nil {
 		// 没有 embedding 能力就无法做语义召回。此处静默降级：
 		// 主链路的对话补全可能走 Stub，但记忆需要真实向量，二者要求不同。
-		obs.From(context.Background()).WarnContext(context.Background(), "MEMORY_ENABLED but no embedding credential; long-term memory disabled",
+		obs.From(context.Background()).WarnContext(context.Background(), "no embedding credential; local memory unavailable",
 			"error", err)
-		return MemoryOptions{}
+		return nil
 	}
 	// embedding 复用与对话推理相同的网关配置，仅模型名与超时独立可调。
 	// 走 WithCredentials 构造，密钥不进入结构体字段。
@@ -466,26 +554,16 @@ func newMemoryOptionsFromEnv(creds contracts.CredentialProvider) MemoryOptions {
 	if err != nil {
 		// 连接失败只降级、不致命：向量库可能稍后才就绪，
 		// 而 worker 必须能起来处理节点（记忆缺失只是少了增强）。
-		obs.From(context.Background()).WarnContext(context.Background(), "qdrant unavailable; long-term memory disabled",
+		obs.From(context.Background()).WarnContext(context.Background(), "qdrant unavailable; local memory unavailable",
 			"error", err)
-		return MemoryOptions{}
+		return nil
 	}
-
-	m := &providers.VectorMemory{
+	return &providers.VectorMemory{
 		Embedder:   embedder,
 		Store:      vs,
 		Collection: envString("QDRANT_COLLECTION", providers.DefaultMemoryCollection),
 		TopK:       envInt("MEMORY_TOP_K", providers.DefaultMemoryTopK),
 		MinScore:   envFloat32("MEMORY_MIN_SCORE", providers.DefaultMemoryMinScore),
-	}
-	obs.From(context.Background()).InfoContext(context.Background(), "long-term memory enabled",
-		"collection", m.Collection, "top_k", m.TopK, "min_score", m.MinScore,
-		"timeout", envDuration("MEMORY_SEARCH_TIMEOUT", DefaultMemorySearchTimeout).String())
-	return MemoryOptions{
-		Memory:           m,
-		SearchTimeout:    envDuration("MEMORY_SEARCH_TIMEOUT", DefaultMemorySearchTimeout),
-		MaxMessages:      envInt("MEMORY_MAX_MESSAGES", DefaultMaxMemoryMessages),
-		MaxContextTokens: envInt("MEMORY_MAX_CONTEXT_TOKENS", DefaultMaxContextTokens),
 	}
 }
 
