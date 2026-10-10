@@ -155,13 +155,19 @@ agent-runtime/
 │   ├── 010_run_limits.sql
 │   ├── 011_planner_decision.sql
 │   ├── 012_run_thread.sql
-│   └── 013_memory_indexed.sql
+│   ├── 013_memory_indexed.sql
+│   └── 014_run_identity.sql      # Run 发起者身份（user_id / auth_method）
 │
 └── docs/
     ├── design.md
     ├── architecture-v2.md
     └── architecture-v3.md
 ```
+
+> `migrations/bootstrap.sh` 是按序应用这些文件的幂等引导脚本，
+> 用 `schema_migrations` 表记录版本。**新增迁移后不要用手工 `mysql <` 命令套清单**，
+> 那要求每次都同步改文档，漏一处就断一次全新部署（014 就曾被这样漏掉，
+> 症状是首个 `CreateRun` 报 `Unknown column 'user_id'`）。
 
 ***
 
@@ -984,6 +990,25 @@ docker compose -f deploy/docker-compose.yml up -d
 初始化数据库：
 
 ```bash
+./migrations/bootstrap.sh
+```
+
+脚本按文件名顺序应用全部迁移，并记录版本到 `schema_migrations`，
+重复运行只会应用增量。连接参数缺省为 `agent:agent@127.0.0.1:3306/agent_runtime`，
+可用 `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` 覆盖，
+也可直接复用运行时的连接串：
+
+```bash
+DATABASE_DSN='agent:agent@tcp(127.0.0.1:3308)/agent_runtime?parseTime=true' ./migrations/bootstrap.sh
+```
+
+> **端口注意**：`deploy/docker-compose.yml` 把 MySQL 映射到宿主机 **3308**（Redis 为 6380），
+> 而各进程的 `DATABASE_DSN` 默认值写的是 3306。通过 compose 起的库要用 `MYSQL_PORT=3308`
+> （或 DSN 里写 3308），否则连的是本机另一个 MySQL 实例。
+
+需要精确控制时（例如在 CI 里逐个校验），仍可手工执行：
+
+```bash
 mysql -h127.0.0.1 -uagent -pagent < migrations/001_init.sql
 mysql -h127.0.0.1 -uagent -pagent < migrations/002_node_tenant.sql
 mysql -h127.0.0.1 -uagent -pagent < migrations/003_tool_call_tenant.sql
@@ -997,10 +1022,13 @@ mysql -h127.0.0.1 -uagent -pagent < migrations/010_run_limits.sql
 mysql -h127.0.0.1 -uagent -pagent < migrations/011_planner_decision.sql
 mysql -h127.0.0.1 -uagent -pagent < migrations/012_run_thread.sql
 mysql -h127.0.0.1 -uagent -pagent < migrations/013_memory_indexed.sql
+mysql -h127.0.0.1 -uagent -pagent < migrations/014_run_identity.sql
 ```
 
-> 012 为 `agent_run` 增加 `thread_id`（长期记忆的会话隔离维度），
-> 013 建立 `memory_indexed`（向量投影进度表）。二者缺失时记忆功能会静默失效。
+> 1. 012 为 `agent_run` 增加 `thread_id`（长期记忆的会话隔离维度），
+>    013 建立 `memory_indexed`（向量投影进度表）。二者缺失时记忆功能会静默失效。
+> 2. **014 不可省略**：`store.CreateRun` 的 INSERT 依赖它加的 `user_id` / `auth_method`，
+>    缺失时第一个 Run 就会创建失败。本条此前长期只在 code 里存在、未写进文档。
 
 安装依赖：
 
