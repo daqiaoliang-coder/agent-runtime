@@ -134,6 +134,9 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		case policy.Deny:
 			// Deny is a deterministic policy failure. Do not execute and do not
 			// retry it as an infrastructure failure.
+			// 同样不进 DLQ：重试同样的入参只会命中同样的规则，
+			// 把 DLQ 堆满重复的安全告警，反而淹没真正需要人工介入的故障。
+			obs.Runtime().NodeSettled(ctx, n.TenantID, string(n.Type), "policy_denied")
 			if _, ferr := w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{
 				ID:          fmt.Sprintf("policy-deny-%s-%d", n.ID, time.Now().UnixNano()),
 				EventType:   "AgentPolicyDenied",
@@ -151,6 +154,7 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 			// Durable HITL is a Run-level interrupt in the current runtime.
 			// Because the node has not been claimed yet, Resume can safely
 			// re-queue the same READY node after approval.
+			obs.Runtime().HITL(ctx, n.TenantID, "policy")
 			return w.Approval.Interrupt(
 				ctx,
 				n.TenantID,
@@ -172,6 +176,14 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	obs.From(ctx).InfoContext(ctx, "worker claimed node",
 		"worker_id", w.ID, "run_id", n.RunID, "node_id", n.ID, "tenant_id", n.TenantID,
 		"node_type", n.Type, "attempt", n.Attempt)
+	obs.Runtime().NodeClaimed(ctx, n.TenantID, string(n.Type))
+	// 耗时从此刻起算，覆盖"实际执行 + 持久化"的全过程。
+	// 认领成功到出结果之间的时间才是用户感知的节点耗时，认领之前的排队时间
+	// 属于队列侧指标，两者分开才能判断瓶颈是"没人干活"还是"干活太慢"。
+	nodeStartedAt := time.Now()
+	defer func() {
+		obs.Runtime().NodeDuration(ctx, n.TenantID, string(n.Type), time.Since(nodeStartedAt).Seconds())
+	}()
 	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
 		ID: fmt.Sprintf("runtime-event-%s-start-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 		Type: contracts.EventNodeStarted, Timestamp: time.Now(), Data: map[string]any{"type": n.Type, "name": n.Name, "attempt": n.Attempt},
@@ -208,6 +220,8 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 			next := n.Attempt + 1
 			obs.From(ctx).WarnContext(ctx, "node dead-lettered (token budget)",
 				"run_id", n.RunID, "node_id", n.ID, "attempt", n.Attempt)
+			obs.Runtime().DLQ(ctx, n.TenantID, "token_budget")
+			obs.Runtime().NodeSettled(ctx, n.TenantID, string(n.Type), "failed")
 			_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, budgetErr.Error(), next, "")
 			fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: budgetErr.Error(), Timestamp: time.Now()}
 			injectTraceContext(ctx, &fe)
@@ -253,6 +267,9 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		if errors.Is(execErr, middleware.ErrAwaitingApproval) {
 			obs.From(ctx).InfoContext(ctx, "node awaiting human approval",
 				"run_id", n.RunID, "node_id", n.ID, "tenant_id", n.TenantID, "tool", n.Name)
+			// 护栏转人工不是失败，单列一个指标：它的抬升意味着模型正在被诱导去调用
+			// 危险工具，是安全态势的直接读数（且 Run 会冻结，必然影响按时完成率）。
+			obs.Runtime().HITL(ctx, n.TenantID, "guard")
 			w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
 				ID: fmt.Sprintf("runtime-event-%s-hitl-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 				Type: contracts.EventHITLRequested, Timestamp: time.Now(),
@@ -286,12 +303,17 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 			obs.From(ctx).WarnContext(ctx, "node retried",
 				"run_id", n.RunID, "node_id", n.ID, "attempt_from", n.Attempt,
 				"attempt_to", next, "backoff_until", readyAt.Format(time.RFC3339), "error", execErr)
+			// 重试率是最容易被忽略的容量信号：它稳定为正说明下游已经在退化，
+			// 只是被重试掩盖成了"慢"，等它变成 DLQ 时通常已经错过处置窗口。
+			obs.Runtime().NodeRetry(ctx, n.TenantID, string(n.Type))
 			return nil
 		}
 		// 重试耗尽：入死信队列 + 失败事件，由 Resume 收敛 Run 为 FAILED。
 		// 关键日志：重试耗尽进入死信队列，标志该节点不可恢复，需人工介入或下游兜底。
 		obs.From(ctx).WarnContext(ctx, "node dead-lettered",
 			"run_id", n.RunID, "node_id", n.ID, "attempt", n.Attempt, "error", execErr)
+		obs.Runtime().DLQ(ctx, n.TenantID, "retries_exhausted")
+		obs.Runtime().NodeSettled(ctx, n.TenantID, string(n.Type), "failed")
 		_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, execErr.Error(), next, output)
 		fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: execErr.Error(), Timestamp: time.Now()}
 		injectTraceContext(ctx, &fe)
@@ -331,6 +353,10 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	obs.From(ctx).InfoContext(ctx, "node completed",
 		"run_id", n.RunID, "node_id", n.ID, "tenant_id", n.TenantID,
 		"attempt", n.Attempt, "output_bytes", len(output))
+	// 终态计数放在 worker 而不是 executor：
+	// executor 返回成功时节点还没提交，worker 之后仍有会失败的路要走
+	// （CompleteNodeWithOutbox 本身可能失败）。只有这里才算真正落地。
+	obs.Runtime().NodeSettled(ctx, n.TenantID, string(n.Type), "success")
 	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
 		ID: fmt.Sprintf("runtime-event-%s-finished-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 		Type: contracts.EventNodeFinished, Timestamp: time.Now(), Data: map[string]any{"output": output, "attempt": n.Attempt},

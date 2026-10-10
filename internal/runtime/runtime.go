@@ -154,6 +154,9 @@ func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input, threadID 
 		// 的唯一可观测证据。刻意只记身份维度与错误类别，不记凭证原文。
 		obs.From(ctx).WarnContext(ctx, "run creation denied by authentication",
 			"run_id", id, "tenant_id", tenant, "error", err.Error())
+		// 认证失败计入 rejected 而非简单的创建失败：这条曲线的抬升通常意味着
+		// 凭证被轮转但调用方没跟上，或者有人在撞库 —— 两者的处置完全不同。
+		obs.Runtime().RunError(ctx, tenant, "auth")
 		return nil, err
 	}
 	// 身份维度进 span：让追踪系统能按"谁发起的"检索整条 Trace。
@@ -193,6 +196,7 @@ func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input, threadID 
 		// 计划失败：Run 已落库为 PENDING 但不会有任何节点，事件驱动的 Resumer 无法感知它。
 		// 主动 CAS 收敛为 FAILED，避免留下永不终止的孤儿 Run（最佳努力：标记失败不掩盖原始错误）。
 		reason := fmt.Sprintf("planning failed: %v", err)
+		obs.Runtime().RunError(ctx, run.TenantID, "plan")
 		if ok, cerr := r.Store.UpdateRunCAS(ctx, run.TenantID, run.ID, run.Version, model.RunFailed, "", reason); cerr != nil {
 			obs.From(ctx).ErrorContext(ctx, "run mark-failed on planning error failed",
 				"run_id", run.ID, "tenant_id", run.TenantID, "error", cerr, "planning_error", err)
@@ -214,6 +218,7 @@ func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input, threadID 
 	ok, _ := r.Store.UpdateRunCAS(ctx, run.TenantID, run.ID, run.Version, model.RunRunning, "", "")
 	if !ok {
 		err := fmt.Errorf("run version conflict")
+		obs.Runtime().RunError(ctx, run.TenantID, "version_conflict")
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		return nil, err
@@ -236,6 +241,7 @@ func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input, threadID 
 	// 关键日志：Run 创建并切到 RUNNING，标志一次 Agent 运行的真正起点，串联调度入口与下游 worker。
 	obs.From(ctx).InfoContext(ctx, "run created",
 		"run_id", run.ID, "tenant_id", run.TenantID, "agent_id", run.AgentID, "root_nodes", countRoots(plan.Nodes))
+	obs.Runtime().RunStarted(ctx, run.TenantID)
 	span.SetAttributes(attribute.Int("plan.node_count", len(plan.Nodes)))
 	return r.Store.GetRun(ctx, run.TenantID, run.ID)
 }

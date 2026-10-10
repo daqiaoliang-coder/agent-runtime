@@ -62,16 +62,23 @@ func (r *Resumer) Handle(ctx context.Context, e model.Event) error {
 		return fmt.Errorf("inbox seen: %w", err)
 	}
 	if seen {
+		// 重复投递是 RocketMQ 至少一次的正常表现，不计为错误 ——
+		// 但必须可观测：重复率异常抬升意味着上游发生了大规模重投，
+		// 那通常是 broker 抖动或消费端超时配置的信号。
+		obs.Runtime().EventHandled(ctx, e.TenantID, e.Type, "duplicate")
 		return nil
 	}
 	// 标记后模式：先推进事件，成功后再写 Inbox；处理中途崩溃不会误标完成，
 	// 重投递可幂等重放（底层 CAS/状态机本身幂等）。
 	if err := r.process(ctx, e); err != nil {
+		obs.Runtime().EventHandled(ctx, e.TenantID, e.Type, "error")
 		return err
 	}
 	if err := r.Store.MarkInbox(ctx, e.TenantID, e.ID); err != nil {
+		obs.Runtime().EventHandled(ctx, e.TenantID, e.Type, "error")
 		return fmt.Errorf("mark inbox: %w", err)
 	}
+	obs.Runtime().EventHandled(ctx, e.TenantID, e.Type, "ok")
 	return nil
 }
 
@@ -107,6 +114,10 @@ func (r *Resumer) process(ctx context.Context, e model.Event) error {
 		// 只在 CAS 真正成功时触发结束钩子：并发场景下只有一个 Resumer 能把 Run
 		// 翻到终态，若对失败者也调用，同一次 Run 会记下多条结束审计。
 		if ok {
+			// 节点失败会让 Run 立即收敛到 FAILED，不再走后面的子图推进。
+			// 这条路径必须同样计数，否则"用户可见的失败率"会被系统性低估 ——
+			// 恰好是最该被看见的那部分失败不会被记录。
+			obs.Runtime().RunSettled(ctx, e.TenantID, string(model.RunFailed))
 			r.finishLifecycle(ctx, run, errors.New("node failed"))
 		}
 		return nil
@@ -161,6 +172,10 @@ func (r *Resumer) process(ctx context.Context, e model.Event) error {
 	// 关键日志：Run 收敛到终态，标志 DAG 全部节点结束，是 Runtime 最重要的一次状态跃迁。
 	obs.From(ctx).InfoContext(ctx, "run settled",
 		"run_id", e.RunID, "tenant_id", e.TenantID, "status", string(status), "trigger_node", e.NodeID)
+	// 收敛到终态才计数：这是"Run 层吞吐与成功率"的唯一数据源，
+	// 与 nodes.settled 的区别在于它按 Run 而非节点计 —— 一个失败节点会废掉整个 Run，
+	// 两个指标一起看才能区分"节点偶发失败"与"用户可见的失败率"。
+	obs.Runtime().RunSettled(ctx, e.TenantID, string(status))
 	// CAS 已成功，本次收敛由本 Resumer 独占，触发一次结束钩子。
 	var runErr error
 	if status == model.RunFailed {
@@ -192,6 +207,7 @@ func (r *Resumer) tryConvergeCancelled(ctx context.Context, e model.Event, run *
 	}
 	obs.From(ctx).InfoContext(ctx, "run cancelled",
 		"run_id", e.RunID, "tenant_id", e.TenantID, "trigger_node", e.NodeID)
+	obs.Runtime().RunSettled(ctx, e.TenantID, string(model.RunCancelled))
 	r.finishLifecycle(ctx, run, errRunCancelled)
 	return nil
 }
@@ -360,6 +376,9 @@ func (r *Resumer) convergeOnLimit(ctx context.Context, e model.Event, run *model
 	}
 	obs.From(ctx).WarnContext(ctx, "run failed on limit",
 		"run_id", e.RunID, "tenant_id", e.TenantID, "trigger_node", e.NodeID, "reason", reason)
+	// 防线命中导致的收敛单列 status：它与"节点执行失败"是两类完全不同的问题，
+	// 前者是配额/防护策略生效，后者是下游故障，混在一起会让容量规划失去依据。
+	obs.Runtime().RunSettled(ctx, e.TenantID, "LIMIT")
 	return nil
 }
 

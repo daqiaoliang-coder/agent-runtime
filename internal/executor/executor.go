@@ -226,6 +226,26 @@ func (d *Dispatcher) Execute(ctx context.Context, n *model.Node) (string, error)
 func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, error) {
 	ctx, span := trace.StartSpan(ctx, "executor.llm")
 	defer span.End()
+	// LLM 耗时与成败统一在这里收口上报：两条生成路径（ModelProvider / 遗留 LLM）
+	// 各自 !err → return，若分别埋点必然漏掉其中一条，而漏的那条恰好取决于部署配置，
+	// 于是"生产没有某条曲线"会被误判成"没有该故障"。用闭包统一，只有一处 How。
+	// llmCalled 区分"没走到 LLM"（上下文加载失败、护栏拦截）与"调用了但失败"：
+	// 前者不应污染 LLM 成功率。
+	llmStart := time.Now()
+	llmModel := modelForNode(n)
+	var llmCalled bool
+	var llmErr error
+	defer func() {
+		if !llmCalled {
+			return
+		}
+		obs.Runtime().LLMDuration(ctx, n.TenantID, llmModel, time.Since(llmStart).Seconds())
+		if llmErr != nil {
+			obs.Runtime().LLMRequest(ctx, n.TenantID, llmModel, "error")
+			return
+		}
+		obs.Runtime().LLMRequest(ctx, n.TenantID, llmModel, "ok")
+	}()
 	// 历史在前，当前 user prompt 在后，保证 Agent 上下文连续。
 	// 历史由 ContextLoader 从已提交的 SUCCESS（祖先）节点派生，不依赖 checkpoint。
 	msgs := []llm.Message{{Role: llm.RoleUser, Content: n.Input}}
@@ -254,10 +274,13 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 		return "", err
 	}
 	if d.ModelProvider != nil {
+		llmCalled = true
 		generated, err := d.ModelProvider.Generate(ctx, request)
 		if err != nil {
+			llmErr = err
 			return "", fmt.Errorf("llm: %w", err)
 		}
+		llmModel = flatOr(generated.Model, llmModel)
 		resp = llm.Response{
 			Content: generated.Message.Content,
 			Model:   generated.Model,
@@ -269,16 +292,25 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 		}
 		// 遗留客户端只认 llm.Message：由**改写后**的 request 反构造，
 		// 保证 Before 的改写对两条路径同等生效。
+		llmCalled = true
 		legacy := llm.Request{Model: request.Model, CacheKey: request.CacheKey}
 		for _, m := range request.Messages {
 			legacy.Messages = append(legacy.Messages, llm.Message{Role: llm.Role(m.Role), Content: m.Content})
 		}
 		got, err := d.LLM.Complete(ctx, legacy)
 		if err != nil {
+			llmErr = err
 			return "", fmt.Errorf("llm: %w", err)
 		}
+		llmModel = flatOr(got.Model, llmModel)
 		resp = got
 	}
+	// token 用量同时进 Metrics，而不仅仅躺在 llm_usage 表里：
+	// 表里的数据适合事后对账，但成本失控需要**当次就能看见**，
+	// 按 tenant / model 聚合后可以直接配预算告警，不必等日终跑 SQL。
+	// 结果与耗时由 executeLLM 顶部的闭包统一上报，此处只补 token 维度。
+	obs.Runtime().LLMTokens(ctx, n.TenantID, resp.Model, "prompt", int64(resp.Usage.PromptTokens))
+	obs.Runtime().LLMTokens(ctx, n.TenantID, resp.Model, "completion", int64(resp.Usage.CompletionTokens))
 	// 将 token 用量与模型记入 span，便于在追踪系统中按 token 维度聚合分析。
 	span.SetAttributes(
 		attribute.String("llm.model", resp.Model),
@@ -456,6 +488,11 @@ func (d *Dispatcher) executeTool(ctx context.Context, n *model.Node) (string, er
 	redactedRun := func(ctx context.Context, r contracts.ToolCallRequest) (contracts.ToolResult, error) {
 		res, rerr := run(ctx, r)
 		if rerr != nil {
+			// After 也要观察失败，供审计与熔断器记录结果；执行错误仍原样返回，
+			// 不允许结果中间件掩盖工具实际失败。
+			failed := res
+			failed.IsError = true
+			_, _ = d.afterTool(ctx, ec, r, failed)
 			return res, rerr
 		}
 		return d.afterTool(ctx, ec, r, res)
@@ -517,6 +554,9 @@ func (d *Dispatcher) executeToolIdempotent(ctx context.Context, n *model.Node, r
 	switch rec.Status {
 	case "SUCCESS":
 		// 幂等命中：复用已持久化结果，跳过重复副作用。
+		// 单独记 outcome=reused 而不是混进 success：复用率上升说明重投在增加，
+		// 那是队列/网络层面的信号，与"工具本身执行成功"不是一回事。
+		obs.Runtime().ToolCall(ctx, n.TenantID, req.Name, "reused")
 		return rec.Output, nil
 	case "FAILED":
 		// 上次失败（副作用通常未发生）：回收为 RUNNING 后重试一次。
@@ -534,6 +574,9 @@ func (d *Dispatcher) executeToolIdempotent(ctx context.Context, n *model.Node, r
 		obs.From(ctx).WarnContext(ctx, "tool call refused re-execution",
 			"call_id", callID, "run_id", n.RunID, "node_id", n.ID,
 			"tenant_id", n.TenantID, "status", rec.Status)
+		// 这是本次埋点里最该配告警的一条：这些调用卡在副作用未知的状态且不会自愈，
+		// 只能靠人工确认或下游幂等查询解决。日志会被翻页淹没，指标不会。
+		obs.Runtime().ToolRefused(ctx, n.TenantID, rec.Status)
 		return "", fmt.Errorf("tool call %s stale %s; refusing re-execution (non-idempotent safety)", callID, rec.Status)
 	default:
 		return "", fmt.Errorf("tool call %s unknown status %q", callID, rec.Status)
@@ -543,23 +586,34 @@ func (d *Dispatcher) executeToolIdempotent(ctx context.Context, n *model.Node, r
 // runAndPersistTool 执行工具并按结果更新 tool_call 状态。
 // 歧义失败（超时/取消）标记为 UNKNOWN 以阻止盲目重试；确定失败标记为 FAILED 允许重试。
 func (d *Dispatcher) runAndPersistTool(ctx context.Context, n *model.Node, req contracts.ToolCallRequest, run func(context.Context, contracts.ToolCallRequest) (contracts.ToolResult, error)) (string, error) {
+	// 工具耗时占比通常是节点的绝大部分，且不同工具差异巨大：
+	// 按 tool 维度分开记录，才能回答"慢是因为哪个工具"，而不是笼统地说"节点慢"。
+	start := time.Now()
+	defer func() {
+		obs.Runtime().ToolDuration(ctx, n.TenantID, req.Name, time.Since(start).Seconds())
+	}()
 	result, err := run(ctx, req)
 	if err != nil {
 		if isAmbiguousFailure(err) {
 			_ = d.ToolStore.MarkToolCallUnknown(ctx, n.TenantID, req.CallID)
+			obs.Runtime().ToolCall(ctx, n.TenantID, req.Name, "ambiguous")
 		} else {
 			_ = d.ToolStore.FailToolCall(ctx, n.TenantID, req.CallID)
+			obs.Runtime().ToolCall(ctx, n.TenantID, req.Name, "failed")
 		}
 		return "", fmt.Errorf("tool %q: %w", req.Name, err)
 	}
 	if result.IsError {
 		// 工具返回了确定性错误结果（副作用未发生或工具自报错误），标记 FAILED 允许重试。
 		_ = d.ToolStore.FailToolCall(ctx, n.TenantID, req.CallID)
+		obs.Runtime().ToolCall(ctx, n.TenantID, req.Name, "tool_error")
 		return "", fmt.Errorf("tool %q returned error", req.Name)
 	}
 	if err := d.ToolStore.CompleteToolCall(ctx, n.TenantID, req.CallID, result.Output); err != nil {
+		obs.Runtime().ToolCall(ctx, n.TenantID, req.Name, "persist_error")
 		return "", fmt.Errorf("complete tool call: %w", err)
 	}
+	obs.Runtime().ToolCall(ctx, n.TenantID, req.Name, "success")
 	return result.Output, nil
 }
 
@@ -568,6 +622,17 @@ func (d *Dispatcher) runAndPersistTool(ctx context.Context, n *model.Node, req c
 func idempotencyKey(runID, nodeID, toolName, input string) string {
 	h := sha256.Sum256([]byte(runID + "|" + nodeID + "|" + toolName + "|" + input))
 	return hex.EncodeToString(h[:])
+}
+
+// flatOr 返回首个非空值。
+// 模型名用于 metrics label，为空会退化成 attrOr 填的 "unknown"，
+// 而退化的时间序列会把所有模型的数据并成一条，使得"哪个模型慢/贵"无法归因。
+// 网关通常会在响应里回填实际模型名（可能与请求不同，如发生自动降级），优先用它。
+func flatOr(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
 }
 
 // modelForNode 返回 LLM 节点应使用的模型名。当前从 node.Name 取（LLM 节点的 Name 字段
