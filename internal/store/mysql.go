@@ -493,6 +493,48 @@ func (s *MySQL) ReadyTasks(ctx context.Context, limit int) ([]model.Task, error)
 	return tasks, rows.Err()
 }
 
+// PendingStaleTasks 扫描长期滞留在 PENDING 且依赖已全部就绪的节点（系统级，不限定租户），
+// 供 recovery 周期性补偿投递，关闭"MarkReady 失败或进程崩溃导致节点永远 PENDING"
+// 的调度缺口——正常调度路径中 PENDING 是瞬时状态（插入后立即 MarkReady），
+// 一旦滞留就意味着没有人为它投递，而 ReadyTasks/RecoverExpired 都捞不到 PENDING。
+//
+// 触发条件刻意三重限定，避免与正常调度路径竞争：
+//   - created_at 早于 staleAfter：排除 CreateRun/Replan 刚插入、尚未走到 MarkReady
+//     的新节点（正常窗口是毫秒级，阈值是数个数量级的余量）；
+//   - Run 处于 RUNNING：CANCEL_REQUESTED 的 PENDING 节点由取消扫描收敛，
+//     终态 Run 的 PENDING 节点由 worker 侧 CancelNode 收敛，这里不碰；
+//   - 依赖全部 SUCCESS（NOT EXISTS 非 SUCCESS 前驱）：依赖未就绪的节点不属于
+//     "调度缺口"，补投会绕过 DAG 拓扑顺序；依赖已 FAILED 的节点更不该跑。
+func (s *MySQL) PendingStaleTasks(ctx context.Context, staleAfter time.Duration, limit int) ([]model.Task, error) {
+	sec := int(staleAfter.Seconds())
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT n.node_id, n.run_id, n.tenant_id, n.attempt
+FROM agent_node n
+JOIN agent_run r ON r.run_id = n.run_id AND r.tenant_id = n.tenant_id
+WHERE n.status = ?
+  AND n.created_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)
+  AND r.status = ?
+  AND NOT EXISTS (
+    SELECT 1 FROM agent_edge e JOIN agent_node p ON p.node_id = e.from_node_id
+    WHERE e.to_node_id = n.node_id AND p.tenant_id = n.tenant_id AND p.status <> ?
+  )
+ORDER BY n.created_at LIMIT ?`,
+		model.NodePending, sec, model.RunRunning, model.NodeSuccess, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tasks []model.Task
+	for rows.Next() {
+		var t model.Task
+		if err := rows.Scan(&t.NodeID, &t.RunID, &t.TenantID, &t.Attempt); err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, t)
+	}
+	return tasks, rows.Err()
+}
+
 // RetryNode 将 RUNNING 节点重置为 READY 并安排 ready_at（退避到期时间），attempt+1。
 // 用于可重试失败的指数退避重试；recovery 的 ReadyTasks 扫描会在 ready_at 到期后补投递。
 func (s *MySQL) RetryNode(ctx context.Context, tenant, id string, version int64, readyAt time.Time) (bool, error) {
@@ -585,9 +627,14 @@ func (s *MySQL) MarkInbox(ctx context.Context, tenant, eventID string) error {
 
 // RecordLLMUsage 记录单次 LLM 调用的 token 消耗与成本到 llm_usage 表。
 // 用于按 run/tenant/model 维度聚合统计，支撑成本分析与配额管控。
+//
+// 占位符数量必须与列清单严格一致（9 列 / 9 个 ?）：数据库在 prepare 阶段就校验
+// 列数与值数，不匹配的 INSERT 每次都会失败——此前 10 个占位符对 9 列，
+// 该错误被调用方以 `_ =` 吞掉，llm_usage 永远为空，依赖它的 token 预算防线
+// 与成本统计静默失效。sqlmock 不校验列/值数量，单测发现不了这类缺陷。
 func (s *MySQL) RecordLLMUsage(ctx context.Context, u model.LLMUsage) error {
 	_, err := s.DB.ExecContext(ctx,
-		`INSERT INTO llm_usage(usage_id,run_id,node_id,tenant_id,model,prompt_tokens,completion_tokens,total_tokens,cost) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO llm_usage(usage_id,run_id,node_id,tenant_id,model,prompt_tokens,completion_tokens,total_tokens,cost) VALUES(?,?,?,?,?,?,?,?,?)`,
 		u.ID, u.RunID, u.NodeID, u.TenantID, u.Model, u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.Cost)
 	return err
 }

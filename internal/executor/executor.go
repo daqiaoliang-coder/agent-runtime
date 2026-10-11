@@ -287,6 +287,8 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 		attribute.Int("llm.total_tokens", resp.Usage.TotalTokens),
 	)
 	// 记录 token 用量与估算成本（最佳努力，不影响主流程）。
+	// 但失败必须留日志：token 预算防线依赖 llm_usage 汇总，静默失败会让预算
+	// 永久失效且无任何告警——运维只能从"超长 Run 不被拦截"反推这里出了问题。
 	if d.UsageRecorder != nil && resp.Usage.TotalTokens > 0 {
 		modelName := resp.Model
 		if modelName == "" {
@@ -296,7 +298,7 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 		if d.Pricer != nil {
 			cost = d.Pricer(modelName, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 		}
-		_ = d.UsageRecorder.RecordLLMUsage(ctx, model.LLMUsage{
+		if rerr := d.UsageRecorder.RecordLLMUsage(ctx, model.LLMUsage{
 			ID:               fmt.Sprintf("usage-%s-%d", n.ID, time.Now().UnixNano()),
 			RunID:            n.RunID,
 			NodeID:           n.ID,
@@ -306,7 +308,10 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 			CompletionTokens: resp.Usage.CompletionTokens,
 			TotalTokens:      resp.Usage.TotalTokens,
 			Cost:             cost,
-		})
+		}); rerr != nil {
+			obs.From(ctx).WarnContext(ctx, "record llm usage failed; token budget accounting degraded",
+				"run_id", n.RunID, "node_id", n.ID, "tenant_id", n.TenantID, "error", rerr)
+		}
 	}
 	// 第二步：内容护栏的输出侧，必须在返回之前。
 	// 这个返回值有两个下游：worker 落库为 agent_node.output，ContextLoader 把它重新

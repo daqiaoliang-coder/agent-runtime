@@ -49,11 +49,55 @@ type Worker struct {
 	Approval      ApprovalRequester
 	Retry         retry.Policy
 	ID            string
+	// ExecTimeout 约束单次节点执行（LLM 推理/工具调用）的最长时长，仅覆盖 Exec.Execute，
+	// 不覆盖失败落库等兜底写入。0/负值用 DefaultExecTimeout。
+	// 硬编码超时会误杀合法的长任务：多步工具循环与长输出的时长方差极大，
+	// 超时必须可配置（WORKER_EXEC_TIMEOUT）。
+	ExecTimeout time.Duration
+	// leaseTTL / heartbeatInterval 是执行期租约参数（未导出，测试可缩短）。
+	// 0 值回退 defaultLeaseTTL / defaultHeartbeatInterval。
+	leaseTTL          time.Duration
+	heartbeatInterval time.Duration
 	// EventChain 在事件离开 Runtime 前做变换（当前用于脱敏），为 nil 时原样发射。
 	//
 	// 这一层的必要性高于工具结果脱敏：同一份事件会进 SSE 推给前端、进日志、
 	// 进可观测系统，是敏感信息扩散面最大的地方。工具结果即便在 After 漏了，这里还有一道。
 	EventChain *middleware.EventChain
+}
+
+// DefaultExecTimeout 是单次节点执行的默认超时。覆盖绝大多数 LLM 推理与工具调用，
+// 且远大于执行期租约（30s + 心跳续租），长任务靠心跳维持租约。
+const DefaultExecTimeout = 10 * time.Minute
+
+// defaultLeaseTTL / defaultHeartbeatInterval 是执行期租约的默认参数。
+// 心跳间隔必须小于租约时长（30s / 10s），保证在租约过期前有续租机会。
+const (
+	defaultLeaseTTL          = 30 * time.Second
+	defaultHeartbeatInterval = 10 * time.Second
+)
+
+// execTimeout 返回生效的执行超时。
+func (w *Worker) execTimeout() time.Duration {
+	if w.ExecTimeout > 0 {
+		return w.ExecTimeout
+	}
+	return DefaultExecTimeout
+}
+
+// leaseTTLOrDefault 返回生效的执行期租约时长。
+func (w *Worker) leaseTTLOrDefault() time.Duration {
+	if w.leaseTTL > 0 {
+		return w.leaseTTL
+	}
+	return defaultLeaseTTL
+}
+
+// heartbeatIntervalOrDefault 返回生效的心跳间隔。
+func (w *Worker) heartbeatIntervalOrDefault() time.Duration {
+	if w.heartbeatInterval > 0 {
+		return w.heartbeatInterval
+	}
+	return defaultHeartbeatInterval
 }
 
 // ApprovalRequester is intentionally smaller than runtime.Runtime.
@@ -161,7 +205,7 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		}
 	}
 
-	ok, err := w.Store.ClaimNode(ctx, n.TenantID, n.ID, n.Version, w.ID, 30*time.Second)
+	ok, err := w.Store.ClaimNode(ctx, n.TenantID, n.ID, n.Version, w.ID, w.leaseTTLOrDefault())
 	if err != nil {
 		return err
 	}
@@ -176,20 +220,59 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		ID: fmt.Sprintf("runtime-event-%s-start-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 		Type: contracts.EventNodeStarted, Timestamp: time.Now(), Data: map[string]any{"type": n.Type, "name": n.Name, "attempt": n.Attempt},
 	})
-	n, _ = w.Store.GetNode(ctx, n.TenantID, n.ID)
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
+	// 重新读取节点以拿到 ClaimNode 后的 version（心跳续租按该 version 做 CAS 条件）。
+	// 此前错误被 `_ =` 吞掉：读取失败时 n 仍是 claim 前的旧值，RenewLease 的
+	// version 条件永远不匹配——旧代码忽略结果所以无感，续租失败必须中止本地执行后
+	// 这里就成了关键路径，必须显式处理。
+	n, err = w.Store.GetNode(ctx, n.TenantID, n.ID)
+	if err != nil {
+		return err
+	}
+	// 执行超时只约束 Exec.Execute（LLM 推理/工具调用），不再覆盖后续落库。
+	// 原实现把超时 ctx 同时用于失败落库：超时触发后 EnqueueDLQ/FailNodeWithOutbox
+	// 等兜底写入全部立即失败，节点状态只能靠 PEL 重投间接收敛。
+	// 缺省 10 分钟（原 20s 硬编码会误杀合法的长 LLM 调用），WORKER_EXEC_TIMEOUT 可调。
+	execCtx, execCancel := context.WithTimeout(ctx, w.execTimeout())
+	defer execCancel()
 
 	// 执行期间持续续租，避免长任务租约过期被抢占恢复。
-	heartbeat := time.NewTicker(10 * time.Second)
+	//
+	// 续租失败必须中止本地执行——租约是"唯一执行权"的凭证，两类失败处置不同：
+	//   - CAS 失败（ok=false）：节点已被接管或被 recovery 重置，继续执行就是双跑；
+	//   - DB 错误：容忍有限次数（默认 3 次 ≈ lease 时长），超过即放弃执行权——
+	//     DB 长时间不可用时无法续期，恢复周期会把过期节点重置 READY，
+	//     本 worker 必须在此之前停止写入，否则 lease 过期窗口内就是双执行。
+	// 中止走 execCancel：Exec.Execute 以 context.Canceled 返回，落库走父 ctx，链路照常收敛。
+	heartbeat := time.NewTicker(w.heartbeatIntervalOrDefault())
 	defer heartbeat.Stop()
 	go func() {
+		failures := 0
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-heartbeat.C:
-				_, _ = w.Store.RenewLease(ctx, n.TenantID, n.ID, w.ID, n.Version, 30*time.Second)
+				ok, rerr := w.Store.RenewLease(ctx, n.TenantID, n.ID, w.ID, n.Version, w.leaseTTLOrDefault())
+				if rerr != nil {
+					failures++
+					obs.From(ctx).WarnContext(ctx, "lease renew failed",
+						"worker_id", w.ID, "run_id", n.RunID, "node_id", n.ID,
+						"consecutive_failures", failures, "error", rerr)
+					if failures >= 3 {
+						obs.From(ctx).WarnContext(ctx, "lease renew exhausted; aborting local execution",
+							"worker_id", w.ID, "run_id", n.RunID, "node_id", n.ID)
+						execCancel()
+						return
+					}
+					continue
+				}
+				if !ok {
+					obs.From(ctx).WarnContext(ctx, "lease lost; aborting local execution",
+						"worker_id", w.ID, "run_id", n.RunID, "node_id", n.ID)
+					execCancel()
+					return
+				}
+				failures = 0
 			}
 		}
 	}()
@@ -244,7 +327,9 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	})
 
 	// 执行节点：替换原先的占位字符串拼接，真正发起 LLM 推理或工具调用。
-	output, execErr := w.Exec.Execute(ctx, n)
+	// 使用 execCtx（仅约束本次执行，不覆盖后续落库）；续租失败/丢失时
+	// execCancel 中止执行，execErr 以 context.Canceled 进入失败处理。
+	output, execErr := w.Exec.Execute(execCtx, n)
 	if execErr != nil {
 		// 护栏转人工：Approver 已在拦截时把 Run 与节点一并挂起（WAITING_HUMAN），
 		// 此处**不得**再动节点状态 —— 任何 Fail/Retry/Complete 都会覆盖挂起态，
@@ -423,7 +508,8 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	sec := newSecurityBundle(s, q, creds)
 	disp.ToolChain = sec.ToolChain
 	disp.ModelChain = sec.ModelChain
-	return &Worker{Store: s, Queue: q, Events: r, ID: id, Retry: retry.Default(), Exec: disp, EventChain: sec.EventChain}
+	return &Worker{Store: s, Queue: q, Events: r, ID: id, Retry: retry.Default(), Exec: disp, EventChain: sec.EventChain,
+		ExecTimeout: envDuration("WORKER_EXEC_TIMEOUT", DefaultExecTimeout)}
 }
 
 // newMemoryOptionsFromEnv 按环境变量装配读取路径的记忆能力。

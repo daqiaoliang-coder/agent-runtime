@@ -693,3 +693,99 @@ func TestIntegration_CancelRun_LeavesRunningForWorker(t *testing.T) {
 		t.Errorf("RUNNING node should remain RUNNING after CancelNode attempt, got %s", nStillRunning.Status)
 	}
 }
+
+// TestIntegration_RecordLLMUsage 验证 P0-6 修复：RecordLLMUsage 列/占位符/参数
+// 三者严格一致，真实 MySQL 下 INSERT 必须成功且维度可读回。
+// 此前 10 个占位符对 9 列，prepare 阶段报错且被调用方静默吞掉，
+// llm_usage 永远为空——sqlmock 不校验列/值数量，只有真库能发现这类缺陷。
+func TestIntegration_RecordLLMUsage(t *testing.T) {
+	s := newIntegrationStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	// 外键父记录：llm_usage 无外键，但保持与其他用例一致的建立顺序。
+	u := model.LLMUsage{
+		ID: "it-usage-1", RunID: "it-usage-run", NodeID: "it-usage-node", TenantID: "tenant-it",
+		Model: "gpt-4o", PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Cost: 0.000625,
+	}
+	if err := s.RecordLLMUsage(ctx, u); err != nil {
+		t.Fatalf("RecordLLMUsage: %v (列/占位符/参数是否一致?)", err)
+	}
+	// 汇总读回：token 预算防线依赖该表，落不进去预算就是 0。
+	total, err := s.RunTokenUsage(ctx, "tenant-it", "it-usage-run")
+	if err != nil {
+		t.Fatalf("RunTokenUsage: %v", err)
+	}
+	if total != 150 {
+		t.Errorf("RunTokenUsage = %d, want 150", total)
+	}
+}
+
+// TestIntegration_PendingStaleTasks 验证 PENDING 补偿扫描的三重限定：
+// 只捞 PENDING + 滞留超阈值 + Run 为 RUNNING + 依赖全 SUCCESS 的节点；
+// 新节点、依赖未就绪节点、CANCELLED Run 的节点都不该被补投。
+func TestIntegration_PendingStaleTasks(t *testing.T) {
+	s := newIntegrationStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	const runID, tenant = "it-pend-1", "tenant-it"
+	run := &model.Run{ID: runID, TenantID: tenant, Status: model.RunRunning, Version: 1}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	// 拓扑：a (根) ──> b ；x (根) 属于另一个已取消的 Run
+	plan := model.Plan{Nodes: []model.PlanNode{
+		{ID: runID + ":a", Type: model.NodeLLM, Name: "a"},
+		{ID: runID + ":b", Type: model.NodeLLM, Name: "b", DependsOn: []string{runID + ":a"}},
+	}}
+	if err := s.InsertPlan(ctx, runID, tenant, plan); err != nil {
+		t.Fatal(err)
+	}
+	// 新插入的 PENDING 节点（created_at 刚刚）不应被补投。
+	stale, err := s.PendingStaleTasks(ctx, time.Minute, 10)
+	if err != nil {
+		t.Fatalf("PendingStaleTasks: %v", err)
+	}
+	if len(stale) != 0 {
+		t.Errorf("freshly inserted PENDING nodes must not be scanned, got %+v", stale)
+	}
+	// 把 a 的 created_at 回拨到阈值之外（模拟 MarkReady 失败遗留的调度缺口）。
+	if _, err := s.DB.ExecContext(ctx,
+		`UPDATE agent_node SET created_at = DATE_SUB(NOW(6), INTERVAL 2 MINUTE) WHERE node_id=? AND tenant_id=?`,
+		runID+":a", tenant); err != nil {
+		t.Fatal(err)
+	}
+	// b 依赖未就绪，即使回拨也不应被补投；a 依赖已满足，应被补投。
+	stale, err = s.PendingStaleTasks(ctx, time.Minute, 10)
+	if err != nil {
+		t.Fatalf("PendingStaleTasks: %v", err)
+	}
+	if len(stale) != 1 || stale[0].NodeID != runID+":a" {
+		t.Fatalf("stale tasks = %+v, want only %s:a (b deps not ready)", stale, runID)
+	}
+	// 补投：MarkReady 后节点不再被重复扫到。
+	if err := s.MarkReady(ctx, tenant, runID+":a"); err != nil {
+		t.Fatal(err)
+	}
+	stale, _ = s.PendingStaleTasks(ctx, time.Minute, 10)
+	if len(stale) != 0 {
+		t.Errorf("after MarkReady, stale scan should be empty, got %+v", stale)
+	}
+	// 已取消 Run 的 PENDING 节点不补投：构造第二个 Run 并回拨节点。
+	cRun := &model.Run{ID: "it-pend-2", TenantID: tenant, Status: model.RunCancelled, Version: 1}
+	_ = s.CreateRun(ctx, cRun)
+	_ = s.InsertPlan(ctx, "it-pend-2", tenant, model.Plan{Nodes: []model.PlanNode{
+		{ID: "it-pend-2:x", Type: model.NodeLLM, Name: "x"},
+	}})
+	if _, err := s.DB.ExecContext(ctx,
+		`UPDATE agent_node SET created_at = DATE_SUB(NOW(6), INTERVAL 2 MINUTE) WHERE node_id='it-pend-2:x'`); err != nil {
+		t.Fatal(err)
+	}
+	stale, _ = s.PendingStaleTasks(ctx, time.Minute, 10)
+	for _, tk := range stale {
+		if tk.RunID == "it-pend-2" {
+			t.Errorf("nodes of non-RUNNING runs must not be scanned, got %+v", tk)
+		}
+	}
+}

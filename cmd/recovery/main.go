@@ -17,6 +17,10 @@ import (
 	"time"
 )
 
+// defaultPendingStaleAfter 是 PENDING 节点补偿扫描的默认滞留阈值。
+// 正常调度窗口为毫秒级，60s 已是数个数量级的余量，不会与正常路径竞争。
+const defaultPendingStaleAfter = time.Minute
+
 func main() {
 	ctx := context.Background()
 	if shutdown, err := trace.Init("agent-recovery"); err != nil {
@@ -38,6 +42,15 @@ func main() {
 	}
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	// PENDING 节点的滞留阈值：正常调度路径中 PENDING 是瞬时状态（插入后立即
+	// MarkReady），超过阈值的 PENDING 且依赖已就绪的节点视为调度缺口，
+	// 由 PendingStaleTasks 补偿投递。PENDING_STALE_AFTER 可调，0/非法值回退默认。
+	staleAfter := defaultPendingStaleAfter
+	if v := os.Getenv("PENDING_STALE_AFTER"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			staleAfter = d
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -76,6 +89,21 @@ func main() {
 			tasks, err := s.RecoverExpired(ctx, 100)
 			if err != nil {
 				obs.From(ctx).ErrorContext(ctx, "recovery scan failed", "error", err)
+			}
+			// PENDING 补偿扫描：MarkReady 失败或崩溃遗留的长期 PENDING 节点，
+			// ReadyTasks/RecoverExpired 都捞不到，这里是唯一的调度缺口兜底。
+			// 先 MarkReady 再入队，与 ReadyTasks 的补投递语义一致；
+			// 重复扫描由 MarkReady 的状态条件（仅 PENDING 生效）幂等拦截。
+			stale, err := s.PendingStaleTasks(ctx, staleAfter, 100)
+			if err != nil {
+				obs.From(ctx).ErrorContext(ctx, "pending scan failed", "error", err)
+			}
+			for _, t := range stale {
+				if err := s.MarkReady(ctx, t.TenantID, t.NodeID); err != nil {
+					obs.From(ctx).ErrorContext(ctx, "mark pending node ready failed", "run_id", t.RunID, "node_id", t.NodeID, "error", err)
+					continue
+				}
+				tasks = append(tasks, t)
 			}
 			ready, err := s.ReadyTasks(ctx, 100)
 			if err != nil {
