@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"agent-runtime/internal/contracts"
+	"agent-runtime/internal/id"
 	"agent-runtime/internal/model"
 	"agent-runtime/internal/obs"
 	"agent-runtime/internal/trace"
@@ -57,6 +58,16 @@ type Runtime struct {
 	// Lifecycle 是 Run 生命周期的横切链；为 nil 时不执行任何钩子。
 	// OnRunStart 在 Run 落库**之前**执行，OnRunFinish 由 Resumer 在收敛到终态时执行。
 	Lifecycle RunLifecycle
+	// CancelPub 在 CancelRun 落库成功后广播取消信号（Redis pub/sub），
+	// 让正在执行该 Run 的 worker 毫秒级感知并止损（否则要等下一个心跳轮询）。
+	// 为 nil 时跳过广播，worker 靠降频轮询兜底——发布失败同理，只记日志不重试：
+	// 信号是加速器不是事实源，晚一点感知不影响正确性。
+	CancelPub CancelPublisher
+}
+
+// CancelPublisher 由 *queue.RedisQueue 实现；接口化是为了 runtime 单测免依赖 Redis。
+type CancelPublisher interface {
+	PublishCancel(ctx context.Context, runID string) error
 }
 
 // authenticate 把 ctx 中的原始凭证换成可信身份。
@@ -137,23 +148,23 @@ func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input, threadID 
 	// Run 创建的根 span：整条 Trace 的起点，串联 planner、入队与下游 worker 执行。
 	ctx, span := trace.StartSpan(ctx, "run.create")
 	defer span.End()
-	id := fmt.Sprintf("run-%d", time.Now().UnixNano())
+	runID := id.New("run")
 	span.SetAttributes(
-		attribute.String("run.id", id),
+		attribute.String("run.id", runID),
 		attribute.String("tenant.id", tenant),
 		attribute.String("agent.id", agent),
 		attribute.String("thread.id", threadID),
 	)
 
 	// 1) 认证：凭证 → 身份。失败即返回，不产生任何持久化痕迹。
-	identity, err := r.authenticate(ctx, tenant, id)
+	identity, err := r.authenticate(ctx, tenant, runID)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		// 认证失败是安全事件，必须留下日志：它是"有人在用无效凭证尝试创建 Run"
 		// 的唯一可观测证据。刻意只记身份维度与错误类别，不记凭证原文。
 		obs.From(ctx).WarnContext(ctx, "run creation denied by authentication",
-			"run_id", id, "tenant_id", tenant, "error", err.Error())
+			"run_id", runID, "tenant_id", tenant, "error", err.Error())
 		// 认证失败计入 rejected 而非简单的创建失败：这条曲线的抬升通常意味着
 		// 凭证被轮转但调用方没跟上，或者有人在撞库 —— 两者的处置完全不同。
 		obs.Runtime().RunError(ctx, tenant, "auth")
@@ -168,7 +179,7 @@ func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input, threadID 
 	}
 
 	run := &model.Run{
-		ID: id, TenantID: tenant, ThreadID: threadID, AgentID: agent,
+		ID: runID, TenantID: tenant, ThreadID: threadID, AgentID: agent,
 		UserID: identity.UserID, AuthMethod: identity.Method,
 		Status: model.RunPending, Input: input,
 		MaxSteps: 50, MaxRounds: 10, CreatedAt: time.Now(), UpdatedAt: time.Now(),
@@ -285,5 +296,13 @@ func (r *Runtime) Cancel(ctx context.Context, tenant, runID, reason string) erro
 	// 关键日志：用户取消请求已落盘，Run 进入 CANCEL_REQUESTED，等待节点收敛到 CANCELLED。
 	obs.From(ctx).InfoContext(ctx, "run cancel requested",
 		"run_id", runID, "tenant_id", tenant, "reason", reason)
+	// 广播取消信号（best-effort）：worker 的 CancelBus 命中后毫秒级取消在途 LLM 调用。
+	// 失败仅延迟感知（兜底轮询 ≤30s 拦截），不值得让取消 API 因此失败。
+	if r.CancelPub != nil {
+		if perr := r.CancelPub.PublishCancel(ctx, runID); perr != nil {
+			obs.From(ctx).WarnContext(ctx, "cancel signal publish failed; workers will detect via polling",
+				"run_id", runID, "error", perr)
+		}
+	}
 	return nil
 }

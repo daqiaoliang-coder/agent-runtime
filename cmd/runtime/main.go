@@ -13,9 +13,10 @@ import (
 	"agent-runtime/internal/trace"
 	"context"
 	"fmt"
-	_ "github.com/go-sql-driver/mysql"
 	"log"
 	"os"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 func main() {
@@ -52,6 +53,9 @@ func main() {
 		}
 	}
 	rt := &runtime.Runtime{Store: s, Queue: q, Planner: planner}
+	// 取消信号广播：CancelRun 落库成功后经 Redis pub/sub 通知 worker 毫秒级止损。
+	// 发布是 best-effort（失败仅延迟感知，兜底轮询会拦截），不引入启动依赖。
+	rt.CancelPub = q
 
 	// 认证装配：AUTH_ENABLED=true 时校验入口凭证，并把身份写入 agent_run。
 	//
