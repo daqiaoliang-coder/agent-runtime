@@ -4,6 +4,7 @@
 package store
 
 import (
+	"agent-runtime/internal/id"
 	"agent-runtime/internal/model"
 	"context"
 	"database/sql"
@@ -548,7 +549,7 @@ func (s *MySQL) RetryNode(ctx context.Context, tenant, id string, version int64,
 
 // EnqueueDLQ 将重试耗尽的节点写入死信队列，供人工排查或补偿。
 func (s *MySQL) EnqueueDLQ(ctx context.Context, tenant, runID, nodeID, reason string, attempt int, payload string) error {
-	dlqID := fmt.Sprintf("dlq-%s-%d", nodeID, time.Now().UnixNano())
+	dlqID := id.New("dlq")
 	_, err := s.DB.ExecContext(ctx, `INSERT INTO agent_dlq(dlq_id,run_id,node_id,tenant_id,reason,attempt,payload) VALUES(?,?,?,?,?,?,?)`, dlqID, runID, nodeID, tenant, reason, attempt, payload)
 	return err
 }
@@ -699,8 +700,8 @@ func (s *MySQL) InterruptRun(ctx context.Context, tenant, runID, nodeID, reason 
 	if err != nil || n != 1 {
 		return false, err
 	}
-	id := fmt.Sprintf("interrupt-%d", time.Now().UnixNano())
-	if _, err := tx.ExecContext(ctx, `INSERT INTO run_interrupt(interrupt_id,run_id,tenant_id,node_id,reason,status) VALUES(?,?,?,?,?,'WAITING')`, id, runID, tenant, nodeID, reason); err != nil {
+	interruptID := id.New("interrupt")
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_interrupt(interrupt_id,run_id,tenant_id,node_id,reason,status) VALUES(?,?,?,?,?,'WAITING')`, interruptID, runID, tenant, nodeID, reason); err != nil {
 		return false, err
 	}
 	// 挂起触发节点并释放租约。nodeID 为空时跳过：Run 级中断（非护栏触发）
