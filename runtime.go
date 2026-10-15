@@ -1,6 +1,7 @@
 package main
 
 import (
+	"agent-runtime/internal/id"
 	"context"
 	"errors"
 	"fmt"
@@ -261,5 +262,5 @@ func (r *Runtime) newStepID() string {
 }
 
 func newID(prefix string) string {
-	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	return id.New(prefix)
 }

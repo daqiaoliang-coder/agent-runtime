@@ -6,6 +6,7 @@ require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/apache/rocketmq-client-go/v2 v2.1.0
 	github.com/go-sql-driver/mysql v1.9.1
+	github.com/google/uuid v1.6.0
 	github.com/qdrant/go-client v1.19.2
 	github.com/redis/go-redis/v9 v9.7.3
 	go.opentelemetry.io/contrib/bridges/otelslog v0.20.1
@@ -33,7 +34,6 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/golang/mock v1.3.1 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0 // indirect
 	github.com/json-iterator/go v1.1.9 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421 // indirect

@@ -6,6 +6,7 @@ import (
 	"agent-runtime/internal/adapters/llm"
 	tooladapter "agent-runtime/internal/adapters/tool"
 	"agent-runtime/internal/contracts"
+	"agent-runtime/internal/id"
 	"agent-runtime/internal/llm"
 	"agent-runtime/internal/middleware"
 	"agent-runtime/internal/model"
@@ -329,7 +330,7 @@ func (d *Dispatcher) executeLLM(ctx context.Context, n *model.Node) (string, err
 			cost = d.Pricer(modelName, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 		}
 		_ = d.UsageRecorder.RecordLLMUsage(ctx, model.LLMUsage{
-			ID:               fmt.Sprintf("usage-%s-%d", n.ID, time.Now().UnixNano()),
+			ID:               id.New("usage"),
 			RunID:            n.RunID,
 			NodeID:           n.ID,
 			TenantID:         n.TenantID,
