@@ -4,13 +4,12 @@ package worker
 
 import (
 	"agent-runtime/internal/adapters/credential"
-	llmadapter "agent-runtime/internal/adapters/llm"
+	"agent-runtime/internal/adapters/llm"
 	tooladapter "agent-runtime/internal/adapters/tool"
 	"agent-runtime/internal/adapters/vector"
 	"agent-runtime/internal/contracts"
 	"agent-runtime/internal/event"
 	"agent-runtime/internal/executor"
-	"agent-runtime/internal/id"
 	"agent-runtime/internal/llm"
 	"agent-runtime/internal/middleware"
 	"agent-runtime/internal/model"
@@ -37,27 +36,11 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
-// WorkerStore 是 Worker.Handle 所需的持久化操作接口。
-// 把 Store 抽成接口是为了让取消路径可以用 fake 做纯单元测试（不需要真实 MySQL）。
-// *store.MySQL 天然满足该接口，NewFromEnv 的装配零改动。
-type WorkerStore interface {
-	GetRun(ctx context.Context, tenant, id string) (*model.Run, error)
-	GetNode(ctx context.Context, tenant, id string) (*model.Node, error)
-	ClaimNode(ctx context.Context, tenant, id string, version int64, owner string, lease time.Duration) (bool, error)
-	RenewLease(ctx context.Context, tenant, id, owner string, version int64, lease time.Duration) (bool, error)
-	RunTokenUsage(ctx context.Context, tenant, runID string) (int, error)
-	CompleteNodeWithOutbox(ctx context.Context, node *model.Node, output string, e model.OutboxMessage) (bool, error)
-	FailNodeWithOutbox(ctx context.Context, node *model.Node, e model.OutboxMessage) (bool, error)
-	RetryNode(ctx context.Context, tenant, id string, version int64, readyAt time.Time) (bool, error)
-	EnqueueDLQ(ctx context.Context, tenant, runID, nodeID, reason string, attempt int, payload string) error
-	CancelNode(ctx context.Context, tenant, id string, version int64) (bool, error)
-}
-
 // Worker 是单个任务执行器实例。
 // ID 用于租约归属标识；Exec 执行节点（默认为带 Stub LLM + 演示工具的 Dispatcher）。
 // Events 字段预留给直接发布场景（当前完成/失败事件经 Outbox 投递）。
 type Worker struct {
-	Store         WorkerStore
+	Store         *store.MySQL
 	Queue         *queue.RedisQueue
 	Events        *event.RocketMQ
 	RuntimeEvents event.Sink
@@ -66,37 +49,55 @@ type Worker struct {
 	Approval      ApprovalRequester
 	Retry         retry.Policy
 	ID            string
+	// ExecTimeout 约束单次节点执行（LLM 推理/工具调用）的最长时长，仅覆盖 Exec.Execute，
+	// 不覆盖失败落库等兜底写入。0/负值用 DefaultExecTimeout。
+	// 硬编码超时会误杀合法的长任务：多步工具循环与长输出的时长方差极大，
+	// 超时必须可配置（WORKER_EXEC_TIMEOUT）。
+	ExecTimeout time.Duration
+	// leaseTTL / heartbeatInterval 是执行期租约参数（未导出，测试可缩短）。
+	// 0 值回退 defaultLeaseTTL / defaultHeartbeatInterval。
+	leaseTTL          time.Duration
+	heartbeatInterval time.Duration
 	// EventChain 在事件离开 Runtime 前做变换（当前用于脱敏），为 nil 时原样发射。
 	//
 	// 这一层的必要性高于工具结果脱敏：同一份事件会进 SSE 推给前端、进日志、
 	// 进可观测系统，是敏感信息扩散面最大的地方。工具结果即便在 After 漏了，这里还有一道。
 	EventChain *middleware.EventChain
-	// heartbeatInterval 控制 Run 取消轮询与租约续租的频率。
-	// 零值默认 3s（生产档位），测试注入可缩到毫秒级加速用例。
-	heartbeatInterval time.Duration
-	// nodeTimeout 是节点执行的硬性时限兜底，零值默认 20s。
-	// 生产经 WORKER_NODE_TIMEOUT 配置（如 "5m"）以容纳长工具调用与多步
-	// ReAct 循环；测试注入可缩短加速用例。租约不受它约束：执行期间
-	// 心跳持续续租，超时只终结执行，不改变崩溃恢复语义。
-	nodeTimeout time.Duration
-	// CancelBus 是 Run 取消信号的进程级订阅（Redis pub/sub）。非 nil 时心跳
-	// 查内存集合取代每 tick 的 GetRun 读（DB 读 QPS 从 1/interval 降到
-	// 1/pollInterval），取消感知延迟从 ≤interval 降到毫秒级。
-	// 为 nil 时（测试直构/旧装配）退回每 tick GetRun 轮询——行为与改造前一致。
-	CancelBus CancelSignals
-	// pollInterval 是 CancelBus 生效时 GetRun 的兜底轮询间隔（零值默认 30s）。
-	// pub/sub 信号丢失/迟到（订阅断线、worker 重启窗口）由它拦截；租约续期
-	// 仍按 heartbeatInterval，两者互不替代。
-	pollInterval time.Duration
 }
 
-// CancelSignals 是 Worker 消费的取消信号源（由 *queue.CancelBus 实现）。
-// 抽成接口是为了 worker 单测可用内存 fake，无需真实 Redis pub/sub。
-type CancelSignals interface {
-	// Cancelled 报告 run 是否收到过未过期的取消信号。
-	Cancelled(runID string) bool
-	// Clear 消费掉该 run 的信号（已处理或忽略）。
-	Clear(runID string)
+// DefaultExecTimeout 是单次节点执行的默认超时。覆盖绝大多数 LLM 推理与工具调用，
+// 且远大于执行期租约（30s + 心跳续租），长任务靠心跳维持租约。
+const DefaultExecTimeout = 10 * time.Minute
+
+// defaultLeaseTTL / defaultHeartbeatInterval 是执行期租约的默认参数。
+// 心跳间隔必须小于租约时长（30s / 10s），保证在租约过期前有续租机会。
+const (
+	defaultLeaseTTL          = 30 * time.Second
+	defaultHeartbeatInterval = 10 * time.Second
+)
+
+// execTimeout 返回生效的执行超时。
+func (w *Worker) execTimeout() time.Duration {
+	if w.ExecTimeout > 0 {
+		return w.ExecTimeout
+	}
+	return DefaultExecTimeout
+}
+
+// leaseTTLOrDefault 返回生效的执行期租约时长。
+func (w *Worker) leaseTTLOrDefault() time.Duration {
+	if w.leaseTTL > 0 {
+		return w.leaseTTL
+	}
+	return defaultLeaseTTL
+}
+
+// heartbeatIntervalOrDefault 返回生效的心跳间隔。
+func (w *Worker) heartbeatIntervalOrDefault() time.Duration {
+	if w.heartbeatInterval > 0 {
+		return w.heartbeatInterval
+	}
+	return defaultHeartbeatInterval
 }
 
 // ApprovalRequester is intentionally smaller than runtime.Runtime.
@@ -177,11 +178,8 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		case policy.Deny:
 			// Deny is a deterministic policy failure. Do not execute and do not
 			// retry it as an infrastructure failure.
-			// 同样不进 DLQ：重试同样的入参只会命中同样的规则，
-			// 把 DLQ 堆满重复的安全告警，反而淹没真正需要人工介入的故障。
-			obs.Runtime().NodeSettled(ctx, n.TenantID, string(n.Type), "policy_denied")
 			if _, ferr := w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{
-				ID:          id.New("policy-deny"),
+				ID:          fmt.Sprintf("policy-deny-%s-%d", n.ID, time.Now().UnixNano()),
 				EventType:   "AgentPolicyDenied",
 				AggregateID: n.RunID,
 				Payload: fmt.Sprintf(`{"node_id":%q,"policy_id":%q,"reason":%q}`,
@@ -197,7 +195,6 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 			// Durable HITL is a Run-level interrupt in the current runtime.
 			// Because the node has not been claimed yet, Resume can safely
 			// re-queue the same READY node after approval.
-			obs.Runtime().HITL(ctx, n.TenantID, "policy")
 			return w.Approval.Interrupt(
 				ctx,
 				n.TenantID,
@@ -208,7 +205,7 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		}
 	}
 
-	ok, err := w.Store.ClaimNode(ctx, n.TenantID, n.ID, n.Version, w.ID, 30*time.Second)
+	ok, err := w.Store.ClaimNode(ctx, n.TenantID, n.ID, n.Version, w.ID, w.leaseTTLOrDefault())
 	if err != nil {
 		return err
 	}
@@ -219,88 +216,63 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	obs.From(ctx).InfoContext(ctx, "worker claimed node",
 		"worker_id", w.ID, "run_id", n.RunID, "node_id", n.ID, "tenant_id", n.TenantID,
 		"node_type", n.Type, "attempt", n.Attempt)
-	obs.Runtime().NodeClaimed(ctx, n.TenantID, string(n.Type))
-	// 耗时从此刻起算，覆盖"实际执行 + 持久化"的全过程。
-	// 认领成功到出结果之间的时间才是用户感知的节点耗时，认领之前的排队时间
-	// 属于队列侧指标，两者分开才能判断瓶颈是"没人干活"还是"干活太慢"。
-	nodeStartedAt := time.Now()
-	defer func() {
-		obs.Runtime().NodeDuration(ctx, n.TenantID, string(n.Type), time.Since(nodeStartedAt).Seconds())
-	}()
 	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
-		ID: id.New("runtime-event"), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
+		ID: fmt.Sprintf("runtime-event-%s-start-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 		Type: contracts.EventNodeStarted, Timestamp: time.Now(), Data: map[string]any{"type": n.Type, "name": n.Name, "attempt": n.Attempt},
 	})
-	n, _ = w.Store.GetNode(ctx, n.TenantID, n.ID)
-	// ctx 层级：parentCtx → runCancelCtx (WithCancel，由 heartbeat 触发) → timeoutCtx (节点时限)。
-	// runCancelCtx 捕获 Run 级取消信号；timeoutCtx 是节点执行的硬兜底。
-	// 层级不可反：runCancelCtx.Done() 必须先于 timeoutCtx.Done()，否则用户取消会被超时吞没。
-	nodeTimeout := w.nodeTimeout
-	if nodeTimeout <= 0 {
-		nodeTimeout = 20 * time.Second
+	// 重新读取节点以拿到 ClaimNode 后的 version（心跳续租按该 version 做 CAS 条件）。
+	// 此前错误被 `_ =` 吞掉：读取失败时 n 仍是 claim 前的旧值，RenewLease 的
+	// version 条件永远不匹配——旧代码忽略结果所以无感，续租失败必须中止本地执行后
+	// 这里就成了关键路径，必须显式处理。
+	n, err = w.Store.GetNode(ctx, n.TenantID, n.ID)
+	if err != nil {
+		return err
 	}
-	runCancelCtx, runCancel := context.WithCancel(ctx)
-	ctx, timeoutCancel := context.WithTimeout(runCancelCtx, nodeTimeout)
-	defer runCancel()
-	defer timeoutCancel()
+	// 执行超时只约束 Exec.Execute（LLM 推理/工具调用），不再覆盖后续落库。
+	// 原实现把超时 ctx 同时用于失败落库：超时触发后 EnqueueDLQ/FailNodeWithOutbox
+	// 等兜底写入全部立即失败，节点状态只能靠 PEL 重投间接收敛。
+	// 缺省 10 分钟（原 20s 硬编码会误杀合法的长 LLM 调用），WORKER_EXEC_TIMEOUT 可调。
+	execCtx, execCancel := context.WithTimeout(ctx, w.execTimeout())
+	defer execCancel()
 
-	// 执行期间持续续租 + 轮询 Run 取消信号。
-	// 默认 3s 周期（取消感知延迟与 DB 负载的折中：1000 并发节点 × 1/3 QPS ≈ 333 QPS）；
-	// heartbeatInterval 可在测试里注入毫秒级值加速用例。
-	interval := w.heartbeatInterval
-	if interval <= 0 {
-		interval = 3 * time.Second
-	}
-	heartbeat := time.NewTicker(interval)
+	// 执行期间持续续租，避免长任务租约过期被抢占恢复。
+	//
+	// 续租失败必须中止本地执行——租约是"唯一执行权"的凭证，两类失败处置不同：
+	//   - CAS 失败（ok=false）：节点已被接管或被 recovery 重置，继续执行就是双跑；
+	//   - DB 错误：容忍有限次数（默认 3 次 ≈ lease 时长），超过即放弃执行权——
+	//     DB 长时间不可用时无法续期，恢复周期会把过期节点重置 READY，
+	//     本 worker 必须在此之前停止写入，否则 lease 过期窗口内就是双执行。
+	// 中止走 execCancel：Exec.Execute 以 context.Canceled 返回，落库走父 ctx，链路照常收敛。
+	heartbeat := time.NewTicker(w.heartbeatIntervalOrDefault())
 	defer heartbeat.Stop()
-	// 取消感知三级防线：① CancelBus 内存信号（毫秒级延迟，零 DB）
-	// ② 降频 GetRun 兜底轮询（拦截 pub/sub 丢失/迟到，缺省 30s 一次）
-	// ③ 认领时前置 GetRun（Handle 入口已有）。
-	// CancelBus 为 nil 时退回每 tick GetRun——与改造前行为逐字节一致（存量测试依赖）。
-	// 信号命中后仍要 DB 确认状态：pub/sub 是加速器不是事实源，过期/串扰信号
-	// 若直接取消会误杀正常 Run（误取消 = 节点被打成 FAILED，污染结果不可逆）。
-	pollEvery := 1
-	if w.CancelBus != nil {
-		pi := w.pollInterval
-		if pi <= 0 {
-			pi = 30 * time.Second
-		}
-		pollEvery = int(pi / interval)
-		if pollEvery < 1 {
-			pollEvery = 1
-		}
-	}
-	tick := 0
 	go func() {
+		failures := 0
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-heartbeat.C:
-				tick++
-				cancelled := false
-				switch {
-				case w.CancelBus != nil && w.CancelBus.Cancelled(n.RunID):
-					w.CancelBus.Clear(n.RunID) // 消费信号：无论 DB 确认结果都不再依赖它
-					if r, gerr := w.Store.GetRun(ctx, n.TenantID, n.RunID); gerr == nil && r.Status == model.RunCancelRequested {
-						cancelled = true
+				ok, rerr := w.Store.RenewLease(ctx, n.TenantID, n.ID, w.ID, n.Version, w.leaseTTLOrDefault())
+				if rerr != nil {
+					failures++
+					obs.From(ctx).WarnContext(ctx, "lease renew failed",
+						"worker_id", w.ID, "run_id", n.RunID, "node_id", n.ID,
+						"consecutive_failures", failures, "error", rerr)
+					if failures >= 3 {
+						obs.From(ctx).WarnContext(ctx, "lease renew exhausted; aborting local execution",
+							"worker_id", w.ID, "run_id", n.RunID, "node_id", n.ID)
+						execCancel()
+						return
 					}
-				case w.CancelBus == nil || tick%pollEvery == 0:
-					if r, gerr := w.Store.GetRun(ctx, n.TenantID, n.RunID); gerr == nil && r.Status == model.RunCancelRequested {
-						cancelled = true
-					}
+					continue
 				}
-				if cancelled {
-					// runCancel() 会沿 ctx 链向下传播，让 OpenAIClient.Complete 的
-					// http.NewRequestWithContext 感知取消并中断 HTTP 请求
-					// （已烧的 token 无法挽回，但可及时止损）。
-					obs.From(ctx).InfoContext(ctx, "worker propagating run cancel to running node",
-						"run_id", n.RunID, "node_id", n.ID, "tenant_id", n.TenantID)
-					runCancel()
+				if !ok {
+					obs.From(ctx).WarnContext(ctx, "lease lost; aborting local execution",
+						"worker_id", w.ID, "run_id", n.RunID, "node_id", n.ID)
+					execCancel()
 					return
 				}
-				// 续租放在取消检查之后：runCancel 触发时 ctx 可能已 cancel，续租不应再发。
-				_, _ = w.Store.RenewLease(ctx, n.TenantID, n.ID, w.ID, n.Version, 30*time.Second)
+				failures = 0
 			}
 		}
 	}()
@@ -319,15 +291,13 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 			next := n.Attempt + 1
 			obs.From(ctx).WarnContext(ctx, "node dead-lettered (token budget)",
 				"run_id", n.RunID, "node_id", n.ID, "attempt", n.Attempt)
-			obs.Runtime().DLQ(ctx, n.TenantID, "token_budget")
-			obs.Runtime().NodeSettled(ctx, n.TenantID, string(n.Type), "failed")
 			_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, budgetErr.Error(), next, "")
-			fe := model.Event{ID: id.New("event"), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: budgetErr.Error(), Timestamp: time.Now()}
+			fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: budgetErr.Error(), Timestamp: time.Now()}
 			injectTraceContext(ctx, &fe)
 			payload, _ := json.Marshal(fe)
 			_, _ = w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{ID: fe.ID, EventType: fe.Type, AggregateID: n.RunID, Payload: string(payload)})
 			w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
-				ID: id.New("runtime-event"), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
+				ID: fmt.Sprintf("runtime-event-%s-failed-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 				Type: contracts.EventNodeFailed, Timestamp: time.Now(), Data: map[string]any{"error": budgetErr.Error(), "attempt": n.Attempt},
 			})
 			return nil
@@ -357,18 +327,9 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	})
 
 	// 执行节点：替换原先的占位字符串拼接，真正发起 LLM 推理或工具调用。
-	output, execErr := w.Exec.Execute(ctx, n)
-
-	// —— 取消拦截：必须在重试/DLQ/UNKNOWN 之前处理 ——
-	// ctx.Canceled 若流进 executor.isAmbiguousFailure，工具节点会被标 UNKNOWN；
-	// 若流进 w.Retry.ShouldRetry，会被指数退避重试（完全违背取消意图）。
-	// 处理路径：FailNodeWithOutbox（节点→FAILED）+ AgentStepFailed(error="run cancelled")。
-	// Resumer.tryConvergeCancelled 只看 Run.Status==CANCEL_REQUESTED 不看事件类型，
-	// 所以会正确收敛 Run 到 CANCELLED，不会走 RunFailed 分支。
-	if execErr != nil && errors.Is(execErr, context.Canceled) {
-		w.handleRunCancelled(ctx, n, output, execErr.Error())
-		return nil
-	}
+	// 使用 execCtx（仅约束本次执行，不覆盖后续落库）；续租失败/丢失时
+	// execCancel 中止执行，execErr 以 context.Canceled 进入失败处理。
+	output, execErr := w.Exec.Execute(execCtx, n)
 	if execErr != nil {
 		// 护栏转人工：Approver 已在拦截时把 Run 与节点一并挂起（WAITING_HUMAN），
 		// 此处**不得**再动节点状态 —— 任何 Fail/Retry/Complete 都会覆盖挂起态，
@@ -377,11 +338,8 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 		if errors.Is(execErr, middleware.ErrAwaitingApproval) {
 			obs.From(ctx).InfoContext(ctx, "node awaiting human approval",
 				"run_id", n.RunID, "node_id", n.ID, "tenant_id", n.TenantID, "tool", n.Name)
-			// 护栏转人工不是失败，单列一个指标：它的抬升意味着模型正在被诱导去调用
-			// 危险工具，是安全态势的直接读数（且 Run 会冻结，必然影响按时完成率）。
-			obs.Runtime().HITL(ctx, n.TenantID, "guard")
 			w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
-				ID: id.New("runtime-event"), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
+				ID: fmt.Sprintf("runtime-event-%s-hitl-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 				Type: contracts.EventHITLRequested, Timestamp: time.Now(),
 				// 只放原因不放工具入参：入参可能正是攻击载荷，
 				// 事件会进 SSE 与日志，抄进去等于二次扩散。
@@ -413,36 +371,23 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 			obs.From(ctx).WarnContext(ctx, "node retried",
 				"run_id", n.RunID, "node_id", n.ID, "attempt_from", n.Attempt,
 				"attempt_to", next, "backoff_until", readyAt.Format(time.RFC3339), "error", execErr)
-			// 重试率是最容易被忽略的容量信号：它稳定为正说明下游已经在退化，
-			// 只是被重试掩盖成了"慢"，等它变成 DLQ 时通常已经错过处置窗口。
-			obs.Runtime().NodeRetry(ctx, n.TenantID, string(n.Type))
 			return nil
 		}
 		// 重试耗尽：入死信队列 + 失败事件，由 Resume 收敛 Run 为 FAILED。
 		// 关键日志：重试耗尽进入死信队列，标志该节点不可恢复，需人工介入或下游兜底。
 		obs.From(ctx).WarnContext(ctx, "node dead-lettered",
 			"run_id", n.RunID, "node_id", n.ID, "attempt", n.Attempt, "error", execErr)
-		obs.Runtime().DLQ(ctx, n.TenantID, "retries_exhausted")
-		obs.Runtime().NodeSettled(ctx, n.TenantID, string(n.Type), "failed")
 		_ = w.Store.EnqueueDLQ(ctx, n.TenantID, n.RunID, n.ID, execErr.Error(), next, output)
-		fe := model.Event{ID: id.New("event"), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: execErr.Error(), Timestamp: time.Now()}
+		fe := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: execErr.Error(), Timestamp: time.Now()}
 		injectTraceContext(ctx, &fe)
 		payload, _ := json.Marshal(fe)
 		if _, ferr := w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{ID: fe.ID, EventType: fe.Type, AggregateID: n.RunID, Payload: string(payload)}); ferr != nil {
 			return fmt.Errorf("persist failure: %w (exec err: %v)", ferr, execErr)
 		}
 		w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
-			ID: id.New("runtime-event"), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
+			ID: fmt.Sprintf("runtime-event-%s-failed-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 			Type: contracts.EventNodeFailed, Timestamp: time.Now(), Data: map[string]any{"error": execErr.Error(), "attempt": n.Attempt},
 		})
-		return nil
-	}
-
-	// —— Path B 安全网：Exec.Execute 成功返回，但 ctx 可能在最后一瞬间被取消。
-	// 极短执行刚好完成 + heartbeat 轮询同时触发 runCancel 的竞态窗口。
-	// 若 ctx.Err() 非空，走取消路径而非 CompleteNodeWithOutbox（防止本应被取消的节点标记 SUCCESS）。
-	if ctx.Err() != nil {
-		w.handleRunCancelled(ctx, n, output, "run cancelled mid-execution (ctx closed)")
 		return nil
 	}
 
@@ -457,7 +402,7 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 			eventType = "ReplanRequested"
 		}
 	}
-	e := model.Event{ID: id.New("event"), Type: eventType, RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Output: output, Timestamp: time.Now()}
+	e := model.Event{ID: fmt.Sprintf("event-%s-%d", n.ID, time.Now().UnixNano()), Type: eventType, RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Output: output, Timestamp: time.Now()}
 	injectTraceContext(ctx, &e)
 	payload, _ := json.Marshal(e)
 	// 节点完成 + Outbox 事件在同一事务内提交，保证状态与事件一致。
@@ -471,47 +416,11 @@ func (w *Worker) Handle(ctx context.Context, t model.Task) error {
 	obs.From(ctx).InfoContext(ctx, "node completed",
 		"run_id", n.RunID, "node_id", n.ID, "tenant_id", n.TenantID,
 		"attempt", n.Attempt, "output_bytes", len(output))
-	// 终态计数放在 worker 而不是 executor：
-	// executor 返回成功时节点还没提交，worker 之后仍有会失败的路要走
-	// （CompleteNodeWithOutbox 本身可能失败）。只有这里才算真正落地。
-	obs.Runtime().NodeSettled(ctx, n.TenantID, string(n.Type), "success")
 	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
-		ID: id.New("runtime-event"), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
+		ID: fmt.Sprintf("runtime-event-%s-finished-%d", n.ID, time.Now().UnixNano()), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
 		Type: contracts.EventNodeFinished, Timestamp: time.Now(), Data: map[string]any{"output": output, "attempt": n.Attempt},
 	})
 	return nil
-}
-
-// handleRunCancelled 将 RUNNING 节点在 Run 取消时正确收敛：
-//  1. FailNodeWithOutbox：节点 → FAILED（终态）。为什么不用 CancelNode？CancelNode 只能把
-//     PENDING/READY → CANCELLED，RUNNING 不在其覆盖范围。为什么不直接标 CANCELLED？
-//     当前 FailNodeWithOutbox 只支持 FAILED，但 Resumer 在 Run.CANCEL_REQUESTED 时走
-//     tryConvergeCancelled（不看节点终态类型），所以标记 FAILED 与 CANCELLED 效果等价。
-//  2. 发 AgentStepFailed 事件携带 "run cancelled" 错误，供 Resumer.tryConvergeCancelled 收敛 Run。
-//  3. 发 EventNodeFailed runtime event + NodeSettled("cancelled") 指标（与 "failed" 分开，取消是用户主动行为）。
-//
-// output 参数携带 Exec.Execute 已产生的部分结果（LLM 可能已烧了部分 token），
-// 工具节点可能还没产生副作用就被中断，output 为空也是合法的。
-func (w *Worker) handleRunCancelled(ctx context.Context, n *model.Node, output string, reason string) {
-	obs.From(ctx).WarnContext(ctx, "node cancelled (run-level cancel)",
-		"run_id", n.RunID, "node_id", n.ID, "tenant_id", n.TenantID,
-		"attempt", n.Attempt, "reason", reason)
-	// 指标单列 "cancelled"，与 "failed" 区分：取消是用户主动行为，不应计入失败率。
-	obs.Runtime().NodeSettled(ctx, n.TenantID, string(n.Type), "cancelled")
-	errMsg := fmt.Sprintf("run cancelled: %s", reason)
-	fe := model.Event{ID: id.New("event"), Type: "AgentStepFailed", RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID, Attempt: n.Attempt, Error: errMsg, Timestamp: time.Now()}
-	injectTraceContext(ctx, &fe)
-	payload, _ := json.Marshal(fe)
-	// FailNodeWithOutbox 是节点状态 + Outbox 事件的单事务提交。
-	// 即使 Run 已 CANCEL_REQUESTED，节点从 RUNNING → FAILED 仍是合法终态跃迁。
-	if _, ferr := w.Store.FailNodeWithOutbox(ctx, n, model.OutboxMessage{ID: fe.ID, EventType: fe.Type, AggregateID: n.RunID, Payload: string(payload)}); ferr != nil {
-		obs.From(ctx).ErrorContext(ctx, "fail node on run cancel failed (node may remain RUNNING)",
-			"run_id", n.RunID, "node_id", n.ID, "error", ferr)
-	}
-	w.emitRuntimeEvent(ctx, contracts.RuntimeEvent{
-		ID: id.New("runtime-event"), RunID: n.RunID, NodeID: n.ID, TenantID: n.TenantID,
-		Type: contracts.EventNodeFailed, Timestamp: time.Now(), Data: map[string]any{"error": errMsg, "attempt": n.Attempt},
-	})
 }
 
 // injectTraceContext 将当前 ctx 的 W3C trace 上下文注入事件，
@@ -549,13 +458,13 @@ func (w *Worker) emitRuntimeEvent(ctx context.Context, ev contracts.RuntimeEvent
 	_ = w.RuntimeEvents.Emit(ctx, ev)
 }
 
-// NewFromEnv 从环境变量 WORKER_ID 读取标识，缺省时生成 UUIDv7。
+// NewFromEnv 从环境变量 WORKER_ID 读取标识，缺省时按时间戳生成。
 // 默认使用 Echo（Stub）LLM + Search/Calculator 工具，并注入真实 store 启用 tool_call 幂等。
 // 配置 OPENAI_BASE_URL + OPENAI_API_KEY 时切换为真实 OpenAI 兼容 HTTP 客户端。
 func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker {
-	workerID := os.Getenv("WORKER_ID")
-	if workerID == "" {
-		workerID = id.New("worker")
+	id := os.Getenv("WORKER_ID")
+	if id == "" {
+		id = fmt.Sprintf("worker-%d", time.Now().UnixNano())
 	}
 	tools := tool.NewRegistry()
 	tools.Register(tool.Search{})
@@ -599,18 +508,8 @@ func NewFromEnv(s *store.MySQL, q *queue.RedisQueue, r *event.RocketMQ) *Worker 
 	sec := newSecurityBundle(s, q, creds)
 	disp.ToolChain = sec.ToolChain
 	disp.ModelChain = sec.ModelChain
-	// P0：节点时限经 WORKER_NODE_TIMEOUT 配置（缺省 20s，见 Worker.nodeTimeout）。
-	// 多步 ReAct 循环或长工具调用的部署应显式调大；租约由心跳持续续租，不受影响。
-	// P1：CancelBus 装配（GetRun 兜底轮询经 WORKER_POLL_INTERVAL 配置，缺省 30s）。
-	// 只构造不订阅：Start 会建立真实 Redis 订阅连接，属进程生命周期行为，
-	// 由 cmd/worker 的 main 启动——NewFromEnv 保持纯装配，单测不受影响。
-	return &Worker{
-		Store: s, Queue: q, Events: r, ID: workerID,
-		Retry: retry.Default(), Exec: disp, EventChain: sec.EventChain,
-		nodeTimeout:  envDuration("WORKER_NODE_TIMEOUT", 0),
-		CancelBus:    q.NewCancelBus(),
-		pollInterval: envDuration("WORKER_POLL_INTERVAL", 30*time.Second),
-	}
+	return &Worker{Store: s, Queue: q, Events: r, ID: id, Retry: retry.Default(), Exec: disp, EventChain: sec.EventChain,
+		ExecTimeout: envDuration("WORKER_EXEC_TIMEOUT", DefaultExecTimeout)}
 }
 
 // newMemoryOptionsFromEnv 按环境变量装配读取路径的记忆能力。

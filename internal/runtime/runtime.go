@@ -220,6 +220,17 @@ func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input, threadID 
 		return nil, err
 	}
 	if err := r.Store.InsertPlan(ctx, run.ID, run.TenantID, plan); err != nil {
+		// 计划落库失败：Run 已是 PENDING 但不会有任何节点，事件驱动的 Resumer 无法感知它，
+		// Recovery 也只扫 RUNNING/READY——不主动收敛就会留下永不终止的孤儿 Run。
+		// 与上方 planning failed 同模式：主动 CAS 收敛为 FAILED（最佳努力，不掩盖原始错误）。
+		reason := fmt.Sprintf("persist plan failed: %v", err)
+		if fok, cerr := r.Store.UpdateRunCAS(ctx, run.TenantID, run.ID, run.Version, model.RunFailed, "", reason); cerr != nil {
+			obs.From(ctx).ErrorContext(ctx, "run mark-failed on plan-persist error failed",
+				"run_id", run.ID, "tenant_id", run.TenantID, "error", cerr, "plan_error", err)
+		} else if !fok {
+			obs.From(ctx).WarnContext(ctx, "run mark-failed on plan-persist error skipped (version conflict)",
+				"run_id", run.ID, "tenant_id", run.TenantID)
+		}
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		return nil, err
@@ -235,17 +246,23 @@ func (r *Runtime) CreateRun(ctx context.Context, tenant, agent, input, threadID 
 		return nil, err
 	}
 	// 仅入队无依赖的根节点，其余节点等待依赖完成后由 Resumer 推进。
+	//
+	// 单个节点的 MarkReady/Enqueue 失败不再中断创建：此时 Run 已 RUNNING 且无法整体
+	// 回滚，直接返回错误会让调用方误判"创建失败"而重试，制造重复 Run。
+	// 两条失败路径各有兜底——
+	//   - MarkReady 失败（节点仍 PENDING）：recovery 的 PendingStaleTasks 补偿扫描
+	//     会在依赖就绪且超过 stale 阈值后补投递；
+	//   - Enqueue 失败（节点已 READY）：recovery 的 ReadyTasks 扫描会补投递。
 	for _, n := range plan.Nodes {
 		if len(n.DependsOn) == 0 {
 			if err := r.Store.MarkReady(ctx, run.TenantID, n.ID); err != nil {
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-				return nil, err
+				obs.From(ctx).WarnContext(ctx, "mark root node ready failed; pending scan will retry",
+					"run_id", run.ID, "node_id", n.ID, "error", err)
+				continue
 			}
 			if err := r.Queue.Enqueue(ctx, model.Task{RunID: run.ID, NodeID: n.ID, TenantID: run.TenantID}); err != nil {
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-				return nil, err
+				obs.From(ctx).WarnContext(ctx, "enqueue root node failed; ready scan will retry",
+					"run_id", run.ID, "node_id", n.ID, "error", err)
 			}
 		}
 	}
