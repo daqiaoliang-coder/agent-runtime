@@ -63,6 +63,11 @@ type Worker struct {
 	// 这一层的必要性高于工具结果脱敏：同一份事件会进 SSE 推给前端、进日志、
 	// 进可观测系统，是敏感信息扩散面最大的地方。工具结果即便在 After 漏了，这里还有一道。
 	EventChain *middleware.EventChain
+	// CancelBus 是 Run 取消信号的进程级订阅（Redis pub/sub）。非 nil 时心跳
+	// 循环优先消费它（毫秒级延迟，零 DB）；为 nil 时退回每 tick GetRun 兜底。
+	CancelBus CancelSignals
+	// pollInterval 是 CancelBus 生效时 GetRun 的兜底轮询间隔（零值默认 30s）。
+	pollInterval time.Duration
 }
 
 // DefaultExecTimeout 是单次节点执行的默认超时。覆盖绝大多数 LLM 推理与工具调用，
@@ -98,6 +103,15 @@ func (w *Worker) heartbeatIntervalOrDefault() time.Duration {
 		return w.heartbeatInterval
 	}
 	return defaultHeartbeatInterval
+}
+
+// CancelSignals 是 Worker 消费的取消信号源（由 *queue.CancelBus 实现）。
+// 接口隔离让 worker 不直接依赖 Redis 实现，测试可注入 stub。
+type CancelSignals interface {
+	// Cancelled 报告 run 是否收到过未过期的取消信号。
+	Cancelled(runID string) bool
+	// Clear 消费掉该 run 的信号（已处理或忽略）。
+	Clear(runID string)
 }
 
 // ApprovalRequester is intentionally smaller than runtime.Runtime.
