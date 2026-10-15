@@ -191,3 +191,40 @@ func TestResumer_CancelRequested_FailedEvent_TriggersConverge(t *testing.T) {
 		t.Errorf("CAS status = %s, want CANCELLED (not FAILED)", fs.updateCASCalls[0].status)
 	}
 }
+
+func TestResumer_TerminalRunIgnoresLateEvents(t *testing.T) {
+	for _, status := range []model.RunStatus{model.RunCancelled, model.RunSuccess, model.RunFailed} {
+		for _, kind := range []string{"AgentStepFailed", "AgentStepCompleted", "ReplanRequested"} {
+			t.Run(string(status)+"/"+kind, func(t *testing.T) {
+				fs := &fakeStore{
+					getRun:      &model.Run{ID: "run-1", TenantID: "tenant-A", Status: status, Version: 8},
+					runComplete: true, casOK: true,
+				}
+				q := &fakeQueue{}
+				r := &Resumer{Store: fs, Queue: q}
+				e := model.Event{ID: "late-event", Type: kind, RunID: "run-1", TenantID: "tenant-A"}
+				if err := r.Handle(context.Background(), e); err != nil {
+					t.Fatal(err)
+				}
+				if len(fs.updateCASCalls) != 0 || len(fs.childrenCalls) != 0 || len(fs.insertPlanCalls) != 0 || len(q.enqueued) != 0 {
+					t.Fatal("late event must not mutate a terminal run or advance its DAG")
+				}
+				if !fs.inbox[e.ID] {
+					t.Fatal("late event must still be acknowledged in the inbox")
+				}
+			})
+		}
+	}
+}
+
+func TestResumer_CancelRequested_ReplanEventConverges(t *testing.T) {
+	fs := &fakeStore{getRun: cancelledRun(), runComplete: true, casOK: true}
+	r := &Resumer{Store: fs, Queue: &fakeQueue{}}
+	e := model.Event{ID: "cancelled-reflect", Type: "ReplanRequested", RunID: "run-1", TenantID: "tenant-A"}
+	if err := r.Handle(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	if len(fs.updateCASCalls) != 1 || fs.updateCASCalls[0].status != model.RunCancelled {
+		t.Fatal("completed REFLECT must converge cancellation without replanning")
+	}
+}

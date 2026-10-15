@@ -128,8 +128,7 @@ func (s *MySQL) GetNode(ctx context.Context, tenant, id string) (*model.Node, er
 // ClaimNode worker 抢占节点：仅当 tenant/version 匹配且状态为 PENDING/READY 且租约过期时，
 // 将状态置为 RUNNING 并写入租约所有者和过期时间，实现至少一次认领。
 func (s *MySQL) ClaimNode(ctx context.Context, tenant, id string, version int64, owner string, lease time.Duration) (bool, error) {
-	sec := int(lease.Seconds())
-	res, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=?,lease_until=DATE_ADD(NOW(6),INTERVAL ? SECOND),started_at=COALESCE(started_at,NOW(6)) WHERE node_id=? AND tenant_id=? AND version=? AND status IN (?,?) AND (lease_until IS NULL OR lease_until<NOW(6))`, model.NodeRunning, owner, sec, id, tenant, version, model.NodePending, model.NodeReady)
+	res, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=?,lease_until=DATE_ADD(NOW(6),INTERVAL ? MICROSECOND),started_at=COALESCE(started_at,NOW(6)) WHERE node_id=? AND tenant_id=? AND version=? AND status IN (?,?) AND (lease_until IS NULL OR lease_until<NOW(6))`, model.NodeRunning, owner, lease.Microseconds(), id, tenant, version, model.NodePending, model.NodeReady)
 	if err != nil {
 		return false, err
 	}
@@ -159,8 +158,7 @@ func (s *MySQL) FailNode(ctx context.Context, tenant, id string, version int64) 
 
 // RenewLease 续租：仅当节点仍由该 owner 持有且租户匹配时延长过期时间。
 func (s *MySQL) RenewLease(ctx context.Context, tenant, id, owner string, version int64, lease time.Duration) (bool, error) {
-	sec := int(lease.Seconds())
-	res, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET lease_until=DATE_ADD(NOW(6),INTERVAL ? SECOND) WHERE node_id=? AND tenant_id=? AND lease_owner=? AND version=? AND status=?`, sec, id, tenant, owner, version, model.NodeRunning)
+	res, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET lease_until=DATE_ADD(NOW(6),INTERVAL ? MICROSECOND) WHERE node_id=? AND tenant_id=? AND lease_owner=? AND version=? AND status=? AND lease_until>NOW(6)`, lease.Microseconds(), id, tenant, owner, version, model.NodeRunning)
 	if err != nil {
 		return false, err
 	}
@@ -393,7 +391,7 @@ func (s *MySQL) CompleteNodeWithOutbox(ctx context.Context, node *model.Node, ou
 		return false, err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,output=?,version=version+1,lease_owner=NULL,lease_until=NULL,ready_at=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=? AND status=?`, model.NodeSuccess, output, node.ID, node.TenantID, node.Version, model.NodeRunning)
+	res, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,output=?,version=version+1,lease_owner=NULL,lease_until=NULL,ready_at=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=? AND status=? AND lease_owner=? AND lease_until>NOW(6)`, model.NodeSuccess, output, node.ID, node.TenantID, node.Version, model.NodeRunning, node.LeaseOwner)
 	if err != nil {
 		return false, err
 	}
@@ -414,7 +412,16 @@ func (s *MySQL) FailNodeWithOutbox(ctx context.Context, node *model.Node, e mode
 		return false, err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,ready_at=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=?`, model.NodeFailed, node.ID, node.TenantID, node.Version)
+	query := `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,ready_at=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=?`
+	args := []any{model.NodeFailed, node.ID, node.TenantID, node.Version}
+	if node.LeaseOwner == "" {
+		query += ` AND status IN (?,?) AND (lease_owner IS NULL OR lease_owner='') AND lease_until IS NULL`
+		args = append(args, model.NodePending, model.NodeReady)
+	} else {
+		query += ` AND status=? AND lease_owner=? AND lease_until>NOW(6)`
+		args = append(args, model.NodeRunning, node.LeaseOwner)
+	}
+	res, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return false, err
 	}
@@ -426,6 +433,29 @@ func (s *MySQL) FailNodeWithOutbox(ctx context.Context, node *model.Node, e mode
 		return false, err
 	}
 	return true, tx.Commit()
+}
+
+func (s *MySQL) CancelNodeWithOutbox(ctx context.Context, node *model.Node, e model.OutboxMessage) (bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,ready_at=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=? AND status=? AND lease_owner=? AND lease_until>NOW(6)`, model.NodeCancelled, node.ID, node.TenantID, node.Version, model.NodeRunning, node.LeaseOwner)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n != 1 {
+		return false, err
+	}
+	if err := s.PutOutbox(ctx, tx, e); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ClaimOutbox 抢占待发布的 Outbox 消息：选取 PENDING/超时的 SENDING 记录，
@@ -538,8 +568,8 @@ ORDER BY n.created_at LIMIT ?`,
 
 // RetryNode 将 RUNNING 节点重置为 READY 并安排 ready_at（退避到期时间），attempt+1。
 // 用于可重试失败的指数退避重试；recovery 的 ReadyTasks 扫描会在 ready_at 到期后补投递。
-func (s *MySQL) RetryNode(ctx context.Context, tenant, id string, version int64, readyAt time.Time) (bool, error) {
-	res, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET status=?,ready_at=?,attempt=attempt+1,lease_owner=NULL,lease_until=NULL,version=version+1 WHERE node_id=? AND tenant_id=? AND version=? AND status=?`, model.NodeReady, readyAt, id, tenant, version, model.NodeRunning)
+func (s *MySQL) RetryNode(ctx context.Context, tenant, id, owner string, version int64, readyAt time.Time) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET status=?,ready_at=?,attempt=attempt+1,lease_owner=NULL,lease_until=NULL,version=version+1 WHERE node_id=? AND tenant_id=? AND version=? AND status=? AND lease_owner=? AND lease_until>NOW(6)`, model.NodeReady, readyAt, id, tenant, version, model.NodeRunning, owner)
 	if err != nil {
 		return false, err
 	}

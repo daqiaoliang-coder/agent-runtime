@@ -32,7 +32,7 @@ import (
 // newItIndexer 构造集成测试用的索引器，与 cmd/memory-indexer 的装配保持一致，
 // 但关掉批间限速（BatchDelay=0）以免拖慢测试。
 func newItIndexer(s *store.MySQL, vs vector.VectorStore, emb llm.Embedder) *memory.Indexer {
-	return memory.New(emb, s, vs, memory.Config{
+	return memory.New(&memory.LocalWriter{Embedder: emb, Vectors: vs}, s, memory.Config{
 		Collection:   itCollection,
 		Dim:          8,
 		ScanLimit:    50,

@@ -84,26 +84,19 @@ func (r *Resumer) Handle(ctx context.Context, e model.Event) error {
 
 // process 执行事件推进逻辑（原 Handle 主体）。返回 error 时不写 Inbox，触发重投递。
 func (r *Resumer) process(ctx context.Context, e model.Event) error {
-	// ReplanRequested：REFLECT 节点决定续规，调 Planner.Replan 追加新节点到 DAG。
-	if e.Type == "ReplanRequested" {
-		run, err := r.Store.GetRun(ctx, e.TenantID, e.RunID)
-		if err != nil {
-			return fmt.Errorf("load run for replan: %w", err)
-		}
-		if run.Status == model.RunCancelRequested {
-			return nil // 已取消，不续规
-		}
-		return r.handleReplan(ctx, e, run)
-	}
-	// 先获取 Run：Failed 与 Completed 两条路径都需要 version 做 CAS，且需要检查取消。
 	run, err := r.Store.GetRun(ctx, e.TenantID, e.RunID)
 	if err != nil {
 		return fmt.Errorf("load run: %w", err)
 	}
-	// 取消优先：Run 处于 CANCEL_REQUESTED 时，不推进 DAG 也不标 FAILED，
-	// 仅检查是否所有节点终态（含 CANCELLED）以收敛到 CANCELLED。
-	if run.Status == model.RunCancelRequested {
+	// 并行节点的迟到事件不能重新打开或改写已收敛的 Run。
+	switch run.Status {
+	case model.RunCancelled, model.RunSuccess, model.RunFailed:
+		return nil
+	case model.RunCancelRequested:
 		return r.tryConvergeCancelled(ctx, e, run)
+	}
+	if e.Type == "ReplanRequested" {
+		return r.handleReplan(ctx, e, run)
 	}
 	if e.Type == "AgentStepFailed" {
 		// Bug2 修复保持：run.Version 来自上方 GetRun，CAS 标记 FAILED。

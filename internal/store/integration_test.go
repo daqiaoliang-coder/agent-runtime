@@ -14,6 +14,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -642,9 +643,6 @@ func TestIntegration_CancelRunChain(t *testing.T) {
 	}
 }
 
-// TestIntegration_CancelRun_LeavesRunningForWorker 验证 RUNNING 节点不被
-// CancelRun 批量取消：RUNNING 节点需由 worker 侧 CancelNode 显式处理，
-// 避免中断正在执行的副作用。这是"旧租约执行者不得提交"不变量的体现。
 func TestIntegration_CancelRun_LeavesRunningForWorker(t *testing.T) {
 	s := newIntegrationStore(t)
 	defer s.Close()
@@ -676,10 +674,6 @@ func TestIntegration_CancelRun_LeavesRunningForWorker(t *testing.T) {
 	if nRunning.Status != model.NodeRunning {
 		t.Errorf("running node should stay RUNNING (worker handles cancel), got %s", nRunning.Status)
 	}
-	// CancelNode 仅取消 PENDING/READY，不取消 RUNNING（避免中断正在执行的副作用）
-	// 这是"旧租约执行者不得提交"不变量的体现：worker 完成后会发现 Run 已取消，
-	// 主动调 CancelNode 不可行——因为 RUNNING 节点需等 CompleteNode/FailNode 后
-	// 由 Resumer 在 CANCEL_REQUESTED 路径收敛。
 	ok, err = s.CancelNode(ctx, "tenant-it", "it-cancel-2:run", nRunning.Version)
 	if err != nil {
 		t.Fatalf("CancelNode error: %v", err)
@@ -691,6 +685,32 @@ func TestIntegration_CancelRun_LeavesRunningForWorker(t *testing.T) {
 	nStillRunning, _ := s.GetNode(ctx, "tenant-it", "it-cancel-2:run")
 	if nStillRunning.Status != model.NodeRunning {
 		t.Errorf("RUNNING node should remain RUNNING after CancelNode attempt, got %s", nStillRunning.Status)
+	}
+	e := model.OutboxMessage{ID: "it-cancel-2:event", EventType: "AgentStepFailed", AggregateID: run.ID, Payload: `{}`}
+	ok, err = s.CancelNodeWithOutbox(ctx, nRunning, e)
+	if err != nil || !ok {
+		t.Fatalf("owned cancellation: ok=%v err=%v", ok, err)
+	}
+	cancelled := getLeaseTestNode(t, s, nRunning.ID)
+	if cancelled.Status != model.NodeCancelled || cancelled.Version != nRunning.Version+1 || cancelled.Attempt != nRunning.Attempt || cancelled.LeaseOwner != "" || cancelled.LeaseUntil != nil || cancelled.FinishedAt.IsZero() {
+		t.Fatalf("cancelled node: %+v", cancelled)
+	}
+	var readyAt sql.NullTime
+	if err := s.DB.QueryRowContext(ctx, `SELECT ready_at FROM agent_node WHERE node_id=?`, nRunning.ID).Scan(&readyAt); err != nil || readyAt.Valid {
+		t.Fatalf("cancelled node scheduled for retry: readyAt=%v err=%v", readyAt, err)
+	}
+	assertLeaseTestOutbox(t, s, e.ID, 1)
+	var eventType string
+	if err := s.DB.QueryRowContext(ctx, `SELECT event_type FROM event_outbox WHERE event_id=?`, e.ID).Scan(&eventType); err != nil || eventType != "AgentStepFailed" {
+		t.Fatalf("cancellation event: type=%s err=%v", eventType, err)
+	}
+	complete, err := s.RunComplete(ctx, run.TenantID, run.ID)
+	if err != nil || !complete {
+		t.Fatalf("cancel convergence: complete=%v err=%v", complete, err)
+	}
+	var dlqCount int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_dlq WHERE node_id=?`, nRunning.ID).Scan(&dlqCount); err != nil || dlqCount != 0 {
+		t.Fatalf("cancellation produced DLQ: count=%d err=%v", dlqCount, err)
 	}
 }
 
@@ -787,5 +807,343 @@ func TestIntegration_PendingStaleTasks(t *testing.T) {
 		if tk.RunID == "it-pend-2" {
 			t.Errorf("nodes of non-RUNNING runs must not be scanned, got %+v", tk)
 		}
+	}
+}
+
+func insertLeaseTestNode(t *testing.T, s *MySQL, runID string, claim bool) *model.Node {
+	t.Helper()
+	ctx := context.Background()
+	run := &model.Run{ID: runID, TenantID: "tenant-it", Status: model.RunRunning, Version: 1}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertPlan(ctx, runID, run.TenantID, model.Plan{Nodes: []model.PlanNode{
+		{ID: runID + ":n1", Type: model.NodeLLM, Name: "step"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	n := getLeaseTestNode(t, s, runID+":n1")
+	if claim {
+		ok, err := s.ClaimNode(ctx, n.TenantID, n.ID, n.Version, "worker-1", time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		n = getLeaseTestNode(t, s, n.ID)
+	}
+	return n
+}
+
+func getLeaseTestNode(t *testing.T, s *MySQL, nodeID string) *model.Node {
+	t.Helper()
+	n, err := s.GetNode(context.Background(), "tenant-it", nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func assertLeaseTestOutbox(t *testing.T, s *MySQL, eventID string, want int) {
+	t.Helper()
+	var count int
+	if err := s.DB.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM event_outbox WHERE event_id=?`, eventID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != want {
+		t.Fatalf("outbox %s: count=%d, want %d", eventID, count, want)
+	}
+}
+
+func leaseTestWrite(s *MySQL, op string, n *model.Node, e model.OutboxMessage) (bool, error) {
+	ctx := context.Background()
+	switch op {
+	case "renew":
+		return s.RenewLease(ctx, n.TenantID, n.ID, n.LeaseOwner, n.Version, 2*time.Minute)
+	case "complete":
+		return s.CompleteNodeWithOutbox(ctx, n, "done", e)
+	case "fail":
+		return s.FailNodeWithOutbox(ctx, n, e)
+	case "retry":
+		return s.RetryNode(ctx, n.TenantID, n.ID, n.LeaseOwner, n.Version, time.Now().Add(time.Minute))
+	case "cancel":
+		return s.CancelNodeWithOutbox(ctx, n, e)
+	default:
+		panic("unknown lease operation: " + op)
+	}
+}
+
+func TestIntegration_ClaimNode_DoubleClaim(t *testing.T) {
+	s := newIntegrationStore(t)
+	defer s.Close()
+	n := insertLeaseTestNode(t, s, "it-double-claim", false)
+	start := make(chan struct{})
+	type result struct {
+		owner string
+		ok    bool
+		err   error
+	}
+	results := make(chan result, 2)
+	for _, owner := range []string{"worker-1", "worker-2"} {
+		go func(owner string) {
+			<-start
+			ok, err := s.ClaimNode(context.Background(), n.TenantID, n.ID, n.Version, owner, time.Minute)
+			results <- result{owner: owner, ok: ok, err: err}
+		}(owner)
+	}
+	close(start)
+	var winners int
+	var winner string
+	for i := 0; i < 2; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Errorf("claim by %s: %v", r.owner, r.err)
+		}
+		if r.ok {
+			winners++
+			winner = r.owner
+		}
+	}
+	got := getLeaseTestNode(t, s, n.ID)
+	if winners != 1 || got.Version != n.Version+1 || got.Status != model.NodeRunning || got.LeaseOwner != winner {
+		t.Fatalf("winners=%d, node=%+v", winners, got)
+	}
+	ok, err := s.ClaimNode(context.Background(), got.TenantID, got.ID, got.Version, "worker-3", time.Minute)
+	if err != nil || ok {
+		t.Fatalf("double claim with current version: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestIntegration_LeaseMicroseconds(t *testing.T) {
+	s := newIntegrationStore(t)
+	defer s.Close()
+	ctx := context.Background()
+	n := insertLeaseTestNode(t, s, "it-microsecond", false)
+	ok, err := s.ClaimNode(ctx, n.TenantID, n.ID, n.Version, "worker-1", 900123*time.Microsecond)
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	var micros int64
+	if err := s.DB.QueryRowContext(ctx, `SELECT TIMESTAMPDIFF(MICROSECOND,started_at,lease_until) FROM agent_node WHERE node_id=?`, n.ID).Scan(&micros); err != nil {
+		t.Fatal(err)
+	}
+	if micros != 900123 {
+		t.Fatalf("claim lease=%d microseconds, want 900123", micros)
+	}
+	ok, err = s.RenewLease(ctx, n.TenantID, n.ID, "worker-1", n.Version+1, 750123*time.Microsecond)
+	if err != nil || !ok {
+		t.Fatalf("renew: ok=%v err=%v", ok, err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT TIMESTAMPDIFF(MICROSECOND,NOW(6),lease_until) FROM agent_node WHERE node_id=?`, n.ID).Scan(&micros); err != nil {
+		t.Fatal(err)
+	}
+	if micros <= 0 || micros > 750123 {
+		t.Fatalf("remaining lease=%d microseconds, want (0,750123]", micros)
+	}
+	if got := getLeaseTestNode(t, s, n.ID); got.Version != n.Version+1 {
+		t.Fatalf("renew changed claim version: %+v", got)
+	}
+}
+
+func TestIntegration_LeaseWriteGuards(t *testing.T) {
+	s := newIntegrationStore(t)
+	defer s.Close()
+	ctx := context.Background()
+	for _, op := range []string{"renew", "complete", "fail", "retry", "cancel"} {
+		for _, fault := range []string{"wrong_owner", "empty_owner", "stale_version", "wrong_tenant", "expired", "missing_lease", "PENDING", "READY", "WAITING_HUMAN", "SUCCESS", "FAILED", "CANCELLED"} {
+			t.Run(op+"/"+fault, func(t *testing.T) {
+				n := insertLeaseTestNode(t, s, "it-guard-"+op+"-"+fault, true)
+				request := *n
+				switch fault {
+				case "wrong_owner":
+					request.LeaseOwner = "worker-other"
+				case "empty_owner":
+					request.LeaseOwner = ""
+				case "stale_version":
+					request.Version--
+				case "wrong_tenant":
+					request.TenantID = "tenant-other"
+				case "expired":
+					_, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET lease_until=DATE_SUB(NOW(6),INTERVAL 1 SECOND) WHERE node_id=?`, n.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+				case "missing_lease":
+					if _, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET lease_until=NULL WHERE node_id=?`, n.ID); err != nil {
+						t.Fatal(err)
+					}
+				default:
+					if _, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET status=? WHERE node_id=?`, fault, n.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				before := getLeaseTestNode(t, s, n.ID)
+				e := model.OutboxMessage{ID: n.ID + ":event", EventType: "AgentStepFailed", AggregateID: n.RunID, Payload: `{}`}
+				ok, err := leaseTestWrite(s, op, &request, e)
+				if err != nil || ok {
+					t.Fatalf("rejected write: ok=%v err=%v", ok, err)
+				}
+				if after := getLeaseTestNode(t, s, n.ID); !reflect.DeepEqual(before, after) {
+					t.Fatalf("rejected write changed node: before=%+v after=%+v", before, after)
+				}
+				assertLeaseTestOutbox(t, s, e.ID, 0)
+			})
+		}
+	}
+}
+
+func TestIntegration_LeaseTakeover(t *testing.T) {
+	s := newIntegrationStore(t)
+	defer s.Close()
+	ctx := context.Background()
+	for _, op := range []string{"renew", "complete", "fail", "retry", "cancel"} {
+		t.Run(op, func(t *testing.T) {
+			old := insertLeaseTestNode(t, s, "it-takeover-"+op, true)
+			if _, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET lease_until=DATE_SUB(NOW(6),INTERVAL 1 SECOND) WHERE node_id=?`, old.ID); err != nil {
+				t.Fatal(err)
+			}
+			tasks, err := s.RecoverExpired(ctx, 10)
+			if err != nil || len(tasks) != 1 || tasks[0].NodeID != old.ID {
+				t.Fatalf("recover: tasks=%+v err=%v", tasks, err)
+			}
+			ready := getLeaseTestNode(t, s, old.ID)
+			if ready.Status != model.NodeReady || ready.Version != old.Version+1 || ready.LeaseOwner != "" || ready.LeaseUntil != nil {
+				t.Fatalf("recovered node: %+v", ready)
+			}
+			ok, err := s.ClaimNode(ctx, ready.TenantID, ready.ID, ready.Version, "worker-2", time.Minute)
+			if err != nil || !ok {
+				t.Fatalf("takeover claim: ok=%v err=%v", ok, err)
+			}
+			current := getLeaseTestNode(t, s, old.ID)
+			if current.Version != ready.Version+1 || current.LeaseOwner != "worker-2" {
+				t.Fatalf("takeover node: %+v", current)
+			}
+			e := model.OutboxMessage{ID: old.ID + ":event", EventType: "AgentStepFailed", AggregateID: old.RunID, Payload: `{}`}
+			for _, mismatch := range []string{"old_lease", "old_owner", "old_version"} {
+				request := *old
+				if mismatch == "old_owner" {
+					request.Version = current.Version
+				}
+				if mismatch == "old_version" {
+					request.LeaseOwner = current.LeaseOwner
+				}
+				ok, err := leaseTestWrite(s, op, &request, e)
+				if err != nil || ok {
+					t.Fatalf("%s write: ok=%v err=%v", mismatch, ok, err)
+				}
+				if after := getLeaseTestNode(t, s, old.ID); !reflect.DeepEqual(current, after) {
+					t.Fatalf("old worker changed takeover node: %+v", after)
+				}
+				assertLeaseTestOutbox(t, s, e.ID, 0)
+			}
+			ok, err = leaseTestWrite(s, op, current, e)
+			if err != nil || !ok {
+				t.Fatalf("current worker write: ok=%v err=%v", ok, err)
+			}
+			after := getLeaseTestNode(t, s, old.ID)
+			if op == "renew" {
+				if after.Status != model.NodeRunning || after.Version != current.Version || after.LeaseOwner != current.LeaseOwner || after.LeaseUntil == nil || !after.LeaseUntil.After(*current.LeaseUntil) {
+					t.Fatalf("renewed node: %+v", after)
+				}
+				assertLeaseTestOutbox(t, s, e.ID, 0)
+				return
+			}
+			wantStatus := map[string]model.NodeStatus{"complete": model.NodeSuccess, "fail": model.NodeFailed, "retry": model.NodeReady, "cancel": model.NodeCancelled}[op]
+			if after.Status != wantStatus || after.Version != current.Version+1 || after.LeaseOwner != "" || after.LeaseUntil != nil {
+				t.Fatalf("committed node: %+v", after)
+			}
+			if op == "retry" {
+				if after.Attempt != current.Attempt+1 {
+					t.Fatalf("retry attempt=%d, want %d", after.Attempt, current.Attempt+1)
+				}
+				assertLeaseTestOutbox(t, s, e.ID, 0)
+			} else {
+				if after.Attempt != current.Attempt || after.FinishedAt.IsZero() {
+					t.Fatalf("terminal node: %+v", after)
+				}
+				assertLeaseTestOutbox(t, s, e.ID, 1)
+			}
+		})
+	}
+}
+
+func TestIntegration_PolicyDenyGuards(t *testing.T) {
+	s := newIntegrationStore(t)
+	defer s.Close()
+	ctx := context.Background()
+	future, past := time.Now().Add(time.Hour), time.Now().Add(-time.Hour)
+	for i, tc := range []struct {
+		name   string
+		status model.NodeStatus
+		owner  any
+		lease  any
+		allow  bool
+	}{
+		{name: "pending_null", status: model.NodePending, allow: true},
+		{name: "pending_empty", status: model.NodePending, owner: "", allow: true},
+		{name: "ready_null", status: model.NodeReady, allow: true},
+		{name: "ready_empty", status: model.NodeReady, owner: "", allow: true},
+		{name: "pending_owned", status: model.NodePending, owner: "worker-1"},
+		{name: "ready_owned", status: model.NodeReady, owner: "worker-1"},
+		{name: "pending_leased", status: model.NodePending, lease: future},
+		{name: "ready_expired", status: model.NodeReady, lease: past},
+		{name: "running", status: model.NodeRunning, owner: "worker-1", lease: future},
+		{name: "running_unowned", status: model.NodeRunning},
+		{name: "waiting_human", status: model.NodeWaitingHuman},
+		{name: "success", status: model.NodeSuccess},
+		{name: "failed", status: model.NodeFailed},
+		{name: "cancelled", status: model.NodeCancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := insertLeaseTestNode(t, s, fmt.Sprintf("it-deny-%d", i), false)
+			if _, err := s.DB.ExecContext(ctx, `UPDATE agent_node SET status=?,lease_owner=?,lease_until=? WHERE node_id=?`, tc.status, tc.owner, tc.lease, n.ID); err != nil {
+				t.Fatal(err)
+			}
+			before := getLeaseTestNode(t, s, n.ID)
+			e := model.OutboxMessage{ID: n.ID + ":event", EventType: "AgentStepFailed", AggregateID: n.RunID, Payload: `{}`}
+			ok, err := s.FailNodeWithOutbox(ctx, n, e)
+			if err != nil || ok != tc.allow {
+				t.Fatalf("policy denial: ok=%v err=%v, want %v", ok, err, tc.allow)
+			}
+			after := getLeaseTestNode(t, s, n.ID)
+			if tc.allow {
+				if after.Status != model.NodeFailed || after.Version != before.Version+1 || after.FinishedAt.IsZero() {
+					t.Fatalf("policy denial node: %+v", after)
+				}
+				assertLeaseTestOutbox(t, s, e.ID, 1)
+			} else {
+				if !reflect.DeepEqual(before, after) {
+					t.Fatalf("policy denial changed protected node: before=%+v after=%+v", before, after)
+				}
+				assertLeaseTestOutbox(t, s, e.ID, 0)
+			}
+		})
+	}
+}
+
+func TestIntegration_LeaseOutboxFailureRollsBack(t *testing.T) {
+	s := newIntegrationStore(t)
+	defer s.Close()
+	ctx := context.Background()
+	for _, op := range []string{"complete", "fail", "cancel"} {
+		t.Run(op, func(t *testing.T) {
+			n := insertLeaseTestNode(t, s, "it-rollback-"+op, true)
+			e := model.OutboxMessage{ID: n.ID + ":event", EventType: "AgentStepFailed", AggregateID: n.RunID, Payload: `{}`}
+			if _, err := s.DB.ExecContext(ctx, `INSERT INTO event_outbox(event_id,event_type,aggregate_id,payload) VALUES(?,?,?,?)`, e.ID, e.EventType, e.AggregateID, e.Payload); err != nil {
+				t.Fatal(err)
+			}
+			ok, err := leaseTestWrite(s, op, n, e)
+			if err == nil || ok {
+				t.Fatalf("duplicate outbox insert: ok=%v err=%v, want failure", ok, err)
+			}
+			if after := getLeaseTestNode(t, s, n.ID); !reflect.DeepEqual(n, after) {
+				t.Fatalf("outbox failure did not roll back node: before=%+v after=%+v", n, after)
+			}
+			assertLeaseTestOutbox(t, s, e.ID, 1)
+			e.ID += "-retry"
+			ok, err = leaseTestWrite(s, op, n, e)
+			if err != nil || !ok {
+				t.Fatalf("retry transaction: ok=%v err=%v", ok, err)
+			}
+			assertLeaseTestOutbox(t, s, e.ID, 1)
+		})
 	}
 }

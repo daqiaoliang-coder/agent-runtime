@@ -289,7 +289,7 @@ func EventJSON(e model.Event) string { b, _ := json.Marshal(e); return string(b)
 
 // Cancel 请求取消一个运行中的 Run：通过 CAS 把 Run 从 RUNNING 切到 CANCEL_REQUESTED，
 // 并在同一事务内把该 Run 下所有 PENDING/READY 节点置为 CANCELLED，阻止 worker 认领新节点。
-// 正在执行的 RUNNING 节点不被中断：它们会自然完成，Resumer 据此收敛 Run 到 CANCELLED。
+// RUNNING 节点由 worker 确认取消后停止执行，Resumer 据节点终态收敛 Run 到 CANCELLED。
 // 仅 RunRunning 状态可被取消；并发变更（version 不匹配）返回错误而非静默失败。
 func (r *Runtime) Cancel(ctx context.Context, tenant, runID, reason string) error {
 	cs, ok := r.Store.(CancelStore)

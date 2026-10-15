@@ -1,8 +1,8 @@
 // notify.go 基于 Redis pub/sub 的 Run 取消信号总线。
 // 背景：worker 心跳原为每 3s 一次 GetRun 轮询取消状态（1000 并发节点 ≈ 333 读 QPS）。
 // 改造后：runtime 在 CancelRun 落库成功后 PublishCancel 广播；worker 进程级
-// CancelBus 订阅并维护本地 run 集合，心跳 tick 查内存集合（零 DB），
-// GetRun 降频为兜底轮询（缺省 30s 一次）。
+// CancelBus 订阅并维护本地 run 集合，执行期每 100ms 查内存集合，命中后用 DB 确认。
+// 未收到信号时，GetRun 降频为兜底轮询（缺省 30s 一次）。
 //
 // 信号是 best-effort 加速器而非事实源：丢失/迟到不影响正确性——
 // 节点认领时的前置 GetRun 与降频兜底轮询都会拦截取消（MySQL 是唯一事实源）。
@@ -19,12 +19,13 @@ import (
 // cancelChannel 是取消广播的 pub/sub 频道名。
 const cancelChannel = "agent-run-cancel"
 
-// cancelSignalTTL 限制本地信号的滞留时间：信号是瞬时加速器，超龄即失效，
-// 后续取消感知交给兜底轮询。同时防止 map 无界增长（无人消费的取消信号）。
+// cancelSignalTTL 限制本地信号的有效期，过期后取消感知交给兜底轮询。
+// record 清扫全部过期项，避免从未查询的历史信号随广播持续增长。
 const cancelSignalTTL = time.Minute
 
-// CancelBus 进程级单例：订阅取消频道，维护本地已取消 run 集合。
-// worker 心跳通过 Cancelled/Clear 消费（读内存，不打 DB）。
+// CancelBus 进程级单例：订阅取消频道，维护本地收到取消信号的 run 集合。
+// Cancelled 非破坏性查询，TTL 内同一 run 的所有并发节点均可观察到信号。
+// 信号本身不能替代 DB 状态确认。
 type CancelBus struct {
 	client *redis.Client
 
@@ -32,7 +33,7 @@ type CancelBus struct {
 	runs map[string]time.Time // runID -> 收到信号的时间
 }
 
-// NewCancelBus 基于现有 RedisQueue 的连接创建总线（不新建连接）。
+// NewCancelBus 复用 RedisQueue 的 client；Start 会为 pub/sub 建立专用连接。
 func (q *RedisQueue) NewCancelBus() *CancelBus {
 	return &CancelBus{client: q.Client, runs: make(map[string]time.Time)}
 }
@@ -76,28 +77,20 @@ func (q *RedisQueue) PublishCancel(ctx context.Context, runID string) error {
 func (b *CancelBus) record(runID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.runs[runID] = time.Now()
-}
-
-// Cancelled 报告 run 是否收到过取消信号（且未过期）。纯内存读。
-// 查询时顺带惰性清扫过期项，避免无人消费的信号长期驻留。
-func (b *CancelBus) Cancelled(runID string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	now := time.Now()
 	for id, at := range b.runs {
-		if now.Sub(at) > cancelSignalTTL {
+		if now.Sub(at) >= cancelSignalTTL {
 			delete(b.runs, id)
 		}
 	}
-	_, ok := b.runs[runID]
-	return ok
+	b.runs[runID] = now
 }
 
-// Clear 移除 run 的本地信号：worker 处理完（确认或忽略）后调用，
-// 防止已终结的取消信号在 TTL 内反复触发 DB 确认。
-func (b *CancelBus) Clear(runID string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	delete(b.runs, runID)
+// Cancelled 报告 run 是否收到过未过期的取消信号，不消费信号，也不延长 TTL。
+// 只查询目标 run，避免每个执行节点的高频检查都遍历整个集合；过期项由 record 清扫。
+func (b *CancelBus) Cancelled(runID string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	at, ok := b.runs[runID]
+	return ok && time.Since(at) < cancelSignalTTL
 }
