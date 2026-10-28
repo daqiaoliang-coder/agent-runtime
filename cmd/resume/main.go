@@ -2,7 +2,9 @@
 package main
 
 import (
+	"agent-runtime/internal/adapters/credential"
 	"agent-runtime/internal/event"
+	"agent-runtime/internal/llm"
 	"agent-runtime/internal/middleware"
 	"agent-runtime/internal/queue"
 	"agent-runtime/internal/runtime"
@@ -31,7 +33,10 @@ func main() {
 	if err := q.Init(ctx); err != nil {
 		log.Fatal(err)
 	}
-	res := &runtime.Resumer{Store: s, Queue: q}
+	res, err := newResumer(s, q)
+	if err != nil {
+		log.Fatalf("resume: planner configuration invalid: %v", err)
+	}
 	// 生命周期钩子：Resumer 是 Run 收敛到终态的地方，OnRunFinish 在此执行，
 	// 记录"谁发起的 Run、最终成功还是失败"。身份从 agent_run 还原（见 runExecutionContext），
 	// 因此无需在此进程重新认证 —— 这正是身份落库的价值：收敛发生在另一个进程、
@@ -47,6 +52,21 @@ func main() {
 	defer c.Close()
 	log.Println("resume controller started")
 	select {}
+}
+
+func newResumer(s runtime.Store, q runtime.Queue) (*runtime.Resumer, error) {
+	planner := runtime.Planner(runtime.DemoPlanner{})
+	router, configured, err := llm.RouterFromEnv(credential.FromEnv())
+	if err != nil {
+		return nil, err
+	}
+	if configured {
+		planner = &runtime.LLMPlanner{
+			LLM:   router,
+			Model: env("LLM_PLANNER_MODEL", env("LLM_DEFAULT_MODEL", "")),
+		}
+	}
+	return &runtime.Resumer{Store: s, Queue: q, Planner: planner}, nil
 }
 
 // newAuthLifecycle 构造收敛侧的生命周期钩子。

@@ -4,7 +4,9 @@ import (
 	"agent-runtime/internal/model"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
+	"regexp"
 	"testing"
 	"time"
 
@@ -136,9 +138,8 @@ func TestGetNode_IncludesTenantFilter(t *testing.T) {
 func TestClaimNode_IncludesTenantFilter(t *testing.T) {
 	s, mock, cleanup := newMockStore(t)
 	defer cleanup()
-	// 参数顺序：status, owner, sec, node_id, tenant, version, NodePending, NodeReady
 	mock.ExpectExec("tenant_id").
-		WithArgs(model.NodeRunning, "worker-1", 30, "node-1", "tenant-A", int64(0), model.NodePending, model.NodeReady).
+		WithArgs(model.NodeRunning, "worker-1", int64(30_000_000), "node-1", "tenant-A", int64(0), model.NodePending, model.NodeReady).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	ok, err := s.ClaimNode(context.Background(), "tenant-A", "node-1", 0, "worker-1", 30*time.Second)
 	if err != nil {
@@ -157,7 +158,7 @@ func TestClaimNode_TenantMismatch_NoRowAffected(t *testing.T) {
 	s, mock, cleanup := newMockStore(t)
 	defer cleanup()
 	mock.ExpectExec("tenant_id").
-		WithArgs(model.NodeRunning, "worker-1", 30, "node-1", "tenant-B", int64(0), model.NodePending, model.NodeReady).
+		WithArgs(model.NodeRunning, "worker-1", int64(30_000_000), "node-1", "tenant-B", int64(0), model.NodePending, model.NodeReady).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	ok, err := s.ClaimNode(context.Background(), "tenant-B", "node-1", 0, "worker-1", 30*time.Second)
 	if err != nil {
@@ -275,10 +276,10 @@ func TestRetryNode_SetsReadyWithReadyAt(t *testing.T) {
 	s, mock, cleanup := newMockStore(t)
 	defer cleanup()
 	readyAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
-	mock.ExpectExec("ready_at=\\?,attempt=attempt\\+1").
-		WithArgs(model.NodeReady, readyAt, "node-1", "tenant-A", int64(0), model.NodeRunning).
+	mock.ExpectExec("^"+regexp.QuoteMeta(`UPDATE agent_node SET status=?,ready_at=?,attempt=attempt+1,lease_owner=NULL,lease_until=NULL,version=version+1 WHERE node_id=? AND tenant_id=? AND version=? AND status=? AND lease_owner=? AND lease_until>NOW(6)`)+"$").
+		WithArgs(model.NodeReady, readyAt, "node-1", "tenant-A", int64(0), model.NodeRunning, "worker-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	ok, err := s.RetryNode(context.Background(), "tenant-A", "node-1", 0, readyAt)
+	ok, err := s.RetryNode(context.Background(), "tenant-A", "node-1", "worker-1", 0, readyAt)
 	if err != nil {
 		t.Fatalf("RetryNode: %v", err)
 	}
@@ -408,5 +409,170 @@ func TestRecordLLMUsage_InsertsWithDimensions(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("expectations not met: %v", err)
+	}
+}
+
+func TestClaimNode_MicrosecondsAndCAS(t *testing.T) {
+	s, mock, cleanup := newMockStore(t)
+	defer cleanup()
+	query := `UPDATE agent_node SET status=?,version=version+1,lease_owner=?,lease_until=DATE_ADD(NOW(6),INTERVAL ? MICROSECOND),started_at=COALESCE(started_at,NOW(6)) WHERE node_id=? AND tenant_id=? AND version=? AND status IN (?,?) AND (lease_until IS NULL OR lease_until<NOW(6))`
+	for i, owner := range []string{"worker-1", "worker-2"} {
+		mock.ExpectExec("^"+regexp.QuoteMeta(query)+"$").
+			WithArgs(model.NodeRunning, owner, int64(250123), "node-1", "tenant-A", int64(4), model.NodePending, model.NodeReady).
+			WillReturnResult(sqlmock.NewResult(0, int64(1-i)))
+		ok, err := s.ClaimNode(context.Background(), "tenant-A", "node-1", 4, owner, 250123*time.Microsecond)
+		if err != nil || ok != (i == 0) {
+			t.Fatalf("claim %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLeaseWrites_GuardsAndErrors(t *testing.T) {
+	readyAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	for _, op := range []struct {
+		name  string
+		query string
+		args  []driver.Value
+		call  func(*MySQL) (bool, error)
+	}{
+		{
+			name:  "renew",
+			query: `UPDATE agent_node SET lease_until=DATE_ADD(NOW(6),INTERVAL ? MICROSECOND) WHERE node_id=? AND tenant_id=? AND lease_owner=? AND version=? AND status=? AND lease_until>NOW(6)`,
+			args:  []driver.Value{int64(750123), "node-1", "tenant-A", "worker-1", int64(4), model.NodeRunning},
+			call: func(s *MySQL) (bool, error) {
+				return s.RenewLease(context.Background(), "tenant-A", "node-1", "worker-1", 4, 750123*time.Microsecond)
+			},
+		},
+		{
+			name:  "retry",
+			query: `UPDATE agent_node SET status=?,ready_at=?,attempt=attempt+1,lease_owner=NULL,lease_until=NULL,version=version+1 WHERE node_id=? AND tenant_id=? AND version=? AND status=? AND lease_owner=? AND lease_until>NOW(6)`,
+			args:  []driver.Value{model.NodeReady, readyAt, "node-1", "tenant-A", int64(4), model.NodeRunning, "worker-1"},
+			call: func(s *MySQL) (bool, error) {
+				return s.RetryNode(context.Background(), "tenant-A", "node-1", "worker-1", 4, readyAt)
+			},
+		},
+	} {
+		for _, result := range []string{"success", "rejected", "error"} {
+			t.Run(op.name+"/"+result, func(t *testing.T) {
+				s, mock, cleanup := newMockStore(t)
+				defer cleanup()
+				injected := errors.New("database unavailable")
+				expect := mock.ExpectExec("^" + regexp.QuoteMeta(op.query) + "$").WithArgs(op.args...)
+				switch result {
+				case "success":
+					expect.WillReturnResult(sqlmock.NewResult(0, 1))
+				case "rejected":
+					expect.WillReturnResult(sqlmock.NewResult(0, 0))
+				case "error":
+					expect.WillReturnError(injected)
+				}
+				ok, err := op.call(s)
+				if result == "error" {
+					if ok || !errors.Is(err, injected) {
+						t.Fatalf("ok=%v err=%v, want database error", ok, err)
+					}
+				} else if err != nil || ok != (result == "success") {
+					t.Fatalf("ok=%v err=%v, result=%s", ok, err, result)
+				}
+				if err := mock.ExpectationsWereMet(); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+func TestNodeWithOutbox_GuardsAndAtomicity(t *testing.T) {
+	node := model.Node{ID: "node-1", TenantID: "tenant-A", Version: 4, LeaseOwner: "worker-1"}
+	event := model.OutboxMessage{ID: "event-1", EventType: "AgentStepFailed", AggregateID: "run-1", Payload: `{}`}
+	baseQuery := `UPDATE agent_node SET status=?,version=version+1,lease_owner=NULL,lease_until=NULL,ready_at=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=?`
+	guard := ` AND status=? AND lease_owner=? AND lease_until>NOW(6)`
+	for _, op := range []struct {
+		name  string
+		query string
+		args  []driver.Value
+		call  func(*MySQL) (bool, error)
+	}{
+		{
+			name:  "complete",
+			query: `UPDATE agent_node SET status=?,output=?,version=version+1,lease_owner=NULL,lease_until=NULL,ready_at=NULL,finished_at=NOW(6) WHERE node_id=? AND tenant_id=? AND version=?` + guard,
+			args:  []driver.Value{model.NodeSuccess, "done", node.ID, node.TenantID, node.Version, model.NodeRunning, node.LeaseOwner},
+			call: func(s *MySQL) (bool, error) {
+				return s.CompleteNodeWithOutbox(context.Background(), &node, "done", event)
+			},
+		},
+		{
+			name: "fail_claimed", query: baseQuery + guard,
+			args: []driver.Value{model.NodeFailed, node.ID, node.TenantID, node.Version, model.NodeRunning, node.LeaseOwner},
+			call: func(s *MySQL) (bool, error) {
+				return s.FailNodeWithOutbox(context.Background(), &node, event)
+			},
+		},
+		{
+			name: "fail_unclaimed", query: baseQuery + ` AND status IN (?,?) AND (lease_owner IS NULL OR lease_owner='') AND lease_until IS NULL`,
+			args: []driver.Value{model.NodeFailed, node.ID, node.TenantID, node.Version, model.NodePending, model.NodeReady},
+			call: func(s *MySQL) (bool, error) {
+				unclaimed := node
+				unclaimed.LeaseOwner = ""
+				return s.FailNodeWithOutbox(context.Background(), &unclaimed, event)
+			},
+		},
+		{
+			name: "cancel", query: baseQuery + guard,
+			args: []driver.Value{model.NodeCancelled, node.ID, node.TenantID, node.Version, model.NodeRunning, node.LeaseOwner},
+			call: func(s *MySQL) (bool, error) {
+				return s.CancelNodeWithOutbox(context.Background(), &node, event)
+			},
+		},
+	} {
+		for _, result := range []string{"success", "rejected", "begin_error", "update_error", "outbox_error", "commit_error"} {
+			t.Run(op.name+"/"+result, func(t *testing.T) {
+				s, mock, cleanup := newMockStore(t)
+				defer cleanup()
+				injected := errors.New("transaction fault")
+				begin := mock.ExpectBegin()
+				if result == "begin_error" {
+					begin.WillReturnError(injected)
+				} else {
+					update := mock.ExpectExec("^" + regexp.QuoteMeta(op.query) + "$").WithArgs(op.args...)
+					switch result {
+					case "rejected":
+						update.WillReturnResult(sqlmock.NewResult(0, 0))
+						mock.ExpectRollback()
+					case "update_error":
+						update.WillReturnError(injected)
+						mock.ExpectRollback()
+					default:
+						update.WillReturnResult(sqlmock.NewResult(0, 1))
+						insert := mock.ExpectExec("^"+regexp.QuoteMeta(`INSERT INTO event_outbox(event_id,event_type,aggregate_id,payload) VALUES(?,?,?,?)`)+"$").
+							WithArgs(event.ID, event.EventType, event.AggregateID, event.Payload)
+						if result == "outbox_error" {
+							insert.WillReturnError(injected)
+							mock.ExpectRollback()
+						} else {
+							insert.WillReturnResult(sqlmock.NewResult(0, 1))
+							commit := mock.ExpectCommit()
+							if result == "commit_error" {
+								commit.WillReturnError(injected)
+							}
+						}
+					}
+				}
+				ok, err := op.call(s)
+				if result == "success" || result == "rejected" {
+					if err != nil || ok != (result == "success") {
+						t.Fatalf("ok=%v err=%v, result=%s", ok, err, result)
+					}
+				} else if !errors.Is(err, injected) {
+					t.Fatalf("err=%v, want transaction fault", err)
+				}
+				if err := mock.ExpectationsWereMet(); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
 	}
 }

@@ -14,9 +14,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 func testAddr() string {
@@ -366,31 +370,130 @@ func TestIntegration_ShardRouting(t *testing.T) {
 	t.Fatal("shard streams should be empty after consume (per-shard Ack+XDel)")
 }
 
-// TestIntegration_CancelBus 验证取消信号总线：PublishCancel 广播 → 同进程
-// CancelBus 订阅收到（Cancelled=true）→ Clear 移除。这是 worker 心跳
-// pub/sub 快路径与 runtime 取消发布点的端到端契约。
+// TestIntegration_CancelBus 只使用 pub/sub，不创建/删除 stream、不清空 Redis。
+// 与真实取消频道共用协议，但只广播随机 UUID runID，避免影响真实运行。
+// TEST_REDIS_ADDR 默认 localhost:6380；可单独运行本测试，不运行其他集成测试。
 func TestIntegration_CancelBus(t *testing.T) {
-	q := newIntegrationQueue(t)
-	bus := q.NewCancelBus()
-	subCtx, stop := context.WithCancel(context.Background())
-	defer stop()
-	if err := bus.Start(subCtx); err != nil {
-		t.Fatalf("bus.Start: %v", err)
+	publisher := newCancelIntegrationQueue(t)
+	q1, q2 := newCancelIntegrationQueue(t), newCancelIntegrationQueue(t)
+	bus1, bus2 := q1.NewCancelBus(), q2.NewCancelBus()
+	ctx1, stop1 := context.WithCancel(context.Background())
+	defer stop1()
+	ctx2, stop2 := context.WithCancel(context.Background())
+	defer stop2()
+	if err := bus1.Start(ctx1); err != nil {
+		t.Fatalf("bus1.Start: %v", err)
+	}
+	if err := bus2.Start(ctx2); err != nil {
+		t.Fatalf("bus2.Start: %v", err)
 	}
 
-	if err := q.PublishCancel(context.Background(), "run-bus-1"); err != nil {
+	// Start 必须等订阅确认，无需 sleep 就立即发布；两个独立 client 均应收到。
+	runID := uuid.NewString()
+	if err := publisher.PublishCancel(context.Background(), runID); err != nil {
 		t.Fatalf("PublishCancel: %v", err)
 	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && !bus.Cancelled("run-bus-1") {
-		time.Sleep(20 * time.Millisecond)
+	waitForCancelCondition(t, "both buses receive broadcast", func() bool {
+		return bus1.Cancelled(runID) && bus2.Cancelled(runID)
+	})
+	for i := 0; i < 100; i++ {
+		if !bus1.Cancelled(runID) || !bus2.Cancelled(runID) {
+			t.Fatal("repeated queries consumed the cancellation signal")
+		}
 	}
-	if !bus.Cancelled("run-bus-1") {
-		t.Fatal("cancel signal not received via pub/sub")
+
+	// 推进本地接收时间而非等待一分钟：真实收到的信号仍受 TTL 约束。
+	bus1.mu.Lock()
+	bus1.runs[runID] = time.Now().Add(-cancelSignalTTL - time.Second)
+	bus1.mu.Unlock()
+	if bus1.Cancelled(runID) || !bus2.Cancelled(runID) {
+		t.Fatal("TTL must expire only the old local signal")
 	}
-	bus.Clear("run-bus-1")
-	if bus.Cancelled("run-bus-1") {
-		t.Fatal("signal should be cleared")
+	nextRunID := uuid.NewString()
+	if err := publisher.PublishCancel(context.Background(), nextRunID); err != nil {
+		t.Fatal(err)
+	}
+	waitForCancelCondition(t, "next broadcast reaches both buses", func() bool {
+		return bus1.Cancelled(nextRunID) && bus2.Cancelled(nextRunID)
+	})
+	bus1.mu.RLock()
+	_, retained := bus1.runs[runID]
+	bus1.mu.RUnlock()
+	if retained {
+		t.Fatal("receiving a broadcast should remove expired history")
+	}
+
+	// 按唯一 client name 检查真实订阅连接，不依赖共享频道的全局订阅人数。
+	if !hasCancelSubscription(t, publisher, q1) || !hasCancelSubscription(t, publisher, q2) {
+		t.Fatal("expected both named subscription connections")
+	}
+	stop1()
+	waitForCancelCondition(t, "first subscription closes on context cancellation", func() bool {
+		return !hasCancelSubscription(t, publisher, q1)
+	})
+	if !bus1.Cancelled(nextRunID) {
+		t.Fatal("closing a subscription must not consume existing signals")
+	}
+	afterStopID := uuid.NewString()
+	if err := publisher.PublishCancel(context.Background(), afterStopID); err != nil {
+		t.Fatal(err)
+	}
+	waitForCancelCondition(t, "remaining bus keeps receiving", func() bool {
+		return bus2.Cancelled(afterStopID)
+	})
+	if bus1.Cancelled(afterStopID) {
+		t.Fatal("stopped bus received a new signal")
+	}
+	stop2()
+	waitForCancelCondition(t, "second subscription closes", func() bool {
+		return !hasCancelSubscription(t, publisher, q2)
+	})
+}
+
+func newCancelIntegrationQueue(t *testing.T) *RedisQueue {
+	t.Helper()
+	addr := os.Getenv("TEST_REDIS_ADDR")
+	if addr == "" {
+		addr = "localhost:6380"
+	}
+	q := &RedisQueue{Client: redis.NewClient(&redis.Options{
+		Addr: addr, ClientName: "cancel-test-" + uuid.NewString(),
+		DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second,
+	})}
+	t.Cleanup(func() { _ = q.Client.Close() })
+	if err := q.Ping(context.Background()); err != nil {
+		t.Fatalf("ping test Redis %s: %v (set TEST_REDIS_ADDR)", addr, err)
+	}
+	return q
+}
+
+func hasCancelSubscription(t *testing.T, observer, subscriber *RedisQueue) bool {
+	t.Helper()
+	clients, err := observer.Client.ClientList(context.Background()).Result()
+	if err != nil {
+		t.Fatalf("list test subscriptions: %v", err)
+	}
+	name := "name=" + subscriber.Client.Options().ClientName + " "
+	for _, line := range strings.Split(clients, "\n") {
+		if strings.Contains(line, name) && strings.Contains(line, " sub=1 ") {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForCancelCondition(t *testing.T, description string, ready func() bool) {
+	t.Helper()
+	timeout := time.NewTimer(3 * time.Second)
+	defer timeout.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for !ready() {
+		select {
+		case <-timeout.C:
+			t.Fatalf("timeout: %s", description)
+		case <-tick.C:
+		}
 	}
 }
 
